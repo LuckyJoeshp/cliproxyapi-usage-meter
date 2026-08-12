@@ -4,7 +4,7 @@
 
 ## 1. 背景
 
-本机已经通过 `cliproxyapi` 为 Codex / OpenAI-compatible 客户端提供代理能力。用户有多个 Codex 订阅账号，shell alias 采用数字命名：`codex-1`、`codex-2`、...，每个 alias 对应独立 `CODEX_HOME`。
+CLIProxyAPI 可以为 Codex / OpenAI-compatible 客户端提供代理能力。一个常见部署会有多个 Codex 订阅账号，shell alias 采用数字命名：`codex-1`、`codex-2`、...，每个 alias 对应独立 `CODEX_HOME`。
 
 现状判断：当前本机 `cliproxyapi` 未发现开箱即用的跨 session / 跨订阅账号 token、价格、额度统计插件。因此采用 **方案 A：在 cliproxyapi 前面加一个本地轻量 sidecar proxy**。
 
@@ -38,7 +38,7 @@ Codex / OpenClaw / curl / 其他 OpenAI-compatible client
 - 不重启 `cliproxyapi`。
 - 不停止 `cliproxyapi`。
 - 不修改 `~/.cli-proxy-api/config.yaml`。
-- 不修改 `~/.zshrc` 或现有 `codex-1..N` alias。
+- 不修改用户 shell 配置或现有 `codex-1..N` alias。
 - 不占用、不替换 `cliproxyapi` 现有端口 `8317`。
 - sidecar 使用独立端口，例如 `8327`。
 - 现有项目继续直连 `http://127.0.0.1:8317/v1/...`，不得被改到 sidecar。
@@ -100,7 +100,7 @@ datas/cliproxy_usage.sqlite
 
 1. 查看 `~/.cli-proxy-api/config.yaml`。
 2. 查看 `cliproxyapi` 进程、端口、版本。
-3. 查看 `~/.zshrc` 中 `codex-1..N` alias 到 `CODEX_HOME` 的映射。
+3. 读取用户 shell 配置中的 `codex-1..N` alias 到 `CODEX_HOME` 的映射。
 4. 查看各 `~/.codex-*/auth.json` 是否能提取 `account_id`，但不要输出 token。
 5. 从现有 `~/.cli-proxy-api/logs/` 中采样请求结构，确认 Codex CLI 是否带有：
    - `client_metadata.session_id`

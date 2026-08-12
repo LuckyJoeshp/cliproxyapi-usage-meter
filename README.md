@@ -1,30 +1,77 @@
 # cliproxyapi-usage-meter
 
-Local, token-safe usage and quota observability for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
+[![Public repository](https://img.shields.io/badge/repository-public-2ea44f?style=flat-square)](https://github.com/LuckyJoeshp/cliproxyapi-usage-meter)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-37%20passing-2ea44f?style=flat-square)](tests/)
+[![License](https://img.shields.io/badge/license-MIT-yellow?style=flat-square)](LICENSE)
 
-This project is a sidecar, not a billing API. It records requests that pass
-through `127.0.0.1:8327`, can optionally drain CLIProxyAPI's read-only
-management usage queue for clients that still use `8317`, and estimates API
-equivalent cost from an explicitly configured or official OpenAI price table.
-It cannot read an official ChatGPT subscription balance. Any “quota” or dollar
-figure is an observed/provider-reported window or an API-price estimate, never
-an invoice or guaranteed remaining balance.
+**A local, token-safe Usage Observatory for CLIProxyAPI.**
+
+See every request, split input/cache/output tokens, estimate API-equivalent
+cost, observe quota resets, and understand account-pool retries from one
+private-by-default dashboard. It runs as a transparent sidecar: clients can
+send traffic through `8327`, while the optional read-only queue collector also
+captures clients that still use `8317`.
+
+![Masked Usage Observatory demo](assets/usage-dashboard-demo.png)
+
+_The screenshot is a real dashboard render with live values, account labels,
+dates, and trend data masked. It is included only as a visual demo._
+
+> This is an observability tool, not a billing API. It cannot read an official
+> ChatGPT subscription balance. Dollar figures are API-price equivalents, and
+> quota figures are observed/provider-reported windows—not invoices or
+> guaranteed remaining balances.
 
 ```text
 client -> 127.0.0.1:8327/v1/... -> usage meter -> 127.0.0.1:8317/v1/...
 ```
 
-## What it measures
+## Why use it
 
-- input, cached-input, output, reasoning and total tokens;
-- successful, failed, streaming and missing-usage calls;
-- logical requests versus account-pool attempts/retries;
-- per alias/account, model, session and date summaries;
-- read-only quota/cooldown/reset observations and cautious full-window
-  API-equivalent estimates;
-- an offline `/usage` HTML dashboard at `http://127.0.0.1:8327/usage`;
-- optional official OpenAI API price synchronization, with source URL, page
-  hash and parser version stored alongside the price table.
+CLIProxyAPI can fan one logical request across several subscription accounts.
+That makes a raw proxy log difficult to answer: **what did I actually consume,
+which account handled it, how much was cached, and why did the account pool
+retry?** This sidecar keeps those questions separate and auditable in SQLite.
+
+## What it gives you
+
+| Capability | What is tracked |
+| --- | --- |
+| Token accounting | Non-cached input, cached input, output, reasoning subset, and raw API processing |
+| Cost estimation | Official OpenAI price sync or reviewed local prices, split by token type |
+| Account behavior | Logical requests, account attempts, retries, aliases, models, sessions, and dates |
+| Quota visibility | Read-only 5-hour/week/month snapshots, reset times, cooldowns, and observed floors |
+| Collection paths | Transparent `8327` proxy plus optional destructive-read `8317` usage queue |
+| Dashboard | Inline, dependency-free `/usage` HTML with trend, account, model, and recent-call views |
+| Privacy boundary | Loopback by default; credentials discarded; only short fingerprints are stored |
+
+## Quick start
+
+```bash
+git clone https://github.com/LuckyJoeshp/cliproxyapi-usage-meter.git
+cd cliproxyapi-usage-meter
+
+# Keep CLIProxyAPI on 8317; point only the clients you want observed at 8327.
+PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
+  scripts/start_cliproxy_usage_meter.sh
+```
+
+Open <http://127.0.0.1:8327/usage>.
+
+For a direct-8317 queue collector, use an external owner-only key file (never
+put a management credential in this checkout):
+
+```bash
+chmod 600 /path/to/cliproxy-management.key
+CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/cliproxy-management.key \
+  PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
+  scripts/start_cliproxy_usage_meter.sh
+```
+
+If Chrome already has the local CLIProxyAPI management page open,
+`scripts/start_cliproxy_usage_meter_from_chrome.py` can pass its key in memory
+without writing or printing it.
 
 ## Safety boundary
 
@@ -41,37 +88,6 @@ client -> 127.0.0.1:8327/v1/... -> usage meter -> 127.0.0.1:8317/v1/...
   ignored. Tests use fake upstream servers and fixture credentials only.
 - Unknown pricing remains `NULL`; the project does not invent a subscription
   price or balance.
-
-## Install and run
-
-Python 3.10+ and the standard library are sufficient.
-
-```bash
-git clone https://github.com/LuckyJoeshp/cliproxyapi-usage-meter.git
-cd cliproxyapi-usage-meter
-
-# Safe local proxy path; existing clients remain on 8317 unless you explicitly
-# point a test client at 8327.
-PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
-  scripts/start_cliproxy_usage_meter.sh
-```
-
-The dashboard is then available at <http://127.0.0.1:8327/usage>.
-
-For direct `8317` usage-queue collection, provide a management key without
-putting it in this checkout:
-
-```bash
-chmod 600 /path/to/cliproxy-management.key
-CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/cliproxy-management.key \
-  PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
-  scripts/start_cliproxy_usage_meter.sh
-```
-
-If the local CLIProxyAPI management page is already authenticated in Chrome,
-`scripts/start_cliproxy_usage_meter_from_chrome.py` can pass the key in memory
-without printing or writing it. This is an optional local convenience; a
-portable deployment should prefer the external `0600` key file.
 
 ## CLI examples
 
@@ -106,6 +122,14 @@ queries. It never contacts a real `8317` service.
 Detailed design and the original requirements are in
 [`docs/cliproxy_usage_meter.md`](docs/cliproxy_usage_meter.md) and
 [`docs/cliproxy_usage_meter_requirements.md`](docs/cliproxy_usage_meter_requirements.md).
+
+## Privacy and data safety
+
+The runtime SQLite database lives under `datas/` and is ignored by Git,
+including WAL files. Raw authorization headers, OAuth tokens, refresh tokens,
+API keys, and management keys are never persisted. The public repository
+contains source, tests, documentation, and a deliberately masked screenshot—
+never local usage history or machine-specific paths.
 
 ## License
 

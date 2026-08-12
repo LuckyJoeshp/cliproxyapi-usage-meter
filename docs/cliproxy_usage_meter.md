@@ -62,8 +62,7 @@ PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
   scripts/start_cliproxy_usage_meter_from_chrome.py
 ```
 
-本机当前运行的 8317 实例配置文件是 `/opt/homebrew/etc/cliproxyapi.conf`；该实例
-的 `usage-statistics-enabled` 已为 true，因此不需要改写 `~/.cli-proxy-api/config.yaml`
+如果本机的 CLIProxyAPI 实例已开启 `usage-statistics-enabled`，则不需要改写其配置文件
 或重启 8317。CLIProxyAPI v7.2.125 的 queue 源码默认只保留 60 秒、最大 3600 秒，
 `GET /usage-queue` 会 destructive pop；本机未另设 retention，因此 poller 尚未启用时
 已经过期的历史请求无法从该队列补回。对应源码见
