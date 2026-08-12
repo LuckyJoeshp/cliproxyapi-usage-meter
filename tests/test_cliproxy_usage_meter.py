@@ -1,0 +1,1211 @@
+from __future__ import annotations
+
+import http.client
+import importlib.util
+import hashlib
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "cliproxy_usage_meter.py"
+SPEC = importlib.util.spec_from_file_location("cliproxy_usage_meter", SCRIPT)
+assert SPEC and SPEC.loader
+meter = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = meter
+SPEC.loader.exec_module(meter)
+CHROME_HELPER = ROOT / "scripts" / "start_cliproxy_usage_meter_from_chrome.py"
+CHROME_SPEC = importlib.util.spec_from_file_location("cliproxy_chrome_key", CHROME_HELPER)
+assert CHROME_SPEC and CHROME_SPEC.loader
+chrome_key = importlib.util.module_from_spec(CHROME_SPEC)
+sys.modules[CHROME_SPEC.name] = chrome_key
+CHROME_SPEC.loader.exec_module(chrome_key)
+
+
+AUTH_SECRET = "fixture-auth-value"
+ERROR_SECRET = "fixture-error-value"
+
+
+class FakeUpstreamHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    auth_forwarded = False
+    usage_header_forwarded = False
+    management_auth_forwarded = False
+    management_calls = 0
+    management_status = 200
+    queue_payload: list[object] = []
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.startswith("/v0/management/usage-queue"):
+            type(self).management_calls += 1
+            type(self).management_auth_forwarded = self.headers.get("Authorization") == "Bearer management-fixture"
+            if type(self).management_status != 200:
+                self._json(type(self).management_status, {"error": "management unavailable"})
+                return
+            payload = type(self).queue_payload
+            type(self).queue_payload = []
+            self._json(200, payload)
+            return
+        if self.path.startswith("/v1/models"):
+            self._json(200, {"object": "list", "data": [], "requested_path": self.path})
+            return
+        self._json(404, {"error": {"message": "not found", "type": "not_found"}})
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b""
+        try:
+            request = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            request = {}
+        type(self).auth_forwarded = self.headers.get("Authorization") == f"Bearer {AUTH_SECRET}"
+        type(self).usage_header_forwarded = "X-Usage-Alias" in self.headers
+
+        if self.path == "/v1/responses":
+            self._json(
+                200,
+                {
+                    "id": "resp_fake",
+                    "model": request.get("model", "fake-responses"),
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "total_tokens": 150,
+                        "input_tokens_details": {"cached_tokens": 20},
+                        "output_tokens_details": {"reasoning_tokens": 10},
+                    },
+                },
+            )
+            return
+        if self.path == "/v1/chat/completions":
+            self._json(
+                200,
+                {
+                    "id": "chat_fake",
+                    "model": request.get("model", "fake-chat"),
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 10,
+                        "total_tokens": 40,
+                        "prompt_tokens_details": {"cached_tokens": 5},
+                        "completion_tokens_details": {"reasoning_tokens": 4},
+                    },
+                },
+            )
+            return
+        if self.path == "/v1/no-usage":
+            self._json(200, {"id": "no_usage", "model": request.get("model", "fake-missing")})
+            return
+        if self.path == "/v1/fail":
+            self._json(
+                429,
+                {
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": f"usage limit reached; Authorization: Bearer {AUTH_SECRET}; api_key={ERROR_SECRET}",
+                    }
+                },
+            )
+            return
+        if self.path == "/v1/stream":
+            chunks = [
+                b'data: {"type":"response.created","response":{"model":"fake-stream"}}\n\n',
+                b'data: {"type":"response.completed","response":{"model":"fake-stream","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for chunk in chunks:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                time.sleep(0.01)
+            self.close_connection = True
+            return
+        if self.path == "/v1/stream-no-usage":
+            body = b'data: {"type":"response.output_text.delta","delta":"hello"}\n\ndata: [DONE]\n\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        if self.path == "/v1/stream-slow":
+            first = b'data: {"type":"response.output_text.delta","delta":"first"}\n\n'
+            final = b'data: {"type":"response.completed","response":{"model":"fake-stream","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\ndata: [DONE]\n\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            time.sleep(0.35)
+            self.wfile.write(final)
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        self._json(404, {"error": {"message": "not found", "type": "not_found"}})
+
+    def _json(self, status: int, payload: object) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class UsageMeterMVPTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.temp_path = Path(self.temp.name)
+        self.db = self.temp_path / "usage.sqlite"
+
+        fake_home = self.temp_path / "home"
+        codex_home = fake_home / ".codex-c"
+        proxy_home = fake_home / ".cli-proxy-api"
+        codex_home.mkdir(parents=True)
+        proxy_home.mkdir(parents=True)
+        (fake_home / ".zshrc").write_text(
+            'alias codex-1=\'__codex_switch "$HOME/.codex-c" codex-1\'\n', encoding="utf-8"
+        )
+        (codex_home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {"account_id": "acct-unit-test-ABCDEFGH", "access_token": AUTH_SECRET},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        FakeUpstreamHandler.auth_forwarded = False
+        FakeUpstreamHandler.usage_header_forwarded = False
+        FakeUpstreamHandler.management_auth_forwarded = False
+        FakeUpstreamHandler.management_calls = 0
+        FakeUpstreamHandler.management_status = 200
+        FakeUpstreamHandler.queue_payload = []
+        self.fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
+        self.fake_thread = threading.Thread(target=self.fake.serve_forever, daemon=True)
+        self.fake_thread.start()
+
+        resolver = meter.AccountResolver(home=fake_home, refresh_seconds=0)
+        self.sidecar = meter.create_server(
+            "127.0.0.1",
+            0,
+            f"http://127.0.0.1:{self.fake.server_address[1]}",
+            self.db,
+            account_resolver=resolver,
+            upstream_timeout=5,
+        )
+        self.sidecar.repo.set_price("fake-*", 1.0, 2.0, 0.5, "unit test only")
+        self.sidecar_thread = threading.Thread(target=self.sidecar.serve_forever, daemon=True)
+        self.sidecar_thread.start()
+        self.port = self.sidecar.server_address[1]
+
+    def tearDown(self) -> None:
+        self.sidecar.shutdown()
+        self.sidecar.server_close()
+        self.sidecar_thread.join(timeout=2)
+        self.fake.shutdown()
+        self.fake.server_close()
+        self.fake_thread.join(timeout=2)
+        self.temp.cleanup()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: object | None = None,
+        *,
+        alias: str | None = "codex-1",
+    ) -> tuple[int, list[tuple[str, str]], bytes]:
+        body = json.dumps(payload).encode() if payload is not None else None
+        headers = {"Authorization": f"Bearer {AUTH_SECRET}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if alias:
+            headers["X-Usage-Alias"] = alias
+            headers["X-Usage-Project"] = "unit-test"
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read()
+        result = (response.status, response.getheaders(), response_body)
+        connection.close()
+        return result
+
+    def wait_events(self, expected: int, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with sqlite3.connect(self.db) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
+            if count >= expected:
+                return
+            time.sleep(0.01)
+        self.fail(f"timed out waiting for {expected} usage events")
+
+    def rows(self, sql: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
+        with sqlite3.connect(self.db) as conn:
+            conn.row_factory = sqlite3.Row
+            return conn.execute(sql, params).fetchall()
+
+    def test_responses_non_streaming_usage_cost_and_account_mapping(self) -> None:
+        status, _, body = self.request(
+            "POST",
+            "/v1/responses",
+            {
+                "model": "fake-responses",
+                "input": "hello",
+                "client_metadata": {
+                    "session_id": "session-A",
+                    "thread_id": "thread-A",
+                    "turn_id": "turn-A",
+                    "x-codex-installation-id": "install-A",
+                    "x-codex-window-id": "window-A",
+                },
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["id"], "resp_fake")
+        self.wait_events(1)
+        row = self.rows("SELECT * FROM usage_events")[0]
+        self.assertEqual((row["input_tokens"], row["output_tokens"], row["total_tokens"]), (100, 50, 150))
+        self.assertEqual((row["cached_tokens"], row["reasoning_tokens"]), (20, 10))
+        self.assertAlmostEqual(row["estimated_api_cost_usd"], 0.00019, places=10)
+        self.assertAlmostEqual(row["non_cached_input_cost_usd"], 0.00008, places=10)
+        self.assertAlmostEqual(row["cached_input_cost_usd"], 0.00001, places=10)
+        self.assertAlmostEqual(row["output_cost_usd"], 0.0001, places=10)
+        self.assertAlmostEqual(
+            row["non_cached_input_cost_usd"]
+            + row["cached_input_cost_usd"]
+            + row["output_cost_usd"],
+            row["estimated_api_cost_usd"],
+            places=12,
+        )
+        self.assertEqual(row["usage_alias"], "codex-1")
+        self.assertEqual(row["account_id_tail"], "ABCDEFGH")
+        self.assertTrue(row["account_id_hash"])
+        self.assertEqual((row["session_id"], row["thread_id"], row["turn_id"]), ("session-A", "thread-A", "turn-A"))
+        self.assertTrue(FakeUpstreamHandler.auth_forwarded)
+        self.assertFalse(FakeUpstreamHandler.usage_header_forwarded)
+
+    def test_chat_completions_normalization(self) -> None:
+        status, _, _ = self.request(
+            "POST", "/v1/chat/completions", {"model": "fake-chat", "messages": [], "stream": False}
+        )
+        self.assertEqual(status, 200)
+        self.wait_events(1)
+        row = self.rows("SELECT * FROM usage_events")[0]
+        self.assertEqual((row["input_tokens"], row["output_tokens"], row["total_tokens"]), (30, 10, 40))
+        self.assertEqual((row["cached_tokens"], row["reasoning_tokens"]), (5, 4))
+        self.assertAlmostEqual(row["estimated_api_cost_usd"], 0.0000475, places=10)
+
+    def test_frozen_component_costs_do_not_follow_later_price_changes(self) -> None:
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(1)
+        before = self.sidecar.repo.summary("all")
+        self.sidecar.repo.set_price("fake-*", 9.0, 40.0, 0.9, "changed fixture price")
+        after = self.sidecar.repo.summary("all")
+        for key in (
+            "estimated_api_cost_usd",
+            "non_cached_input_cost_usd",
+            "cached_input_cost_usd",
+            "output_cost_usd",
+            "split_cost_total_usd",
+        ):
+            self.assertEqual(after[key], before[key], key)
+        self.assertAlmostEqual(after["split_cost_total_usd"], 0.00019, places=12)
+
+    def test_legacy_cost_component_backfill_requires_frozen_total_match(self) -> None:
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, model, input_tokens, cached_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, call_count)
+                   VALUES ('2020-01-01T00:00:00.000000Z', 'fake-responses',
+                           100, 20, 50, 150, 0.00019, 1)"""
+            )
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, model, input_tokens, cached_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, call_count)
+                   VALUES ('2020-01-01T00:00:01.000000Z', 'fake-responses',
+                           100, 20, 50, 150, 123.0, 1)"""
+            )
+        self.assertEqual(self.sidecar.repo.backfill_frozen_cost_components(), 1)
+        rows = self.rows(
+            """SELECT estimated_api_cost_usd, non_cached_input_cost_usd,
+                      cached_input_cost_usd, output_cost_usd
+                 FROM usage_events ORDER BY id"""
+        )
+        self.assertAlmostEqual(rows[0]["non_cached_input_cost_usd"], 0.00008, places=12)
+        self.assertAlmostEqual(rows[0]["cached_input_cost_usd"], 0.00001, places=12)
+        self.assertAlmostEqual(rows[0]["output_cost_usd"], 0.0001, places=12)
+        self.assertEqual(rows[1]["estimated_api_cost_usd"], 123.0)
+        self.assertIsNone(rows[1]["non_cached_input_cost_usd"])
+        self.assertIsNone(rows[1]["cached_input_cost_usd"])
+        self.assertIsNone(rows[1]["output_cost_usd"])
+        self.assertEqual(self.sidecar.repo.backfill_frozen_cost_components(), 0)
+
+    def test_repository_initialization_migrates_legacy_schema_and_backfills_safely(self) -> None:
+        legacy_db = self.temp_path / "legacy.sqlite"
+        with sqlite3.connect(legacy_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE usage_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts TEXT NOT NULL,
+                  usage_alias TEXT,
+                  model TEXT,
+                  input_tokens INTEGER,
+                  cached_tokens INTEGER,
+                  output_tokens INTEGER,
+                  estimated_api_cost_usd REAL,
+                  call_count INTEGER DEFAULT 1
+                );
+                CREATE TABLE model_prices (
+                  model_pattern TEXT PRIMARY KEY,
+                  input_per_million REAL,
+                  output_per_million REAL,
+                  cached_input_per_million REAL,
+                  reasoning_per_million REAL,
+                  currency TEXT,
+                  source_note TEXT,
+                  source_kind TEXT,
+                  updated_at TEXT
+                );
+                INSERT INTO model_prices VALUES
+                  ('legacy-model', 5.0, 30.0, 0.5, NULL, 'USD', 'fixture', 'manual', '2020');
+                INSERT INTO usage_events
+                  (ts, model, input_tokens, cached_tokens, output_tokens,
+                   estimated_api_cost_usd, call_count)
+                VALUES
+                  ('2020-01-01T00:00:00.000000Z', 'legacy-model',
+                   1000000, 500000, 100000, 5.75, 1);
+                """
+            )
+        meter.UsageRepository(legacy_db)
+        with sqlite3.connect(legacy_db) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_events)")}
+            row = conn.execute("SELECT * FROM usage_events").fetchone()
+        self.assertTrue(
+            {"non_cached_input_cost_usd", "cached_input_cost_usd", "output_cost_usd"}
+            <= columns
+        )
+        self.assertAlmostEqual(row["non_cached_input_cost_usd"], 2.5, places=12)
+        self.assertAlmostEqual(row["cached_input_cost_usd"], 0.25, places=12)
+        self.assertAlmostEqual(row["output_cost_usd"], 3.0, places=12)
+        self.assertAlmostEqual(row["estimated_api_cost_usd"], 5.75, places=12)
+
+    def test_auth_fingerprint_maps_account_without_alias_and_unpriced_stays_null(self) -> None:
+        status, _, _ = self.request(
+            "POST", "/v1/responses", {"model": "unpriced-model", "input": "hello"}, alias=None
+        )
+        self.assertEqual(status, 200)
+        self.wait_events(1)
+        row = self.rows("SELECT * FROM usage_events")[0]
+        self.assertEqual(row["usage_alias"], "codex-1")
+        self.assertEqual(row["account_id_tail"], "ABCDEFGH")
+        self.assertEqual(row["auth_fingerprint"], meter.short_hash(AUTH_SECRET))
+        self.assertIsNone(row["estimated_api_cost_usd"])
+        self.assertIsNone(
+            self.sidecar.repo.price_for("fake-responses", meter.NormalizedUsage(total_tokens=3))
+        )
+
+    def test_chrome_management_session_decoder_keeps_key_in_memory(self) -> None:
+        host = "localhost:8317"
+        user_agent = "fixture-user-agent"
+        expected = {"state": {"managementKey": "fixture-management", "apiBase": "http://localhost:8317"}}
+        plain = json.dumps(expected, separators=(",", ":")).encode()
+        mask = f"{chrome_key.STORAGE_PREFIX}|{host}|{user_agent}".encode()
+        cipher = bytes(byte ^ mask[index % len(mask)] for index, byte in enumerate(plain))
+        decoded = list(chrome_key._decoded_objects(cipher, [host], [user_agent]))
+        self.assertEqual(decoded, [expected])
+
+    def test_usage_queue_poller_records_direct_8317_event_without_api_key(self) -> None:
+        full_digest = hashlib.sha256(AUTH_SECRET.encode()).hexdigest()
+        FakeUpstreamHandler.queue_payload = [
+            {
+                "timestamp": "2026-08-12T00:00:00Z",
+                "latency_ms": 321,
+                "auth_index": "codex-eyrie-monody-9p@icloud.com-plus.json",
+                "access_token_sha256": full_digest,
+                "api_key": "queue-api-secret-must-not-be-stored",
+                "model": "fake-responses",
+                "alias": "fake-responses",
+                "endpoint": "/v1/responses",
+                "tokens": {
+                    "input_tokens": 12,
+                    "output_tokens": 8,
+                    "cached_tokens": 2,
+                    "reasoning_tokens": 3,
+                    "total_tokens": 20,
+                },
+                "failed": False,
+                "fail": {"status_code": 200, "body": ""},
+                "request_id": "queue-request-1",
+            }
+        ]
+        key_file = self.temp_path / "management.key"
+        key_file.write_text("management-fixture\n", encoding="utf-8")
+        key_file.chmod(0o600)
+        poller = meter.UsageQueuePoller(
+            self.sidecar.repo,
+            self.sidecar.resolver,
+            meter.urlsplit(f"http://127.0.0.1:{self.fake.server_address[1]}"),
+            key_file=str(key_file),
+            poll_seconds=0.5,
+        )
+        poller.start()
+        try:
+            self.wait_events(1)
+        finally:
+            poller.stop()
+        row = self.rows("SELECT * FROM usage_events")[0]
+        self.assertEqual(row["source"], "usage_queue")
+        self.assertEqual(row["request_id"], meter.short_hash("queue-request-1"))
+        self.assertEqual(row["usage_alias"], "codex-1")
+        self.assertEqual((row["input_tokens"], row["output_tokens"], row["total_tokens"]), (12, 8, 20))
+        self.assertIsNone(row["session_id"])
+        self.assertEqual(row["duration_ms"], 321)
+        self.assertTrue(FakeUpstreamHandler.management_auth_forwarded)
+        self.assertNotIn("queue-api-secret-must-not-be-stored", "\n".join(self._sqlite_dump()))
+
+    def test_usage_queue_403_uses_long_backoff_without_retry_storm(self) -> None:
+        FakeUpstreamHandler.management_status = 403
+        key_file = self.temp_path / "management-backoff.key"
+        key_file.write_text("management-fixture\n", encoding="utf-8")
+        key_file.chmod(0o600)
+        poller = meter.UsageQueuePoller(
+            self.sidecar.repo,
+            self.sidecar.resolver,
+            meter.urlsplit(f"http://127.0.0.1:{self.fake.server_address[1]}"),
+            key_file=str(key_file),
+            poll_seconds=0.5,
+        )
+        poller.start()
+        try:
+            deadline = time.monotonic() + 2
+            while FakeUpstreamHandler.management_calls < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(FakeUpstreamHandler.management_calls, 1)
+            time.sleep(0.65)
+            self.assertEqual(FakeUpstreamHandler.management_calls, 1)
+            status = poller.status()
+            self.assertEqual(status["last_status"], 403)
+            self.assertEqual(status["backoff_seconds"], meter.MAX_MANAGEMENT_BACKOFF_SECONDS)
+        finally:
+            poller.stop()
+
+    def _sqlite_dump(self) -> list[str]:
+        with sqlite3.connect(self.db) as conn:
+            return list(conn.iterdump())
+
+    def test_missing_usage_and_other_v1_path_are_recorded(self) -> None:
+        status, _, _ = self.request("POST", "/v1/no-usage", {"model": "fake-missing"})
+        self.assertEqual(status, 200)
+        status, _, body = self.request("GET", "/v1/models?source=fake", None)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["requested_path"], "/v1/models?source=fake")
+        self.wait_events(2)
+        rows = self.rows("SELECT endpoint, usage_missing, call_count FROM usage_events ORDER BY id")
+        self.assertEqual([(row["endpoint"], row["usage_missing"], row["call_count"]) for row in rows], [("/v1/no-usage", 1, 1), ("/v1/models", 1, 1)])
+
+    def test_malformed_v1_request_is_still_counted(self) -> None:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as client:
+            client.sendall(
+                b"POST /v1/responses HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                + f"Authorization: Bearer {AUTH_SECRET}\r\n".encode()
+                + b"Content-Length: invalid\r\nConnection: close\r\n\r\n"
+            )
+            response = client.recv(4096)
+        self.assertIn(b"400", response.split(b"\r\n", 1)[0])
+        self.wait_events(1)
+        row = self.rows("SELECT status_code, ok, usage_missing, call_count FROM usage_events")[0]
+        self.assertEqual(tuple(row), (400, 0, 1, 1))
+
+    def test_failure_is_counted_redacted_and_closes_quota_cycle(self) -> None:
+        status, _, _ = self.request("POST", "/v1/fail", {"model": "fake-error"})
+        self.assertEqual(status, 429)
+        self.wait_events(1)
+        row = self.rows("SELECT * FROM usage_events")[0]
+        self.assertEqual((row["ok"], row["call_count"], row["usage_missing"]), (0, 1, 1))
+        self.assertIn("<redacted", row["error_message_redacted"])
+        quota = self.rows("SELECT event_type, raw_message_redacted FROM quota_events")
+        self.assertEqual(quota[0]["event_type"], "usage_limit_hit")
+        cycles = self.rows("SELECT is_complete_cycle FROM account_quota_cycles")
+        self.assertEqual(cycles[0]["is_complete_cycle"], 1)
+
+        with sqlite3.connect(self.db) as conn:
+            dump = "\n".join(conn.iterdump())
+        if AUTH_SECRET in dump or ERROR_SECRET in dump:
+            self.fail("a raw credential leaked into SQLite")
+
+    def test_success_after_quota_records_automatic_reset(self) -> None:
+        self.request("POST", "/v1/fail", {"model": "fake-error"})
+        self.wait_events(1)
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(2)
+        events = [row["event_type"] for row in self.rows("SELECT event_type FROM quota_events ORDER BY id")]
+        self.assertEqual(events, ["usage_limit_hit", "reset_detected"])
+        summary = self.sidecar.repo.quota_summary("30d")[0]
+        self.assertEqual(summary["currently_quota_hit"], 0)
+
+    def test_success_after_quota_does_not_reset_while_provider_window_is_full(self) -> None:
+        self.request("POST", "/v1/fail", {"model": "fake-error"})
+        self.wait_events(1)
+        identity = self.rows("SELECT identity_key, account_id_hash, account_id_tail FROM usage_events LIMIT 1")[0]
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-12T00:00:00Z",
+                "identity_key": identity["identity_key"],
+                "account_id_hash": identity["account_id_hash"],
+                "account_id_tail": identity["account_id_tail"],
+                "usage_alias": "codex-1",
+                "window_kind": "weekly",
+                "used_percent": 100,
+                "remaining_percent": 0,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-19T00:00:00Z",
+                "source": "fixture",
+            }
+        )
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(2)
+        events = [row["event_type"] for row in self.rows("SELECT event_type FROM quota_events ORDER BY id")]
+        self.assertEqual(events, ["usage_limit_hit"])
+
+    def test_sse_is_byte_transparent_and_usage_is_recorded(self) -> None:
+        expected = (
+            b'data: {"type":"response.created","response":{"model":"fake-stream"}}\n\n'
+            b'data: {"type":"response.completed","response":{"model":"fake-stream","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        status, headers, body = self.request("POST", "/v1/stream", {"model": "fake-stream", "stream": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertIn("text/event-stream", dict((key.lower(), value) for key, value in headers)["content-type"])
+        self.wait_events(1)
+        row = self.rows("SELECT * FROM usage_events")[0]
+        self.assertEqual((row["stream"], row["usage_missing"], row["total_tokens"]), (1, 0, 18))
+        self.assertEqual((row["cached_tokens"], row["reasoning_tokens"]), (3, 2))
+
+    def test_sse_without_usage_is_marked_missing(self) -> None:
+        status, _, body = self.request("POST", "/v1/stream-no-usage", {"model": "fake-stream", "stream": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
+        self.wait_events(1)
+        row = self.rows("SELECT stream, usage_missing FROM usage_events")[0]
+        self.assertEqual(tuple(row), (1, 1))
+
+    def test_sse_first_event_is_forwarded_before_slow_stream_finishes(self) -> None:
+        body = json.dumps({"model": "fake-stream", "stream": True}).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        started = time.monotonic()
+        connection.request(
+            "POST",
+            "/v1/stream-slow",
+            body=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {AUTH_SECRET}"},
+        )
+        response = connection.getresponse()
+        first_line = response.readline()
+        first_elapsed = time.monotonic() - started
+        rest = response.read()
+        connection.close()
+        self.assertEqual(first_line, b'data: {"type":"response.output_text.delta","delta":"first"}\n')
+        self.assertLess(first_elapsed, 0.25, "the sidecar buffered the streaming response")
+        self.assertIn(b"response.completed", rest)
+        self.wait_events(1)
+        row = self.rows("SELECT stream, total_tokens FROM usage_events")[0]
+        self.assertEqual(tuple(row), (1, 3))
+
+    def test_dashboard_and_all_required_cli_queries(self) -> None:
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.request("POST", "/v1/chat/completions", {"model": "fake-chat", "messages": []})
+        self.wait_events(2)
+        status, _, page = self.request("GET", "/usage", None, alias=None)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Usage Observatory", page)
+        self.assertIn("Token 消费总览".encode(), page)
+        self.assertIn("近 7 天趋势".encode(), page)
+        self.assertIn("订阅额度雷达".encode(), page)
+        self.assertIn("非缓存输入 Tokens".encode(), page)
+        self.assertIn("输出 Tokens".encode(), page)
+        self.assertIn("缓存命中 Tokens".encode(), page)
+        self.assertIn("输入成本".encode(), page)
+        self.assertIn("输出成本".encode(), page)
+        self.assertIn("缓存成本".encode(), page)
+        self.assertIn("API 原始处理量".encode(), page)
+        self.assertIn("逻辑请求".encode(), page)
+        self.assertIn("推理（输出子集）".encode(), page)
+        self.assertIn(b'--paper:#fff4dd', page)
+        self.assertIn(b'box-shadow:var(--shadow)', page)
+        self.assertIn(b'data-role="theme-toggle"', page)
+        self.assertIn(b"cliproxy-usage-theme", page)
+        self.assertIn(b"codex-1", page)
+
+        commands = [
+            ("--summary", "today"),
+            ("--summary", "all"),
+            ("--recent", "20"),
+            ("--by-account", "7d"),
+            ("--by-model", "7d"),
+            ("--by-session", "7d"),
+            ("--by-date", "7d"),
+            ("--quota-summary", "30d"),
+            ("--quota-summary-by-account",),
+            ("--price-sync-status",),
+        ]
+        for action in commands:
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPT), "--db", str(self.db), "--json", *action],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, msg=f"CLI failed for {action}: {completed.stderr}")
+            parsed = json.loads(completed.stdout)
+            self.assertTrue(parsed)
+
+    def test_all_time_query_keeps_history_outside_seven_day_view(self) -> None:
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(2)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE usage_events SET ts='2020-01-01T00:00:00.000000Z' WHERE id=1")
+        week = self.sidecar.repo.summary("7d")
+        all_time = self.sidecar.repo.summary("all")
+        self.assertEqual(week["calls"], 1)
+        self.assertEqual(week["total_tokens"], 150)
+        self.assertEqual(all_time["calls"], 2)
+        self.assertEqual(all_time["total_tokens"], 300)
+        self.assertEqual(all_time["codex_status_tokens"], 260)
+        self.assertEqual(all_time["api_processed_tokens"], 300)
+        self.assertEqual(all_time["cached_tokens"], 40)
+        self.assertIsNone(all_time["since"])
+        coverage = self.sidecar.repo.coverage()
+        self.assertEqual(coverage["first_event_ts"], "2020-01-01T00:00:00.000000Z")
+        dates = self.sidecar.repo.grouped("all", "date")
+        self.assertEqual(sum(row["calls"] for row in dates), 2)
+
+    def test_codex_quota_parser_and_subscription_dashboard(self) -> None:
+        fetched_at = "2026-08-12T00:00:00Z"
+        windows = meter.parse_codex_quota_windows(
+            {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 22,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1786500000,
+                    },
+                    "secondary_window": {
+                        "used_percent": 61.5,
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": 3600,
+                    },
+                },
+            },
+            fetched_at,
+        )
+        self.assertEqual([row["window_kind"] for row in windows], ["five_hour", "weekly"])
+        self.assertEqual(windows[0]["remaining_percent"], 78.0)
+        self.assertEqual(windows[1]["remaining_percent"], 38.5)
+        for window in windows:
+            self.sidecar.repo.insert_subscription_quota_snapshot(
+                {
+                    **window,
+                    "identity_key": "account:fixture",
+                    "account_id_hash": "fixturehash",
+                    "account_id_tail": "ABCDEFGH",
+                    "usage_alias": "codex-1",
+                    "plan_type": "plus",
+                    "source": "fixture",
+                }
+            )
+        subscriptions = self.sidecar.repo.subscription_dashboard_rows()
+        fixture = next(row for row in subscriptions if row["identity_key"] == "account:fixture")
+        self.assertEqual(fixture["plan_type"], "plus")
+        self.assertEqual(fixture["windows"]["five_hour"]["remaining_percent"], 78.0)
+        page = meter.dashboard_html(
+            self.sidecar.repo,
+            {"key_loaded": True, "last_status": 200},
+            {"last_success_at": fetched_at, "account_count": 1},
+        )
+        self.assertIn("78%", page)
+        self.assertIn("38.5%", page)
+        self.assertIn("已用 22% · 剩余 78%", page)
+        self.assertIn("1 个账号已刷新", page)
+        page_after_restart_timeout = meter.dashboard_html(
+            self.sidecar.repo,
+            {"key_loaded": True, "last_status": 200},
+            {"last_success_at": None, "account_count": 0, "last_error_type": "TimeoutError"},
+        )
+        self.assertIn("1 个账号已刷新", page_after_restart_timeout)
+        self.assertIn("Quota snapshot <b>正常", page_after_restart_timeout)
+        self.assertIn("codex-1", page)
+
+    def test_subscription_estimate_uses_provider_window_and_meaningful_identity_badge(self) -> None:
+        # A near-cap provider snapshot must use the observed spend, not the
+        # last fragmented 429 cycle.  A low-use freshly reset account stays
+        # explicitly unprojected.
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-12T12:00:00Z",
+                "identity_key": "account:fixture",
+                "account_id_hash": "fixturehash",
+                "account_id_tail": "ABCDEFGH",
+                "usage_alias": "codex-1",
+                "plan_type": "plus",
+                "window_kind": "weekly",
+                "used_percent": 100,
+                "remaining_percent": 0,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-19T12:00:00Z",
+                "source": "fixture",
+            }
+        )
+        rows = self.sidecar.repo.subscription_dashboard_rows()
+        fixture = next(row for row in rows if row["identity_key"] == "account:fixture")
+        self.assertIsNone(fixture["current_window_full_quota_usd"])
+        self.assertEqual(fixture["quota_estimate_method"], "observed_floor_only")
+        self.assertEqual(meter.identity_badge(fixture)[0], "C")
+        anonymous = {"usage_alias": "auth:abcd", "identity_key": "account:x"}
+        self.assertEqual(meter.identity_badge(anonymous)[0], "A")
+
+    def test_low_use_current_window_can_transfer_measured_previous_window(self) -> None:
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, identity_key, account_id_hash, account_id_tail, usage_alias,
+                    model, ok, status_code, input_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, call_count, usage_missing)
+                   VALUES ('2026-08-10T12:00:00.000000Z', 'account:fixture',
+                           'fixturehash', 'ABCDEFGH', 'codex-1', 'fake-responses',
+                           1, 200, 1000000, 0, 1000000, 20.0, 1, 0)"""
+            )
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-11T11:00:00Z",
+                "identity_key": "account:fixture",
+                "account_id_hash": "fixturehash",
+                "account_id_tail": "ABCDEFGH",
+                "usage_alias": "codex-1",
+                "window_kind": "weekly",
+                "used_percent": 100,
+                "remaining_percent": 0,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-12T12:00:00Z",
+                "source": "fixture",
+            }
+        )
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-12T13:00:00Z",
+                "identity_key": "account:fixture",
+                "account_id_hash": "fixturehash",
+                "account_id_tail": "ABCDEFGH",
+                "usage_alias": "codex-1",
+                "window_kind": "weekly",
+                "used_percent": 5,
+                "remaining_percent": 95,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-19T12:00:00Z",
+                "source": "fixture",
+            }
+        )
+        row = next(
+            item for item in self.sidecar.repo.subscription_dashboard_rows()
+            if item["identity_key"] == "account:fixture"
+        )
+        self.assertAlmostEqual(row["current_window_full_quota_usd"], 20.0, places=8)
+        self.assertEqual(row["quota_estimate_method"], "previous_window_transfer")
+
+    def test_high_used_current_window_projects_remaining_five_percent(self) -> None:
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, identity_key, account_id_hash, account_id_tail, usage_alias,
+                    model, ok, status_code, input_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, call_count, usage_missing)
+                   VALUES ('2026-08-12T12:00:00.000000Z', 'account:fixture',
+                           'fixturehash', 'ABCDEFGH', 'codex-1', 'fake-responses',
+                           1, 200, 9500000, 0, 9500000, 95.0, 1, 0)"""
+            )
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-12T13:00:00Z",
+                "identity_key": "account:fixture",
+                "account_id_hash": "fixturehash",
+                "account_id_tail": "ABCDEFGH",
+                "usage_alias": "codex-1",
+                "window_kind": "weekly",
+                "used_percent": 95,
+                "remaining_percent": 5,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-19T12:00:00Z",
+                "source": "fixture",
+            }
+        )
+        row = next(
+            item for item in self.sidecar.repo.subscription_dashboard_rows()
+            if item["identity_key"] == "account:fixture"
+        )
+        self.assertAlmostEqual(row["current_window_full_quota_usd"], 100.0, places=8)
+        self.assertEqual(row["quota_estimate_method"], "current_window_percent_projection")
+
+    def test_five_percent_used_gives_fast_initial_estimate(self) -> None:
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, identity_key, account_id_hash, account_id_tail, usage_alias,
+                    model, ok, status_code, input_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, call_count, usage_missing)
+                   VALUES ('2026-08-12T12:00:00.000000Z', 'account:fixture',
+                           'fixturehash', 'ABCDEFGH', 'codex-1', 'fake-responses',
+                           1, 200, 500000, 0, 500000, 5.0, 1, 0)"""
+            )
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-12T13:00:00Z",
+                "identity_key": "account:fixture",
+                "account_id_hash": "fixturehash",
+                "account_id_tail": "ABCDEFGH",
+                "usage_alias": "codex-1",
+                "window_kind": "weekly",
+                "used_percent": 5,
+                "remaining_percent": 95,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-19T12:00:00Z",
+                "source": "fixture",
+            }
+        )
+        row = next(item for item in self.sidecar.repo.subscription_dashboard_rows() if item["identity_key"] == "account:fixture")
+        self.assertAlmostEqual(row["current_window_full_quota_usd"], 100.0, places=8)
+        self.assertEqual(row["quota_estimate_confidence"], "initial")
+
+    def test_official_pricing_parser_reads_standard_short_context_rates(self) -> None:
+        fake_html = """
+        <div data-content-switcher-pane="true" data-value="standard">
+          <astro-island component-export="TextTokenPricingTables">
+            <table>
+              <thead><tr><th>Model</th><th>Input</th><th>Cached input</th><th>Cache writes</th><th>Output</th></tr></thead>
+              <tbody>
+                <tr><td>gpt-5.6-sol</td><td>$5.00</td><td>$0.50</td><td>$6.25</td><td>$30.00</td></tr>
+                <tr><td>gpt-5.5 (&lt;272K context length)</td><td>$5.00</td><td>$0.50</td><td>-</td><td>$30.00</td></tr>
+              </tbody>
+            </table>
+          </astro-island>
+        </div>
+        """
+        rows = meter.parse_official_pricing_html(fake_html)
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "model_pattern": "gpt-5.6-sol",
+                    "input_per_million": 5.0,
+                    "output_per_million": 30.0,
+                    "cached_input_per_million": 0.5,
+                },
+                {
+                    "model_pattern": "gpt-5.5",
+                    "input_per_million": 5.0,
+                    "output_per_million": 30.0,
+                    "cached_input_per_million": 0.5,
+                },
+            ],
+        )
+
+    def test_official_pricing_parser_uses_complete_ssr_props_not_collapsed_rows(self) -> None:
+        fake_html = """
+        <div data-content-switcher-pane="true" data-value="standard">
+          <astro-island component-export="TextTokenPricingTables"
+            props="{&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.6-sol&quot;],[0,5],[0,0.5],[0,6.25],[0,30]]],[1,[[0,&quot;gpt-5.6-terra&quot;],[0,2],[0,0.2],[0,2.5],[0,12]]]]]}">
+            <table><thead><tr><th>Model</th><th>Input</th><th>Cached input</th><th>Cache writes</th><th>Output</th></tr></thead>
+            <tbody><tr><td>gpt-5.6-sol</td><td>$5.00</td><td>$0.50</td><td>$6.25</td><td>$30.00</td></tr></tbody></table>
+          </astro-island>
+        </div>
+        """
+        rows = meter.parse_official_pricing_html(fake_html)
+        self.assertEqual([row["model_pattern"] for row in rows], ["gpt-5.6-sol", "gpt-5.6-terra"])
+        self.assertEqual(rows[1]["cached_input_per_million"], 0.2)
+        self.assertEqual(rows[1]["output_per_million"], 12.0)
+
+    def test_official_price_sync_is_atomic_and_failure_keeps_old_prices(self) -> None:
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, model, input_tokens, cached_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, call_count)
+                   VALUES ('2020-01-01T00:00:00.000000Z', 'gpt-5.6-sol',
+                           1000000, 500000, 100000, 1100000, NULL, 1)"""
+            )
+        fake_html = b"""
+        <div data-content-switcher-pane="true" data-value="standard">
+          <astro-island component-export="TextTokenPricingTables">
+            <table><thead><tr><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th></tr></thead>
+            <tbody><tr><td>gpt-5.6-sol</td><td>$5.00</td><td>$0.50</td><td>$30.00</td></tr></tbody></table>
+          </astro-island>
+        </div>
+        """
+        digest = hashlib.sha256(fake_html).hexdigest()
+        with mock.patch.object(
+            meter,
+            "fetch_official_pricing_html",
+            return_value=(meter.OFFICIAL_PRICING_URL, fake_html, digest),
+        ):
+            result = meter.sync_official_prices(self.sidecar.repo)
+        self.assertEqual(result["model_count"], 1)
+        self.assertEqual(result["repriced_events"], 1)
+        repriced = self.rows(
+            """SELECT estimated_api_cost_usd, non_cached_input_cost_usd,
+                      cached_input_cost_usd, output_cost_usd
+                 FROM usage_events WHERE model='gpt-5.6-sol'"""
+        )[0]
+        self.assertAlmostEqual(repriced["estimated_api_cost_usd"], 5.75, places=10)
+        self.assertAlmostEqual(repriced["non_cached_input_cost_usd"], 2.5, places=10)
+        self.assertAlmostEqual(repriced["cached_input_cost_usd"], 0.25, places=10)
+        self.assertAlmostEqual(repriced["output_cost_usd"], 3.0, places=10)
+        price = next(row for row in self.sidecar.repo.list_prices() if row["model_pattern"] == "gpt-5.6-sol")
+        self.assertEqual(price["source_kind"], "official")
+        self.assertEqual(price["output_per_million"], 30.0)
+        self.assertEqual(self.sidecar.repo.price_sync_status()["status"], "ok")
+
+        with mock.patch.object(
+            meter,
+            "fetch_official_pricing_html",
+            side_effect=meter.OfficialPriceSyncError("fixture parse failure"),
+        ):
+            with self.assertRaises(meter.OfficialPriceSyncError):
+                meter.sync_official_prices(self.sidecar.repo)
+        price_after = next(
+            row for row in self.sidecar.repo.list_prices() if row["model_pattern"] == "gpt-5.6-sol"
+        )
+        self.assertEqual(price_after["output_per_million"], 30.0)
+        status = self.sidecar.repo.price_sync_status()
+        self.assertEqual(status["status"], "error")
+        self.assertEqual(status["error_type"], "OfficialPriceSyncError")
+
+    def test_summary_counts_success_failure_streaming_and_complete_quota(self) -> None:
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.request("POST", "/v1/fail", {"model": "fake-error"})
+        self.request("POST", "/v1/stream-no-usage", {"model": "fake-stream", "stream": True})
+        self.wait_events(3)
+        summary = self.sidecar.repo.summary("today")
+        self.assertEqual(summary["calls"], 3)
+        self.assertEqual(summary["successful_calls"], 2)
+        self.assertEqual(summary["failed_calls"], 1)
+        self.assertEqual(summary["streaming_calls"], 1)
+        self.assertEqual(summary["total_tokens"], 150)
+        self.assertAlmostEqual(summary["api_equivalent_quota_usd"], 0.00019, places=10)
+
+    def test_codex_status_token_breakdown_and_logical_request_attempts(self) -> None:
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.request("POST", "/v1/chat/completions", {"model": "fake-chat", "messages": []})
+        self.wait_events(2)
+        with sqlite3.connect(self.db) as conn:
+            conn.row_factory = sqlite3.Row
+            # The HTTP server handles requests concurrently, so SQLite insertion
+            # order is not a stable proxy for endpoint/model order. Select the
+            # rows by their fixture model before assigning logical request IDs.
+            source = conn.execute(
+                "SELECT * FROM usage_events WHERE model=? ORDER BY id LIMIT 1",
+                ("fake-responses",),
+            ).fetchone()
+            chat = conn.execute(
+                "SELECT id FROM usage_events WHERE model=? ORDER BY id LIMIT 1",
+                ("fake-chat",),
+            ).fetchone()
+            self.assertIsNotNone(source)
+            self.assertIsNotNone(chat)
+            conn.execute(
+                "UPDATE usage_events SET request_id=? WHERE id=?",
+                (meter.short_hash("logical-a"), source["id"]),
+            )
+            conn.execute(
+                "UPDATE usage_events SET request_id=? WHERE id=?",
+                (meter.short_hash("logical-b"), chat["id"]),
+            )
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(usage_events)")]
+            values = {column: source[column] for column in columns}
+            values.pop("id")
+            # The retry belongs to the Responses logical request, even though
+            # the row snapshot above predates the UPDATE statement.
+            values["request_id"] = meter.short_hash("logical-a")
+            values["usage_alias"] = "codex-retry"
+            values["ok"] = 0
+            values["status_code"] = 429
+            values["error_type"] = "rate_limit_error"
+            placeholders = ",".join("?" for _ in values)
+            conn.execute(
+                f"INSERT INTO usage_events ({','.join(values)}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+
+        summary = self.sidecar.repo.summary("all")
+        self.assertEqual(summary["account_attempts"], 3)
+        self.assertEqual(summary["logical_requests"], 2)
+        self.assertEqual(summary["retry_attempts"], 1)
+        self.assertEqual(summary["successful_calls"], 2)
+        self.assertEqual(summary["failed_calls"], 1)
+        self.assertEqual(summary["successful_logical_requests"], 2)
+        self.assertEqual(summary["failed_logical_requests"], 0)
+        self.assertEqual(summary["input_tokens"], 230)
+        self.assertEqual(summary["cached_tokens"], 45)
+        self.assertEqual(summary["non_cached_input_tokens"], 185)
+        self.assertEqual(summary["output_tokens"], 110)
+        self.assertEqual(summary["codex_status_tokens"], 295)
+        self.assertEqual(summary["api_processed_tokens"], 340)
+        self.assertEqual(summary["total_tokens"], 340)
+        self.assertAlmostEqual(summary["cache_hit_rate_percent"], 45 / 230 * 100)
+        self.assertAlmostEqual(summary["non_cached_input_cost_usd"], 0.000185, places=10)
+        self.assertAlmostEqual(summary["cached_input_cost_usd"], 0.0000225, places=10)
+        self.assertAlmostEqual(summary["output_cost_usd"], 0.00022, places=10)
+        self.assertAlmostEqual(
+            summary["split_cost_total_usd"], summary["estimated_api_cost_usd"], places=10
+        )
+
+        breakdown = self.sidecar.repo.token_breakdown("all")
+        self.assertEqual(breakdown["codex_status_tokens"], 295)
+        self.assertEqual(breakdown["reasoning_tokens"], 24)
+        self.assertNotEqual(
+            breakdown["codex_status_tokens"] + breakdown["reasoning_tokens"],
+            breakdown["api_processed_tokens"],
+            "reasoning is an output subset and must not be added again",
+        )
+        models = self.sidecar.repo.grouped("all", "model")
+        responses = next(row for row in models if row["model"] == "fake-responses")
+        self.assertEqual(responses["account_attempts"], 2)
+        self.assertEqual(responses["logical_requests"], 1)
+        self.assertEqual(responses["retry_attempts"], 1)
+        self.assertEqual(responses["codex_status_tokens"], 260)
+
+        page = meter.dashboard_html(self.sidecar.repo)
+        self.assertIn("账号调用 3 · 额外调用 1", page)
+        self.assertIn('总调用 <b>3</b>', page)
+        self.assertIn('成功 <b>2</b>', page)
+        self.assertIn('失败 <b>1</b>', page)
+        self.assertIn('额外调用 <b>1</b>', page)
+        self.assertIn("当前不能按 Codex session 精确拆分", page)
+        self.assertIn("实际消耗 = max(输入−缓存, 0)+输出", page)
+        self.assertIn("非缓存输入 Tokens", page)
+        self.assertIn("输出 Tokens", page)
+        self.assertIn("输入成本 $0.000185", page)
+        self.assertIn("输出成本 $0.000220", page)
+
+    def test_manual_quota_and_reset_commands_preserve_cycle_history(self) -> None:
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(1)
+        base_command = [sys.executable, str(SCRIPT), "--db", str(self.db), "--no-account-scan"]
+        quota_result = subprocess.run(
+            [*base_command, "--mark-quota-hit", "codex-1"], cwd=ROOT, text=True, capture_output=True, timeout=10
+        )
+        self.assertEqual(quota_result.returncode, 0, quota_result.stderr)
+        reset_result = subprocess.run(
+            [*base_command, "--mark-reset", "codex-1"], cwd=ROOT, text=True, capture_output=True, timeout=10
+        )
+        self.assertEqual(reset_result.returncode, 0, reset_result.stderr)
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(3)
+        quota_result = subprocess.run(
+            [*base_command, "--mark-quota-hit", "codex-1"], cwd=ROOT, text=True, capture_output=True, timeout=10
+        )
+        self.assertEqual(quota_result.returncode, 0, quota_result.stderr)
+
+        quotas = self.sidecar.repo.quota_summary("30d")
+        self.assertEqual(quotas[0]["complete_cycles_in_period"], 2)
+        self.assertAlmostEqual(quotas[0]["historical_min_usd"], 0.00019, places=10)
+        self.assertAlmostEqual(quotas[0]["historical_p50_usd"], 0.000285, places=10)
+        self.assertAlmostEqual(quotas[0]["historical_max_usd"], 0.00038, places=10)
+        cycles = self.rows("SELECT is_complete_cycle FROM account_quota_cycles ORDER BY id")
+        self.assertEqual([row["is_complete_cycle"] for row in cycles], [1, 1])
+        quota_events = [row["event_type"] for row in self.rows("SELECT event_type FROM quota_events ORDER BY id")]
+        self.assertEqual(quota_events, ["manual_quota_hit", "manual_reset", "manual_quota_hit"])
+
+    def test_start_script_uses_an_independent_port_and_fake_upstream(self) -> None:
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        sidecar_port = probe.getsockname()[1]
+        probe.close()
+        external_db = self.temp_path / "external.sqlite"
+        environment = os.environ.copy()
+        environment.pop("CLIPROXY_MANAGEMENT_KEY", None)
+        environment.pop("CLIPROXY_MANAGEMENT_KEY_FILE", None)
+        environment.update(
+            {
+                "PORT": str(sidecar_port),
+                "UPSTREAM": f"http://127.0.0.1:{self.fake.server_address[1]}",
+                "CLIPROXY_USAGE_DB": str(external_db),
+                "CLIPROXY_USAGE_ACCOUNT_SCAN": "0",
+            }
+        )
+        process = subprocess.Popen(
+            [str(ROOT / "scripts" / "start_cliproxy_usage_meter.sh")],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            health_body = None
+            while time.monotonic() < deadline:
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", sidecar_port, timeout=0.5)
+                    connection.request("GET", "/healthz")
+                    response = connection.getresponse()
+                    health_body = response.read()
+                    connection.close()
+                    if response.status == 200:
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            self.assertIsNotNone(health_body, "start script did not expose /healthz")
+            health = json.loads(health_body)
+            self.assertTrue(health["ok"])
+            self.assertFalse(health["usage_queue"]["enabled"])
+            self.assertFalse(health["subscription_quota"]["enabled"])
+            self.assertTrue(external_db.exists())
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
