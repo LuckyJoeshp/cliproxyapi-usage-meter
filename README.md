@@ -13,10 +13,12 @@ private-by-default dashboard. It runs as a transparent sidecar: clients can
 send traffic through `8327`, while the optional read-only queue collector also
 captures clients that still use `8317`.
 
-![Masked Usage Observatory demo](assets/usage-dashboard-demo.png)
+![Usage Observatory demo — real aggregates with account IDs masked](assets/usage-dashboard-demo.png)
 
-_The screenshot is a real dashboard render with live values, account labels,
-dates, and trend data masked. It is included only as a visual demo._
+_The screenshot is a real dashboard render: token totals, cost estimates,
+quota percentages, trends, model usage, and every account card remain visible.
+Only account names/identifiers and the account column in recent tables are
+replaced with neutral demo labels._
 
 > This is an observability tool, not a billing API. It cannot read an official
 > ChatGPT subscription balance. Dollar figures are API-price equivalents, and
@@ -128,8 +130,8 @@ Detailed design and the original requirements are in
 The runtime SQLite database lives under `datas/` and is ignored by Git,
 including WAL files. Raw authorization headers, OAuth tokens, refresh tokens,
 API keys, and management keys are never persisted. The public repository
-contains source, tests, documentation, and a deliberately masked screenshot—
-never local usage history or machine-specific paths.
+contains source, tests, documentation, and a screenshot with only account
+identities masked—never local usage history or machine-specific paths.
 
 ## License
 
