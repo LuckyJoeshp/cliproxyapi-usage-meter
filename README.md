@@ -61,6 +61,14 @@ PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
 
 Open <http://127.0.0.1:8327/usage>.
 
+The dashboard also monitors direct ChatGPT App Codex sessions when the local
+Codex JSONL history is available. It imports only token-count and rate-limit
+metadata from the `CODEX_APP_HOME` (default `~/.codex`) and matches the local
+account to `codex-13`; it does not inspect prompts, code, tool output, or
+credentials. A manual usage form is available on `/usage` for sessions from
+another device. Dollar values are API-equivalent estimates, not Pro
+subscription billing.
+
 ### Start Codex through CLIProxyAPI from any folder
 
 The repository includes [`scripts/codex-cliproxyapi`](scripts/codex-cliproxyapi),
@@ -101,7 +109,9 @@ without writing or printing it.
   an authentication boundary of your own.
 - Authorization, API keys, OAuth tokens and management keys are never printed
   or persisted. Only short hashes, account hashes and account-ID tails are
-  stored.
+  stored. The loopback dashboard may display each mapped subscription email
+  from its local Codex `auth.json` identity claim; email is kept in memory and
+  is not written to the usage/quota database or logs.
 - Management credentials must come from an owner-only (`0600`) external file
   or environment variable. They are never committed here.
 - SQLite files, WAL files, `.env` files, key files, caches and local paths are

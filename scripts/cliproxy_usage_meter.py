@@ -10,6 +10,7 @@ SHA-256 fingerprint for metering.
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
 import hashlib
 import html
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -50,6 +52,12 @@ DEFAULT_USAGE_QUEUE_POLL_SECONDS = 5.0
 DEFAULT_QUOTA_POLL_SECONDS = 300.0
 DEFAULT_QUOTA_POLL_TIMEOUT = 20.0
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+DEFAULT_CODEX_APP_HOME = Path.home() / ".codex"
+DEFAULT_CODEX_APP_ALIAS = "codex-13"
+DEFAULT_CODEX_APP_POLL_SECONDS = 15.0
+MAX_CODEX_APP_JSONL_BYTES = 128 * 1024 * 1024
+DEFAULT_CODEX_APP_MAX_FILES = 500
+MAX_MANUAL_IMPORT_BYTES = 64 * 1024
 DEFAULT_MANAGEMENT_BACKOFF_SECONDS = 300.0
 MAX_MANAGEMENT_BACKOFF_SECONDS = 1800.0
 MAX_INSPECT_BYTES = 8 * 1024 * 1024
@@ -158,6 +166,18 @@ def safe_alias(value: Any) -> str | None:
     if text and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text):
         return text
     return None
+
+
+def safe_email(value: Any) -> str | None:
+    """Return a bounded local identity email suitable for escaped display."""
+
+    text = safe_text(value, 320)
+    if not text or text.count("@") != 1 or any(character.isspace() for character in text):
+        return None
+    local, domain = text.rsplit("@", 1)
+    if not local or not domain or "." not in domain:
+        return None
+    return text
 
 
 def is_auth_fallback_alias(value: Any) -> bool:
@@ -438,6 +458,10 @@ class AccountIdentity:
     usage_alias: str | None
     account_id_hash: str | None
     account_id_tail: str | None
+    # Read from the local Codex auth identity only for loopback dashboard
+    # display.  Email is deliberately never copied into SQLite usage/quota
+    # rows, logs, queue payloads or health responses.
+    account_email: str | None = None
 
 
 class AccountResolver:
@@ -447,7 +471,9 @@ class AccountResolver:
         self.home = home or Path.home()
         self.enabled = enabled
         self.refresh_seconds = refresh_seconds
-        self._last_refresh = 0.0
+        # ``0.0`` is a valid monotonic timestamp on fresh processes.  Use a
+        # negative sentinel so the first resolve always performs a scan.
+        self._last_refresh = -float("inf")
         self._lock = threading.Lock()
         self._aliases: dict[str, AccountIdentity] = {}
         self._tokens: dict[str, AccountIdentity] = {}
@@ -468,7 +494,12 @@ class AccountResolver:
                 if not usage_alias or is_auth_fallback_alias(usage_alias)
                 else usage_alias
             )
-            return AccountIdentity(resolved_alias, matched.account_id_hash, matched.account_id_tail)
+            return AccountIdentity(
+                resolved_alias,
+                matched.account_id_hash,
+                matched.account_id_tail,
+                matched.account_email,
+            )
         return AccountIdentity(usage_alias, None, None)
 
     def resolve_queue(
@@ -562,10 +593,10 @@ class AccountResolver:
         account_to_alias: dict[str, str] = {}
         for alias, codex_home in alias_homes.items():
             data = self._read_json(codex_home / "auth.json")
-            account_id, access_tokens = self._account_and_tokens(data)
+            account_id, access_tokens, account_email = self._account_and_tokens(data)
             if not account_id:
                 continue
-            identity = self._identity(alias, account_id)
+            identity = self._identity(alias, account_id, account_email)
             aliases[alias] = identity
             account_to_alias[account_id] = alias
             accounts[account_id] = identity
@@ -581,11 +612,16 @@ class AccountResolver:
             proxy_files = []
         for path in proxy_files:
             data = self._read_json(path)
-            account_id, access_tokens = self._account_and_tokens(data)
+            account_id, access_tokens, account_email = self._account_and_tokens(data)
             if not account_id:
                 continue
             alias = account_to_alias.get(account_id)
-            identity = self._identity(alias, account_id)
+            known = accounts.get(account_id)
+            identity = self._identity(
+                alias,
+                account_id,
+                account_email or (known.account_email if known else None),
+            )
             accounts[account_id] = identity
             auth_indexes[path.name] = identity
             for token in access_tokens:
@@ -604,17 +640,44 @@ class AccountResolver:
             return None
 
     @staticmethod
-    def _account_and_tokens(data: Any) -> tuple[str | None, list[str]]:
+    def _account_and_tokens(data: Any) -> tuple[str | None, list[str], str | None]:
         if not isinstance(data, Mapping):
-            return None, []
+            return None, [], None
         nested = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
         account_id = safe_text(first_present(nested, ("account_id",)) or data.get("account_id"), 256)
         raw_tokens = [nested.get("access_token"), data.get("access_token")]
-        return account_id, [token for token in raw_tokens if isinstance(token, str) and token]
+        claims = _decode_jwt_claims_unverified(
+            nested.get("id_token") or data.get("id_token")
+        )
+        auth_claims = claims.get("https://api.openai.com/auth")
+        auth_claims = auth_claims if isinstance(auth_claims, Mapping) else {}
+        profile_claims = claims.get("https://api.openai.com/profile")
+        profile_claims = profile_claims if isinstance(profile_claims, Mapping) else {}
+        account_email = safe_email(
+            data.get("email")
+            or nested.get("email")
+            or claims.get("email")
+            or auth_claims.get("email")
+            or profile_claims.get("email")
+        )
+        return (
+            account_id,
+            [token for token in raw_tokens if isinstance(token, str) and token],
+            account_email,
+        )
 
     @staticmethod
-    def _identity(alias: str | None, account_id: str) -> AccountIdentity:
-        return AccountIdentity(alias, short_hash(account_id), account_id[-8:] if account_id else None)
+    def _identity(
+        alias: str | None,
+        account_id: str,
+        account_email: str | None = None,
+    ) -> AccountIdentity:
+        return AccountIdentity(
+            alias,
+            short_hash(account_id),
+            account_id[-8:] if account_id else None,
+            safe_email(account_email),
+        )
 
 
 def identity_key(
@@ -760,6 +823,24 @@ class UsageEvent:
     call_count: int = 1
     source: str = "sidecar"
     request_id: str | None = None
+
+
+def _decode_jwt_claims_unverified(value: Any) -> Mapping[str, Any]:
+    """Read non-secret identity metadata from a local JWT without verifying it.
+
+    The token itself is never returned, logged or persisted.  This is suitable
+    only for matching two already-local Codex homes; it is not authentication.
+    """
+
+    if not isinstance(value, str) or value.count(".") < 2:
+        return {}
+    try:
+        encoded = value.split(".", 2)[1]
+        encoded += "=" * (-len(encoded) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")))
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return decoded if isinstance(decoded, Mapping) else {}
 
 
 def period_start(period: str, now: datetime | None = None) -> str:
@@ -933,6 +1014,26 @@ class UsageRepository:
                   source TEXT NOT NULL,
                   UNIQUE(identity_key, window_kind, fetched_at)
                 );
+
+                CREATE TABLE IF NOT EXISTS local_import_records (
+                  import_key TEXT PRIMARY KEY,
+                  source TEXT NOT NULL,
+                  usage_event_id INTEGER,
+                  imported_at TEXT NOT NULL,
+                  FOREIGN KEY(usage_event_id) REFERENCES usage_events(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS local_import_files (
+                  path TEXT PRIMARY KEY,
+                  size INTEGER NOT NULL DEFAULT 0,
+                  mtime_ns INTEGER NOT NULL DEFAULT 0,
+                  offset INTEGER NOT NULL DEFAULT 0,
+                  session_id TEXT,
+                  model_provider TEXT,
+                  model TEXT,
+                  turn_id TEXT,
+                  updated_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(conn, "usage_events", "identity_key", "TEXT")
@@ -968,6 +1069,10 @@ class UsageRepository:
                 CREATE INDEX IF NOT EXISTS idx_quota_cycles_identity_end ON account_quota_cycles(identity_key, cycle_end_ts);
                 CREATE INDEX IF NOT EXISTS idx_subscription_quota_identity_kind_ts
                   ON subscription_quota_snapshots(identity_key, window_kind, fetched_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_local_import_records_source
+                  ON local_import_records(source, imported_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_local_import_files_updated
+                  ON local_import_files(updated_at DESC);
                 """
             )
             self._backfill_frozen_cost_components(conn)
@@ -1757,6 +1862,11 @@ class UsageRepository:
         if event.ok:
             self.maybe_auto_reset(info, event.ts)
         event_id = self.insert_event(event)
+        # HTTP handlers can finish out of order.  A quota error may close a
+        # cycle before an earlier-timestamped successful response has finished
+        # its SQLite insert.  Reconcile any already-complete cycle after every
+        # insert so the cycle cost is not permanently understated by that race.
+        self._refresh_complete_cycles_for_event(event)
         quota_type = detect_quota_event(event.status_code, event.error_type, event.error_message_redacted)
         if quota_type:
             self.record_quota_hit(
@@ -1767,7 +1877,173 @@ class UsageRepository:
                 event.error_message_redacted,
                 usage_event_id=event_id,
             )
+            # A quota-hit handler can finish before an older successful
+            # response is inserted. Refresh once more after the hit creates a
+            # cycle so that out-of-order HTTP completions cannot undercount it.
+            self._refresh_complete_cycles_for_event(event)
         return event_id
+
+    def _refresh_complete_cycles_for_event(self, event: UsageEvent) -> None:
+        with self.connect() as conn:
+            cycles = conn.execute(
+                """SELECT id, identity_key, cycle_start_ts, cycle_end_ts
+                     FROM account_quota_cycles
+                    WHERE identity_key=? AND is_complete_cycle=1""",
+                (event.identity_key,),
+            ).fetchall()
+            for cycle in cycles:
+                # A later reset starts a new cycle; otherwise a response that
+                # completed out of order is still part of this already-closed
+                # provider window and may extend its observed end timestamp.
+                later_reset = conn.execute(
+                    f"""SELECT 1 FROM quota_events
+                         WHERE identity_key=? AND event_type IN ({','.join('?' for _ in RESET_EVENT_TYPES)})
+                           AND ts>? LIMIT 1""",
+                    (event.identity_key, *sorted(RESET_EVENT_TYPES), cycle["cycle_end_ts"]),
+                ).fetchone()
+                if later_reset:
+                    continue
+                end_ts = max(str(cycle["cycle_end_ts"]), str(event.ts))
+                reset = conn.execute(
+                    f"""SELECT ts FROM quota_events
+                         WHERE identity_key=? AND event_type IN ({','.join('?' for _ in RESET_EVENT_TYPES)})
+                           AND ts<=?
+                         ORDER BY ts DESC, id DESC LIMIT 1""",
+                    (event.identity_key, *sorted(RESET_EVENT_TYPES), end_ts),
+                ).fetchone()
+                boundary = reset["ts"] if reset else None
+                if boundary is None:
+                    first = conn.execute(
+                        "SELECT MIN(ts) AS ts FROM usage_events WHERE identity_key=? AND ts<=?",
+                        (event.identity_key, end_ts),
+                    ).fetchone()
+                else:
+                    first = conn.execute(
+                        """SELECT MIN(ts) AS ts FROM usage_events
+                             WHERE identity_key=? AND ts>=? AND ts<=?""",
+                        (event.identity_key, boundary, end_ts),
+                    ).fetchone()
+                start = first["ts"] if first and first["ts"] else cycle["cycle_start_ts"]
+                totals = conn.execute(
+                    """SELECT
+                         COALESCE(SUM(call_count),0) total_calls,
+                         COALESCE(SUM(CASE WHEN ok=1 THEN call_count ELSE 0 END),0) successful_calls,
+                         COALESCE(SUM(CASE WHEN ok=0 THEN call_count ELSE 0 END),0) failed_calls,
+                         COALESCE(SUM(CASE WHEN stream=1 THEN call_count ELSE 0 END),0) streaming_calls,
+                         COALESCE(SUM(input_tokens),0) total_input_tokens,
+                         COALESCE(SUM(cached_tokens),0) total_cached_tokens,
+                         COALESCE(SUM(output_tokens),0) total_output_tokens,
+                         COALESCE(SUM(reasoning_tokens),0) total_reasoning_tokens,
+                         COALESCE(SUM(total_tokens),0) total_tokens,
+                         SUM(estimated_api_cost_usd) estimated_api_cost_usd
+                       FROM usage_events
+                      WHERE identity_key=? AND ts>=? AND ts<=?""",
+                    (event.identity_key, start, end_ts),
+                ).fetchone()
+                cost = totals["estimated_api_cost_usd"]
+                conn.execute(
+                    """UPDATE account_quota_cycles SET
+                         cycle_start_ts=?, cycle_end_ts=?, total_calls=?, successful_calls=?, failed_calls=?,
+                         streaming_calls=?, total_input_tokens=?, total_cached_tokens=?,
+                         total_output_tokens=?, total_reasoning_tokens=?, total_tokens=?,
+                         estimated_api_cost_usd=?, observed_floor_usd=?,
+                         api_equivalent_quota_usd=? WHERE id=?""",
+                    (
+                        start,
+                        end_ts,
+                        totals["total_calls"],
+                        totals["successful_calls"],
+                        totals["failed_calls"],
+                        totals["streaming_calls"],
+                        totals["total_input_tokens"],
+                        totals["total_cached_tokens"],
+                        totals["total_output_tokens"],
+                        totals["total_reasoning_tokens"],
+                        totals["total_tokens"],
+                        cost,
+                        cost,
+                        cost,
+                        cycle["id"],
+                    ),
+                )
+
+    def record_imported_event(
+        self,
+        event: UsageEvent,
+        import_key: str,
+        source: str,
+    ) -> bool:
+        """Insert one idempotent local/manual import in a single transaction."""
+
+        safe_key = safe_text(import_key, 300)
+        safe_source = safe_text(source, 64)
+        if not safe_key or not safe_source:
+            raise ValueError("invalid import identity")
+        event.source = safe_source
+        values = asdict(event)
+        columns = list(values)
+        placeholders = ",".join("?" for _ in columns)
+        with self.connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM local_import_records WHERE import_key=?", (safe_key,)
+            ).fetchone():
+                return False
+            cursor = conn.execute(
+                f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
+                tuple(values[column] for column in columns),
+            )
+            conn.execute(
+                """INSERT INTO local_import_records
+                   (import_key, source, usage_event_id, imported_at)
+                   VALUES (?, ?, ?, ?)""",
+                (safe_key, safe_source, int(cursor.lastrowid), utc_now()),
+            )
+        return True
+
+    def import_status(self, source: str = "codex_app_local") -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS imported_events, MAX(imported_at) AS last_import_at
+                     FROM local_import_records WHERE source=?""",
+                (source,),
+            ).fetchone()
+        return dict(row)
+
+    def local_import_file_state(self, path: Path | str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM local_import_files WHERE path=?", (str(path),)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_local_import_file_state(self, state: Mapping[str, Any]) -> None:
+        values = {
+            "path": safe_text(state.get("path"), 4096),
+            "size": as_nonnegative_int(state.get("size")) or 0,
+            "mtime_ns": as_nonnegative_int(state.get("mtime_ns")) or 0,
+            "offset": as_nonnegative_int(state.get("offset")) or 0,
+            "session_id": safe_text(state.get("session_id"), 256),
+            "model_provider": safe_text(state.get("model_provider"), 64),
+            "model": safe_text(state.get("model"), 200),
+            "turn_id": safe_text(state.get("turn_id"), 256),
+            "updated_at": utc_now(),
+        }
+        if not values["path"]:
+            raise ValueError("invalid local import path")
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO local_import_files
+                   (path, size, mtime_ns, offset, session_id, model_provider,
+                    model, turn_id, updated_at)
+                   VALUES (:path, :size, :mtime_ns, :offset, :session_id,
+                           :model_provider, :model, :turn_id, :updated_at)
+                   ON CONFLICT(path) DO UPDATE SET
+                     size=excluded.size, mtime_ns=excluded.mtime_ns,
+                     offset=excluded.offset, session_id=excluded.session_id,
+                     model_provider=excluded.model_provider, model=excluded.model,
+                     turn_id=excluded.turn_id, updated_at=excluded.updated_at""",
+                values,
+            )
 
     def record_quota_hit(
         self,
@@ -2053,7 +2329,69 @@ class UsageRepository:
                    WHERE is_complete_cycle=1 AND cycle_end_ts>=?""",
                 (start,),
             ).fetchone()
-        result["api_equivalent_quota_usd"] = quota_row["api_equivalent_quota_usd"]
+            quota_value = quota_row["api_equivalent_quota_usd"]
+            if quota_value is None:
+                # ``usage_events`` is intentionally committed before quota
+                # transition bookkeeping so a proxy response is never held
+                # up by SQLite.  A reader can therefore briefly observe the
+                # event row before ``account_quota_cycles`` is committed.
+                # Use the just-observed quota error as a conservative,
+                # race-safe fallback until the cycle row appears.
+                pending = conn.execute(
+                    """SELECT identity_key, MAX(ts) AS ts
+                         FROM quota_events
+                        WHERE ts>=? AND event_type IN ({})
+                        GROUP BY identity_key""".format(
+                            ",".join("?" for _ in QUOTA_EVENT_TYPES)
+                        ),
+                    (start, *sorted(QUOTA_EVENT_TYPES)),
+                ).fetchall()
+                if pending:
+                    fallback = 0.0
+                    found = False
+                    for item in pending:
+                        row_cost = conn.execute(
+                            """SELECT SUM(estimated_api_cost_usd) AS cost
+                                 FROM usage_events
+                                WHERE identity_key=? AND ts>=? AND ts<=?""",
+                            (item["identity_key"], start, item["ts"]),
+                        ).fetchone()
+                        if row_cost["cost"] is not None:
+                            fallback += float(row_cost["cost"])
+                            found = True
+                    quota_value = fallback if found else None
+            if quota_value is None:
+                # The quota_events insert itself can trail the usage-event
+                # commit on a concurrent request.  Infer only the narrow,
+                # provider-visible quota shapes from the event row as a
+                # read-time fallback; the durable cycle remains authoritative.
+                pending_events = conn.execute(
+                    """SELECT identity_key, MAX(ts) AS ts
+                         FROM usage_events
+                        WHERE ts>=? AND (
+                              status_code=429 OR
+                              lower(COALESCE(error_type,'')) LIKE '%quota%' OR
+                              lower(COALESCE(error_message_redacted,'')) LIKE '%usage limit%' OR
+                              lower(COALESCE(error_message_redacted,'')) LIKE '%rate limit%'
+                        )
+                        GROUP BY identity_key""",
+                    (start,),
+                ).fetchall()
+                if pending_events:
+                    fallback = 0.0
+                    found = False
+                    for item in pending_events:
+                        row_cost = conn.execute(
+                            """SELECT SUM(estimated_api_cost_usd) AS cost
+                                 FROM usage_events
+                                WHERE identity_key=? AND ts>=? AND ts<=?""",
+                            (item["identity_key"], start, item["ts"]),
+                        ).fetchone()
+                        if row_cost["cost"] is not None:
+                            fallback += float(row_cost["cost"])
+                            found = True
+                    quota_value = fallback if found else None
+        result["api_equivalent_quota_usd"] = quota_value
         result["period"] = period
         result["since"] = None if str(period).strip().lower() in ALL_TIME_PERIODS else start
         return result
@@ -2277,11 +2615,16 @@ class UsageRepository:
                 """
                 SELECT q.*
                   FROM subscription_quota_snapshots q
-                  JOIN (
-                    SELECT identity_key, window_kind, MAX(id) AS max_id
-                      FROM subscription_quota_snapshots
-                     GROUP BY identity_key, window_kind
-                  ) latest ON latest.max_id=q.id
+                 WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM subscription_quota_snapshots newer
+                        WHERE newer.identity_key=q.identity_key
+                          AND newer.window_kind=q.window_kind
+                          AND (
+                                newer.fetched_at > q.fetched_at
+                                OR (newer.fetched_at=q.fetched_at AND newer.id > q.id)
+                              )
+                 )
                  ORDER BY COALESCE(q.usage_alias, q.account_id_tail, q.identity_key),
                           CASE q.window_kind
                             WHEN 'five_hour' THEN 0
@@ -3450,6 +3793,389 @@ def parse_codex_quota_windows(payload: Any, fetched_at: str | None = None) -> li
     return windows
 
 
+def parse_codex_app_rate_windows(
+    rate_limits: Any,
+    fetched_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize the non-secret rate-limit block written to Codex JSONL."""
+
+    if not isinstance(rate_limits, Mapping):
+        return []
+    windows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, name in enumerate(("primary", "secondary")):
+        raw = rate_limits.get(name)
+        if not isinstance(raw, Mapping):
+            continue
+        minutes = as_nonnegative_int(
+            first_present(raw, ("window_minutes", "windowMinutes"))
+        )
+        seconds = minutes * 60 if minutes is not None else None
+        if seconds == 18_000:
+            kind = "five_hour"
+        elif seconds and 2_419_200 <= seconds <= 2_678_400:
+            kind = "monthly"
+        elif seconds == 604_800:
+            kind = "weekly"
+        else:
+            kind = "five_hour" if index == 0 else "weekly"
+        if kind in seen:
+            continue
+        used = _percent_value(first_present(raw, ("used_percent", "usedPercent")))
+        windows.append(
+            {
+                "fetched_at": fetched_at or utc_now(),
+                "window_kind": kind,
+                "used_percent": used,
+                "remaining_percent": 100.0 - used if used is not None else None,
+                "window_seconds": seconds,
+                "reset_at": normalize_optional_timestamp(
+                    first_present(raw, ("resets_at", "resetsAt", "reset_at", "resetAt"))
+                ),
+            }
+        )
+        seen.add(kind)
+    return windows
+
+
+class CodexAppLocalImporter:
+    """Incrementally import safe usage fields from ChatGPT Codex JSONL files.
+
+    Only ``session_meta``, ``turn_context``, ``task_started`` and
+    ``token_count`` metadata is inspected.  Message, reasoning and tool payloads
+    are ignored and never persisted.  Direct OpenAI sessions are selected by
+    ``model_provider=openai`` and matched to the configured alias by local
+    account id, preventing CLIProxyAPI sessions from being double counted.
+    """
+
+    def __init__(
+        self,
+        repo: UsageRepository,
+        resolver: AccountResolver,
+        codex_home: Path | str = DEFAULT_CODEX_APP_HOME,
+        alias: str = DEFAULT_CODEX_APP_ALIAS,
+        poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
+        max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
+    ) -> None:
+        self.repo = repo
+        self.resolver = resolver
+        self.codex_home = Path(codex_home).expanduser().resolve()
+        self.alias = safe_alias(alias) or DEFAULT_CODEX_APP_ALIAS
+        self.poll_seconds = max(5.0, float(poll_seconds))
+        self.max_files = max(1, min(int(max_files), 10_000))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_poll_at: str | None = None
+        self._last_success_at: str | None = None
+        self._last_error_type: str | None = None
+        self._last_imported = 0
+        self._last_scanned_files = 0
+        self._account_match: bool | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="codex-app-local-import", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def status(self) -> dict[str, Any]:
+        persisted = self.repo.import_status("codex_app_local")
+        return {
+            "enabled": True,
+            "codex_home": str(self.codex_home),
+            "usage_alias": self.alias,
+            "account_match": self._account_match,
+            "last_poll_at": self._last_poll_at,
+            "last_success_at": self._last_success_at,
+            "last_error_type": self._last_error_type,
+            "last_imported": self._last_imported,
+            "last_scanned_files": self._last_scanned_files,
+            **persisted,
+        }
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                result = self.import_once()
+                self._last_poll_at = utc_now()
+                self._last_success_at = self._last_poll_at
+                self._last_error_type = None
+                self._last_imported = result["imported"]
+                self._last_scanned_files = result["scanned_files"]
+            except Exception as exc:
+                self._last_poll_at = utc_now()
+                self._last_error_type = type(exc).__name__
+                LOG.warning("Codex app local import failed: %s", type(exc).__name__)
+            self._stop.wait(self.poll_seconds)
+
+    @staticmethod
+    def _read_auth_identity(path: Path) -> tuple[str | None, str | None, str | None]:
+        data = AccountResolver._read_json(path)
+        if not isinstance(data, Mapping):
+            return None, None, None
+        nested = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
+        account = safe_text(nested.get("account_id") or data.get("account_id"), 256)
+        claims = _decode_jwt_claims_unverified(
+            nested.get("id_token") or data.get("id_token")
+        )
+        auth_claims = claims.get("https://api.openai.com/auth")
+        auth_claims = auth_claims if isinstance(auth_claims, Mapping) else {}
+        plan = safe_text(
+            auth_claims.get("chatgpt_plan_type")
+            or claims.get("chatgpt_plan_type")
+            or claims.get("plan_type"),
+            64,
+        )
+        active_until = normalize_optional_timestamp(
+            auth_claims.get("chatgpt_subscription_active_until")
+            or claims.get("chatgpt_subscription_active_until")
+        )
+        return account, plan, active_until
+
+    @staticmethod
+    def _usage_from_token_count(payload: Mapping[str, Any]) -> NormalizedUsage:
+        info = payload.get("info") if isinstance(payload.get("info"), Mapping) else {}
+        raw = info.get("last_token_usage")
+        if not isinstance(raw, Mapping):
+            return NormalizedUsage()
+        return NormalizedUsage(
+            input_tokens=as_nonnegative_int(raw.get("input_tokens")),
+            output_tokens=as_nonnegative_int(raw.get("output_tokens")),
+            cached_tokens=as_nonnegative_int(raw.get("cached_input_tokens")),
+            cache_write_tokens=as_nonnegative_int(raw.get("cache_write_input_tokens")),
+            reasoning_tokens=as_nonnegative_int(raw.get("reasoning_output_tokens")),
+            total_tokens=as_nonnegative_int(raw.get("total_tokens")),
+        )
+
+    def import_once(self) -> dict[str, int]:
+        app_account, default_plan, active_until = self._read_auth_identity(
+            self.codex_home / "auth.json"
+        )
+        alias_identity = self.resolver.resolve(self.alias, None)
+        alias_account_hash = alias_identity.account_id_hash
+        self._account_match = bool(
+            app_account
+            and alias_account_hash
+            and short_hash(app_account) == alias_account_hash
+        )
+        if not self._account_match:
+            raise ValueError("codex app account does not match configured alias")
+        sessions = self.codex_home / "sessions"
+        try:
+            paths = sorted(
+                sessions.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True
+            )[: self.max_files]
+        except OSError:
+            paths = []
+        imported = 0
+        quota_rows = 0
+        for path in paths:
+            try:
+                if not path.is_file() or path.stat().st_size > MAX_CODEX_APP_JSONL_BYTES:
+                    continue
+            except OSError:
+                continue
+            imported_delta, quota_delta = self._import_file(
+                path, alias_identity, default_plan, active_until
+            )
+            imported += imported_delta
+            quota_rows += quota_delta
+        return {
+            "imported": imported,
+            "quota_rows": quota_rows,
+            "scanned_files": len(paths),
+        }
+
+    def _import_file(
+        self,
+        path: Path,
+        identity: AccountIdentity,
+        default_plan: str | None,
+        active_until: str | None,
+    ) -> tuple[int, int]:
+        session_id: str | None = None
+        model_provider: str | None = None
+        model: str | None = None
+        turn_id: str | None = None
+        imported = 0
+        quota_rows = 0
+        record_index = 0
+        resolved_path = path.resolve()
+        try:
+            stat = path.stat()
+            state = self.repo.local_import_file_state(resolved_path) or {}
+            unchanged = (
+                int(state.get("size") or -1) == int(stat.st_size)
+                and int(state.get("mtime_ns") or -1) == int(stat.st_mtime_ns)
+                and int(state.get("offset") or -1) == int(stat.st_size)
+            )
+            if unchanged:
+                return 0, 0
+            can_resume = (
+                state
+                and int(state.get("offset") or 0) > 0
+                and int(stat.st_size) >= int(state.get("offset") or 0)
+                and int(state.get("size") or 0) <= int(stat.st_size)
+            )
+            start_offset = int(state.get("offset") or 0) if can_resume else 0
+            if can_resume:
+                session_id = safe_text(state.get("session_id"), 256)
+                model_provider = safe_text(state.get("model_provider"), 64)
+                model = safe_text(state.get("model"), 200)
+                turn_id = safe_text(state.get("turn_id"), 256)
+            handle = path.open("r", encoding="utf-8", errors="replace")
+            if start_offset:
+                handle.seek(start_offset)
+        except OSError:
+            return 0, 0
+        with handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, Mapping):
+                    continue
+                record_type = record.get("type")
+                payload = record.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                if record_type == "session_meta":
+                    session_id = safe_text(
+                        payload.get("session_id") or payload.get("id"), 256
+                    )
+                    model_provider = safe_text(payload.get("model_provider"), 64)
+                    continue
+                if record_type == "turn_context":
+                    model = safe_text(payload.get("model"), 200) or model
+                    turn_id = safe_text(payload.get("turn_id"), 256) or turn_id
+                    continue
+                if record_type == "event_msg" and payload.get("type") == "task_started":
+                    turn_id = safe_text(payload.get("turn_id"), 256) or turn_id
+                    continue
+                if record_type != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                record_index += 1
+                if (model_provider or "").lower() != "openai":
+                    continue
+                usage = self._usage_from_token_count(payload)
+                if usage.missing:
+                    continue
+                timestamp = normalize_timestamp(record.get("timestamp"))
+                key = identity_key(
+                    identity.account_id_hash, self.alias, None, None, session_id
+                )
+                components = self.repo.price_components_for(model, usage)
+                # The ordinal is stable in Codex JSONL.  Include a bounded
+                # fallback index for older files that omit it.
+                ordinal = record.get("ordinal")
+                ordinal_key = str(ordinal) if ordinal is not None else f"line-{record_index}"
+                import_key = "codex-app:" + (short_hash(
+                    f"{resolved_path}\n{ordinal_key}\n{timestamp}"
+                ) or short_hash(f"{resolved_path}\n{record_index}") or "unknown")
+                event = UsageEvent(
+                    ts=timestamp,
+                    identity_key=key,
+                    endpoint="local://chatgpt-codex",
+                    method="LOCAL",
+                    model=model,
+                    status_code=200,
+                    ok=1,
+                    duration_ms=0,
+                    stream=0,
+                    session_id=session_id,
+                    thread_id=session_id,
+                    turn_id=turn_id,
+                    installation_id=None,
+                    window_id=None,
+                    usage_alias=self.alias,
+                    usage_project="ChatGPT Codex",
+                    auth_fingerprint=None,
+                    account_id_hash=identity.account_id_hash,
+                    account_id_tail=identity.account_id_tail,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cached_tokens=usage.cached_tokens,
+                    cache_write_tokens=usage.cache_write_tokens,
+                    reasoning_tokens=usage.reasoning_tokens,
+                    total_tokens=usage.total_tokens,
+                    estimated_api_cost_usd=components.total_cost_usd if components else None,
+                    non_cached_input_cost_usd=(
+                        components.non_cached_input_cost_usd if components else None
+                    ),
+                    cached_input_cost_usd=(
+                        components.cached_input_cost_usd if components else None
+                    ),
+                    output_cost_usd=components.output_cost_usd if components else None,
+                    long_context_pricing_applied=int(
+                        components.long_context_pricing_applied if components else False
+                    ),
+                    subscription_amortized_cost_usd=None,
+                    api_equivalent_quota_usd=None,
+                    usage_missing=0,
+                    error_type=None,
+                    error_message_redacted=None,
+                    request_bytes=0,
+                    response_bytes=0,
+                    source="codex_app_local",
+                    request_id=import_key,
+                )
+                if self.repo.record_imported_event(
+                    event, import_key, "codex_app_local"
+                ):
+                    imported += 1
+                rate_limits = payload.get("rate_limits")
+                plan = (
+                    safe_text(rate_limits.get("plan_type"), 64)
+                    if isinstance(rate_limits, Mapping)
+                    else None
+                ) or default_plan
+                # Quota snapshots have their own uniqueness key.  Re-reading
+                # an unchanged JSONL line must not create a new snapshot row;
+                # ``insert_subscription_quota_snapshot`` intentionally uses
+                # INSERT OR IGNORE for this reason.
+                for window in parse_codex_app_rate_windows(rate_limits, timestamp):
+                    window.update(
+                        {
+                            "identity_key": key,
+                            "account_id_hash": identity.account_id_hash,
+                            "account_id_tail": identity.account_id_tail,
+                            "usage_alias": self.alias,
+                            "plan_type": plan,
+                            "subscription_active_until": active_until,
+                            "source": "codex_app_local",
+                        }
+                    )
+                    self.repo.insert_subscription_quota_snapshot(window)
+                    quota_rows += 1
+            final_offset = handle.tell()
+        try:
+            final_stat = path.stat()
+        except OSError:
+            return imported, quota_rows
+        self.repo.save_local_import_file_state(
+            {
+                "path": resolved_path,
+                "size": final_stat.st_size,
+                "mtime_ns": final_stat.st_mtime_ns,
+                "offset": min(final_offset, final_stat.st_size),
+                "session_id": session_id,
+                "model_provider": model_provider,
+                "model": model,
+                "turn_id": turn_id,
+            }
+        )
+        return imported, quota_rows
+
+
 class CodexQuotaPoller:
     """Low-frequency, read-only Codex subscription quota snapshots via 8317."""
 
@@ -4019,6 +4745,8 @@ def dashboard_html(
     repo: UsageRepository,
     queue_status: Mapping[str, Any] | None = None,
     quota_status: Mapping[str, Any] | None = None,
+    codex_app_status: Mapping[str, Any] | None = None,
+    account_resolver: AccountResolver | None = None,
 ) -> str:
     today = repo.token_breakdown("today")
     week = repo.token_breakdown("7d")
@@ -4032,6 +4760,7 @@ def dashboard_html(
     price_sync = repo.price_sync_status()
     queue_status = queue_status or {}
     quota_status = quota_status or {}
+    codex_app_status = codex_app_status or {}
 
     hero_metrics = "".join(
         f'<article class="hero-card {tone}"><span>{html.escape(label)}</span>'
@@ -4120,9 +4849,26 @@ def dashboard_html(
         alias = display_identity(row)
         plan = str(row.get("plan_type") or "unknown").upper()
         status_text = "实时额度" if row.get("fetched_at") else "等待额度快照"
+        account_email: str | None = None
+        if account_resolver is not None:
+            identity = account_resolver.resolve_account_hash(row.get("account_id_hash"))
+            if not identity.account_email and row.get("usage_alias"):
+                identity = account_resolver.resolve(str(row["usage_alias"]), None)
+            account_email = identity.account_email
+        account_email_html = (
+            f'<span class="account-email">{html.escape(account_email)}</span>'
+            if account_email else '<span class="account-email unavailable">邮箱未获取</span>'
+        )
+        quota_label = (
+            "上周期满额 API 等价参考"
+            if row.get("quota_estimate_method") == "previous_window_transfer"
+            and float(row.get("quota_used_percent") or 0.0) == 0.0
+            else "API 等价额度估算"
+        )
         subscription_cards.append(
             f'<article class="subscription-card"><div class="account-head"><div class="avatar" title="{html.escape(badge_title)}">{badge}</div>'
-            f'<div><h3>{html.escape(alias)}</h3><span>{html.escape(plan)} · …{html.escape(str(row.get("account_id_tail") or "未知"))} · {html.escape(badge_title)}</span></div>'
+            f'<div class="account-copy"><h3>{html.escape(alias)}</h3>{account_email_html}'
+            f'<span class="account-meta">{html.escape(plan)} · …{html.escape(str(row.get("account_id_tail") or "未知"))} · {html.escape(badge_title)}</span></div>'
             f'<i>{html.escape(status_text)}</i></div>'
             f'{window_meter_html(five_hour, "5 小时额度")}{window_meter_html(weekly, "周额度" if not windows.get("monthly") else "月额度")}'
             f'<div class="account-usage"><span>总调用 <b>{fmt_int(row.get("all_time_account_attempts"))}</b></span>'
@@ -4131,7 +4877,7 @@ def dashboard_html(
             f'<span>非缓存输入 <b>{fmt_compact(row.get("all_time_non_cached_input_tokens"))}</b></span>'
             f'<span>输出 <b>{fmt_compact(row.get("all_time_output_tokens"))}</b></span>'
             f'<span>额外调用 <b>{fmt_int(row.get("all_time_extra_calls"))}</b></span></div>'
-            f'<div class="quota-value"><div><span>API 等价额度估算</span><strong>{quota_text}</strong></div>'
+            f'<div class="quota-value"><div><span>{html.escape(quota_label)}</span><strong>{quota_text}</strong></div>'
             f'<small>{html.escape(quota_note)}<br>累计消费 {fmt_money(row.get("all_time_cost_usd"))}</small></div></article>'
         )
     subscriptions_html = "".join(subscription_cards) or (
@@ -4189,6 +4935,7 @@ def dashboard_html(
 
     collector_ok = queue_status.get("key_loaded") and queue_status.get("last_status") == 200
     quota_ok = quota_status.get("last_success_at") is not None or persisted_quota_accounts > 0
+    codex_app_ok = codex_app_status.get("last_success_at") is not None
     price_ok = price_sync.get("status") == "ok"
     generated = datetime.now().astimezone().isoformat(timespec="seconds")
     return f"""<!doctype html>
@@ -4202,15 +4949,18 @@ def dashboard_html(
 header{{display:flex;min-width:0;align-items:center;justify-content:space-between;gap:22px;margin-bottom:30px}}.brand-lockup{{display:flex;min-width:0;align-items:center;gap:15px}}.brand-lockup>div:last-child{{min-width:0}}.brand-mark{{display:grid;place-items:center;width:54px;height:54px;flex:0 0 auto;border:var(--border);border-radius:50%;background:var(--orange);color:var(--on-color);box-shadow:var(--shadow-sm);font:900 16px/1 var(--font-display);transform:rotate(-4deg)}}.eyebrow{{color:var(--ink-3);font:700 10px/1.2 var(--font-mono);letter-spacing:.14em;text-transform:uppercase}}h1{{font:900 clamp(32px,4vw,54px)/.95 var(--font-display);margin:5px 0 7px;letter-spacing:-.035em;overflow-wrap:anywhere}}.subtitle{{max-width:780px;color:var(--ink-2);overflow-wrap:anywhere}}.header-actions{{display:flex;flex:0 0 auto;align-items:center;gap:12px}}.live,.theme-toggle{{border:var(--border);background:var(--card);color:var(--ink);box-shadow:var(--shadow-sm)}}.live{{display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:999px;font:800 11px/1 var(--font-mono);white-space:nowrap}}.live:before{{content:"";width:9px;height:9px;border:1.5px solid var(--ink);border-radius:50%;background:var(--mint)}}.theme-toggle{{display:grid;place-items:center;width:39px;height:39px;border-radius:50%;cursor:pointer;transition:.12s transform,.12s box-shadow}}.theme-toggle:hover{{transform:translate(-1px,-1px);box-shadow:4px 4px 0 var(--shadow-ink)}}.theme-toggle:active{{transform:translate(2px,2px);box-shadow:none}}.theme-toggle svg{{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}}.theme-icon-sun{{display:none}}:root[data-theme="dark"] .theme-icon-moon{{display:none}}:root[data-theme="dark"] .theme-icon-sun{{display:block}}
 .hero-grid{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:15px}}.hero-grid>*,.period-grid>*,.subscription-grid>*,.two-col>*{{min-width:0}}.hero-card,.period-card,.subscription-card,.panel{{position:relative;min-width:0;border:var(--border);border-radius:var(--radius);box-shadow:var(--shadow);background:var(--card);overflow:hidden}}.hero-card{{min-height:164px;padding:21px;color:var(--on-color);transition:.14s transform,.14s box-shadow}}.hero-card:hover,.period-card:hover,.subscription-card:hover{{transform:translate(-2px,-2px);box-shadow:7px 7px 0 var(--shadow-ink)}}.hero-card.cyan-card{{background:var(--sun)}}.hero-card.output-card{{background:var(--orange)}}.hero-card.mint-card{{background:var(--mint)}}.hero-card.blue-card{{background:var(--sky)}}.hero-card.violet-card{{background:var(--rose)}}.hero-card.amber-card{{background:var(--lavender)}}.hero-card span,.period-head span,.quota-value span{{font:800 10px/1.2 var(--font-mono);letter-spacing:.09em;text-transform:uppercase}}.hero-card span{{opacity:.68}}.hero-card strong{{display:block;margin:18px 0 9px;font:900 clamp(27px,2.7vw,42px)/1 var(--font-display);letter-spacing:-.035em}}.hero-card small{{display:block;opacity:.72;font-size:10px}}
 .notice{{display:flex;gap:12px;align-items:flex-start;margin:18px 0 0;padding:13px 15px;border:var(--border);border-radius:12px;background:var(--watch);box-shadow:var(--shadow-sm)}}.notice b{{white-space:nowrap;font-family:var(--font-display)}}.notice span{{color:var(--ink-2);font-size:12px}}.notice:before{{content:"!";display:grid;place-items:center;width:21px;height:21px;flex:0 0 auto;border:1.5px solid var(--ink);border-radius:50%;background:var(--orange);color:var(--on-color);font-weight:900}}
+.app-import-notice{{background:color-mix(in srgb,var(--mint) 36%,var(--card))}}.app-import-notice:before{{content:"✓";background:var(--mint)}}.manual-import{{margin-top:15px;border:var(--border);border-radius:12px;background:var(--card);box-shadow:var(--shadow-sm);overflow:hidden}}.manual-import summary{{padding:13px 15px;cursor:pointer;font-family:var(--font-display)}}.manual-import summary span{{margin-left:8px;color:var(--ink-3);font:600 10px/1.2 var(--font-mono)}}.manual-import form{{padding:16px;border-top:1.5px solid var(--ink)}}.form-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}.manual-import label{{display:grid;gap:5px;color:var(--ink-2);font:700 10px/1.2 var(--font-mono)}}.manual-import input{{min-width:0;padding:9px 10px;border:1.5px solid var(--ink);border-radius:8px;background:var(--paper);color:var(--ink);font:600 12px/1.2 var(--font-mono)}}.note-label{{margin-top:12px}}.manual-import button{{margin-top:12px;padding:9px 14px;border:var(--border);border-radius:9px;background:var(--orange);color:var(--on-color);box-shadow:var(--shadow-sm);font-weight:900;cursor:pointer}}.manual-import p{{margin:11px 0 0;color:var(--ink-3);font-size:11px}}
 .section-title{{display:flex;justify-content:space-between;align-items:end;margin:38px 0 14px}}.section-title h2{{margin:0;font:900 22px/1.1 var(--font-display);letter-spacing:-.015em}}.section-title p{{margin:5px 0 0;color:var(--ink-2)}}.section-title small{{color:var(--ink-3);font-family:var(--font-mono)}}.period-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}}.period-card{{padding:20px;transition:.14s transform,.14s box-shadow}}.period-card:nth-child(1) .period-head span{{background:var(--sun)}}.period-card:nth-child(2) .period-head span{{background:var(--rose)}}.period-card:nth-child(3) .period-head span{{background:var(--sky)}}.period-head{{display:flex;min-width:0;align-items:end;justify-content:space-between;gap:14px}}.period-head>div{{min-width:0}}.period-head span{{display:inline-block;padding:5px 7px;border:1.5px solid var(--ink);border-radius:7px;color:var(--on-color)}}.period-head strong{{display:block;margin-top:9px;font:900 25px/1 var(--font-display);overflow-wrap:anywhere}}.period-head em{{flex:0 0 auto;font:900 20px/1 var(--font-display);font-style:normal;color:var(--ink)}}.period-meta{{display:flex;flex-wrap:wrap;gap:6px 8px;margin-top:14px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.period-meta span{{max-width:100%;padding:4px 6px;border:1px solid color-mix(in srgb,var(--ink) 38%,transparent);border-radius:6px;background:var(--paper);overflow-wrap:anywhere}}.mix-bar{{display:flex;height:11px;margin:16px 0 14px;border:1.5px solid var(--ink);border-radius:999px;overflow:hidden;background:var(--cream)}}.mix-segment.cyan,.dot.cyan{{background:var(--sky)}}.mix-segment.violet,.dot.violet{{background:var(--lavender)}}.mix-segment.amber,.dot.amber{{background:var(--orange)}}.dot.mint{{background:var(--mint)}}.mix-legend{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:9px 18px}}.mix-item{{display:grid;min-width:0;grid-template-columns:9px minmax(0,1fr) auto;align-items:center;gap:7px;color:var(--ink-2);font-size:11px}}.mix-item span{{min-width:0;overflow-wrap:anywhere}}.mix-item strong{{color:var(--ink);font-family:var(--font-mono)}}.dot{{width:8px;height:8px;border:1px solid var(--ink);border-radius:3px}}
 .trend-panel{{padding:22px 22px 17px;background-color:var(--card);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:16px 16px}}.trend{{height:230px;display:grid;grid-template-columns:repeat(7,1fr);gap:14px;align-items:end;padding-top:24px}}.trend-column{{position:relative;display:grid;grid-template-rows:160px auto auto;text-align:center;gap:5px;min-width:0}}.trend-track{{height:160px;display:flex;align-items:end;border:1.5px solid var(--ink);border-radius:9px;background:var(--cream);overflow:hidden}}.trend-track span{{width:100%;min-height:3px;border-top:1.5px solid var(--ink);background:var(--orange)}}.trend-column:nth-child(3n+2) .trend-track span{{background:var(--sun)}}.trend-column:nth-child(3n+3) .trend-track span{{background:var(--sky)}}.trend-column b{{font:700 10px/1 var(--font-mono);color:var(--ink-3)}}.trend-column small{{font:900 11px/1 var(--font-mono)}}.bar-tooltip{{position:absolute;z-index:3;bottom:190px;left:50%;transform:translate(-50%,8px);opacity:0;pointer-events:none;white-space:nowrap;padding:8px 10px;border:var(--border);border-radius:8px;background:var(--card);box-shadow:var(--shadow-sm);font:700 10px/1.45 var(--font-mono);transition:.16s}}.trend-column:hover .bar-tooltip{{opacity:1;transform:translate(-50%,0)}}
-.subscription-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(310px,100%),1fr));gap:15px}}.subscription-card{{padding:18px;transition:.14s transform,.14s box-shadow}}.subscription-card:nth-child(4n+1){{border-top:8px solid var(--sun)}}.subscription-card:nth-child(4n+2){{border-top:8px solid var(--rose)}}.subscription-card:nth-child(4n+3){{border-top:8px solid var(--sky)}}.subscription-card:nth-child(4n+4){{border-top:8px solid var(--mint)}}.account-head{{display:grid;min-width:0;grid-template-columns:44px minmax(0,1fr) auto;gap:11px;align-items:center;margin-bottom:18px}}.avatar{{display:grid;place-items:center;width:42px;height:42px;border:var(--border);border-radius:50%;background:var(--sun);box-shadow:var(--shadow-sm);color:var(--on-color);font:900 18px/1 var(--font-display)}}.subscription-card:nth-child(4n+2) .avatar{{background:var(--rose)}}.subscription-card:nth-child(4n+3) .avatar{{background:var(--sky)}}.subscription-card:nth-child(4n+4) .avatar{{background:var(--mint)}}.account-head h3{{margin:0;font:900 17px/1.1 var(--font-display);overflow-wrap:anywhere}}.account-head span{{color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.account-head i{{padding:5px 7px;border:1.5px solid var(--ink);border-radius:999px;background:var(--mint);color:var(--on-color);font:800 9px/1 var(--font-mono);font-style:normal}}.quota-row{{margin:14px 0}}.quota-copy{{display:flex;justify-content:space-between;align-items:end}}.quota-copy b{{display:block;font-size:12px}}.quota-copy span,.muted-row span{{display:block;margin-top:2px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.quota-copy strong{{font:900 17px/1 var(--font-display)}}.healthy{{color:#18824c}}.warning{{color:#b06b00}}.critical{{color:#d6324f}}:root[data-theme="dark"] .healthy{{color:#8ce7af}}:root[data-theme="dark"] .warning{{color:#ffd36b}}:root[data-theme="dark"] .critical{{color:#ff91a3}}.meter{{height:10px;margin-top:8px;border:1.5px solid var(--ink);border-radius:999px;background:var(--cream);overflow:hidden}}.meter span{{display:block;height:100%;border-right:1.5px solid var(--ink);background:currentColor}}.muted-row{{display:flex;justify-content:space-between;color:var(--ink-3)}}.account-usage{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:15px 0 5px}}.account-usage span{{min-width:0;padding:8px;border:1.5px solid var(--ink);border-radius:8px;background:var(--paper);color:var(--ink-3);font:700 8px/1.3 var(--font-mono);overflow-wrap:anywhere}}.account-usage b{{display:block;margin-top:3px;color:var(--ink);font-size:11px}}.quota-value{{display:flex;justify-content:space-between;align-items:end;margin-top:14px;padding-top:15px;border-top:2px solid var(--ink)}}.quota-value span{{color:var(--ink-3)}}.quota-value strong{{display:block;margin-top:5px;font:900 22px/1 var(--font-display)}}.quota-value small{{text-align:right;color:var(--ink-3);font:600 9px/1.4 var(--font-mono)}}
+.subscription-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(310px,100%),1fr));gap:15px}}.subscription-card{{padding:18px;transition:.14s transform,.14s box-shadow}}.subscription-card:nth-child(4n+1){{border-top:8px solid var(--sun)}}.subscription-card:nth-child(4n+2){{border-top:8px solid var(--rose)}}.subscription-card:nth-child(4n+3){{border-top:8px solid var(--sky)}}.subscription-card:nth-child(4n+4){{border-top:8px solid var(--mint)}}.account-head{{display:grid;min-width:0;grid-template-columns:44px minmax(0,1fr) auto;gap:11px;align-items:center;margin-bottom:18px}}.account-copy{{min-width:0}}.avatar{{display:grid;place-items:center;width:42px;height:42px;border:var(--border);border-radius:50%;background:var(--sun);box-shadow:var(--shadow-sm);color:var(--on-color);font:900 18px/1 var(--font-display)}}.subscription-card:nth-child(4n+2) .avatar{{background:var(--rose)}}.subscription-card:nth-child(4n+3) .avatar{{background:var(--sky)}}.subscription-card:nth-child(4n+4) .avatar{{background:var(--mint)}}.account-head h3{{margin:0;font:900 17px/1.1 var(--font-display);overflow-wrap:anywhere}}.account-head span{{display:block;overflow-wrap:anywhere}}.account-head .account-email{{margin-top:4px;color:var(--ink-2);font:700 10px/1.3 var(--font-mono)}}.account-head .account-email.unavailable{{color:var(--ink-3);font-weight:600}}.account-head .account-meta{{margin-top:3px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.account-head i{{padding:5px 7px;border:1.5px solid var(--ink);border-radius:999px;background:var(--mint);color:var(--on-color);font:800 9px/1 var(--font-mono);font-style:normal}}.quota-row{{margin:14px 0}}.quota-copy{{display:flex;justify-content:space-between;align-items:end}}.quota-copy b{{display:block;font-size:12px}}.quota-copy span,.muted-row span{{display:block;margin-top:2px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.quota-copy strong{{font:900 17px/1 var(--font-display)}}.healthy{{color:#18824c}}.warning{{color:#b06b00}}.critical{{color:#d6324f}}:root[data-theme="dark"] .healthy{{color:#8ce7af}}:root[data-theme="dark"] .warning{{color:#ffd36b}}:root[data-theme="dark"] .critical{{color:#ff91a3}}.meter{{height:10px;margin-top:8px;border:1.5px solid var(--ink);border-radius:999px;background:var(--cream);overflow:hidden}}.meter span{{display:block;height:100%;border-right:1.5px solid var(--ink);background:currentColor}}.muted-row{{display:flex;justify-content:space-between;color:var(--ink-3)}}.account-usage{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:15px 0 5px}}.account-usage span{{min-width:0;padding:8px;border:1.5px solid var(--ink);border-radius:8px;background:var(--paper);color:var(--ink-3);font:700 8px/1.3 var(--font-mono);overflow-wrap:anywhere}}.account-usage b{{display:block;margin-top:3px;color:var(--ink);font-size:11px}}.quota-value{{display:flex;justify-content:space-between;align-items:end;margin-top:14px;padding-top:15px;border-top:2px solid var(--ink)}}.quota-value span{{color:var(--ink-3)}}.quota-value strong{{display:block;margin-top:5px;font:900 22px/1 var(--font-display)}}.quota-value small{{text-align:right;color:var(--ink-3);font:600 9px/1.4 var(--font-mono)}}
 .two-col{{display:grid;grid-template-columns:1fr 1.2fr;gap:15px}}.panel{{padding:0}}.panel h3{{margin:0;padding:15px 18px;border-bottom:2px solid var(--ink);background:var(--sun);color:var(--on-color);font:900 15px/1 var(--font-display)}}.two-col .panel:nth-child(2) h3{{background:var(--sky)}}.table-wrap{{overflow:auto;max-height:520px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:11px 14px;text-align:left;border-bottom:1.5px solid color-mix(in srgb,var(--ink) 48%,transparent);white-space:nowrap}}th{{position:sticky;top:0;z-index:2;background:var(--cream);color:var(--ink-2);font:800 9px/1.2 var(--font-mono);letter-spacing:.06em;text-transform:uppercase}}tbody tr:nth-child(even){{background:color-mix(in srgb,var(--sky) 12%,var(--card))}}tr:last-child td{{border-bottom:0}}.status-pill{{display:inline-block;min-width:42px;padding:3px 7px;border:1.5px solid var(--ink);border-radius:999px;text-align:center;color:var(--on-color);font:900 9px/1 var(--font-mono)}}.status-pill.ok{{background:var(--mint)}}.status-pill.bad{{background:var(--rose)}}.empty,.empty-state{{padding:25px;text-align:center;color:var(--ink-3)}}
 .system-strip{{display:flex;flex-wrap:wrap;gap:9px;margin-top:27px}}.system-strip span{{padding:7px 10px;border:1.5px solid var(--ink);border-radius:999px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-2);font:700 9px/1 var(--font-mono)}}.system-strip span:nth-child(1){{background:var(--mint);color:var(--on-color)}}.system-strip span:nth-child(2){{background:var(--sky);color:var(--on-color)}}.system-strip span:nth-child(3){{background:var(--sun);color:var(--on-color)}}.system-strip b{{color:inherit}}footer{{margin-top:24px;padding-top:16px;border-top:2px solid var(--ink);color:var(--ink-3);font:600 9px/1.65 var(--font-mono)}}
-@media(max-width:1320px){{.hero-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:920px){{main{{padding:26px 16px 55px}}header{{align-items:flex-start}}.brand-mark{{width:46px;height:46px}}.subtitle{{max-width:560px}}.hero-grid,.period-grid,.two-col{{grid-template-columns:minmax(0,1fr)}}.trend{{gap:7px}}.notice{{display:grid;grid-template-columns:auto minmax(0,1fr)}}.notice b{{white-space:normal}}.notice span{{grid-column:2;overflow-wrap:anywhere}}}}@media(max-width:620px){{header{{align-items:flex-start;flex-direction:column}}.brand-lockup{{align-items:flex-start}}h1{{font-size:clamp(28px,9vw,38px)}}.header-actions{{width:100%;justify-content:space-between}}.hero-grid,.subscription-grid{{grid-template-columns:minmax(0,1fr)}}.period-head{{flex-wrap:wrap}}.mix-legend{{grid-template-columns:minmax(0,1fr)}}.account-usage{{grid-template-columns:repeat(3,minmax(0,1fr))}}.trend-column small{{display:none}}.section-title{{align-items:flex-start;flex-direction:column;gap:6px}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important;transition:none!important}}}}
+@media(max-width:1320px){{.hero-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:920px){{main{{padding:26px 16px 55px}}header{{align-items:flex-start}}.brand-mark{{width:46px;height:46px}}.subtitle{{max-width:560px}}.hero-grid,.period-grid,.two-col{{grid-template-columns:minmax(0,1fr)}}.form-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.trend{{gap:7px}}.notice{{display:grid;grid-template-columns:auto minmax(0,1fr)}}.notice b{{white-space:normal}}.notice span{{grid-column:2;overflow-wrap:anywhere}}}}@media(max-width:620px){{header{{align-items:flex-start;flex-direction:column}}.brand-lockup{{align-items:flex-start}}h1{{font-size:clamp(28px,9vw,38px)}}.header-actions{{width:100%;justify-content:space-between}}.hero-grid,.subscription-grid,.form-grid{{grid-template-columns:minmax(0,1fr)}}.period-head{{flex-wrap:wrap}}.mix-legend{{grid-template-columns:minmax(0,1fr)}}.account-usage{{grid-template-columns:repeat(3,minmax(0,1fr))}}.trend-column small{{display:none}}.section-title{{align-items:flex-start;flex-direction:column;gap:6px}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important;transition:none!important}}}}
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
+<div class="notice app-import-notice"><b>ChatGPT Codex 本地监控</b><span>codex-13 · …fa79c563 已映射到默认 CODEX_HOME；只读取本机会话中的 token_count / rate_limits 元数据，不读取或保存提示词、代码、推理、工具输出和凭据。已自动导入 {fmt_int(codex_app_status.get('imported_events'))} 条，最近扫描 {fmt_local_time(codex_app_status.get('last_import_at'))}。下方“API 等价成本”仅是按模型 API 单价估算，不是 Pro 订阅实际扣款。</span></div>
+<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="codex-13" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><label class="note-label">备注（不填写提示词或代码）<input name="note" maxlength="120" placeholder="例如：另一台设备的 Codex 用量"></label><button type="submit">导入并估价</button><p>输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。重复提交不会自动去重，请按汇总区间录入一次。</p></form></details>
 {session_notice}
 <div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
@@ -4223,7 +4973,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>逻辑请求/尝试 <b>{fmt_int(all_time['logical_requests'])}/{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>逻辑请求/尝试 <b>{fmt_int(all_time['logical_requests'])}/{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；输入、缓存输入和输出成本分别按对应模型的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
 
@@ -4248,6 +4998,11 @@ class MeterHTTPServer(ThreadingHTTPServer):
         usage_queue_timeout: float = 10.0,
         quota_poll_seconds: float = DEFAULT_QUOTA_POLL_SECONDS,
         quota_poll_timeout: float = DEFAULT_QUOTA_POLL_TIMEOUT,
+        codex_app_home: str | Path = DEFAULT_CODEX_APP_HOME,
+        codex_app_alias: str = DEFAULT_CODEX_APP_ALIAS,
+        codex_app_poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
+        codex_app_max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
+        codex_app_import_enabled: bool = True,
     ):
         super().__init__(address, UsageMeterHandler)
         parsed = urlsplit(upstream)
@@ -4278,12 +5033,30 @@ class MeterHTTPServer(ThreadingHTTPServer):
             poll_seconds=quota_poll_seconds,
             timeout=quota_poll_timeout,
         )
+        self.codex_app_importer = CodexAppLocalImporter(
+            repo,
+            resolver,
+            codex_home=codex_app_home,
+            alias=codex_app_alias,
+            poll_seconds=codex_app_poll_seconds,
+            max_files=codex_app_max_files,
+        )
+        self.codex_app_import_enabled = bool(codex_app_import_enabled)
 
     def start_queue_poller(self) -> None:
         self.queue_poller.start()
         self.quota_poller.start()
+        # The local ChatGPT importer is independent of the optional 8317
+        # management queue and must remain active when both are enabled.
+        if self.codex_app_import_enabled:
+            self.codex_app_importer.start()
+
+    def start_local_importer(self) -> None:
+        if self.codex_app_import_enabled:
+            self.codex_app_importer.start()
 
     def server_close(self) -> None:
+        self.codex_app_importer.stop()
         self.quota_poller.stop()
         self.queue_poller.stop()
         super().server_close()
@@ -4337,12 +5110,20 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     self.meter_server.repo,
                     self.meter_server.queue_poller.status(),
                     self.meter_server.quota_poller.status(),
+                    self.meter_server.codex_app_importer.status(),
+                    self.meter_server.resolver,
                 ).encode("utf-8")
             except Exception as exc:  # dashboard failure must not expose DB internals
                 LOG.error("dashboard rendering failed: %s", type(exc).__name__)
                 self._plain_response(500, b"dashboard unavailable\n")
                 return
             self._send_bytes(200, "OK", [("Content-Type", "text/html; charset=utf-8")], body)
+            return
+        if path == "/usage/manual-import":
+            if self.command != "POST":
+                self._plain_response(405, b"method not allowed\n")
+                return
+            self._manual_import()
             return
         if path == "/healthz":
             body = json.dumps(
@@ -4351,6 +5132,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     "upstream": self.meter_server.upstream.geturl(),
                     "usage_queue": self.meter_server.queue_poller.status(),
                     "subscription_quota": self.meter_server.quota_poller.status(),
+                    "codex_app_local": self.meter_server.codex_app_importer.status(),
                 }
             ).encode()
             self._send_bytes(200, "OK", [("Content-Type", "application/json")], body)
@@ -4359,6 +5141,112 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             self._proxy(path)
             return
         self._plain_response(404, b"not found\n")
+
+    def _manual_import(self) -> None:
+        try:
+            body = self._read_request_body()
+            if len(body) > MAX_MANUAL_IMPORT_BYTES:
+                raise ValueError("form too large")
+            fields = urllib.parse.parse_qs(
+                body.decode("utf-8"), keep_blank_values=True, max_num_fields=20
+            )
+            value = lambda name: fields.get(name, [""])[0]
+            alias = safe_alias(value("usage_alias"))
+            if alias != self.meter_server.codex_app_importer.alias:
+                raise ValueError("unsupported alias")
+            model = safe_text(value("model"), 200)
+            if not model:
+                raise ValueError("model is required")
+            input_tokens = as_nonnegative_int(value("input_tokens"))
+            cached_tokens = as_nonnegative_int(value("cached_tokens"))
+            output_tokens = as_nonnegative_int(value("output_tokens"))
+            reasoning_tokens = as_nonnegative_int(value("reasoning_tokens"))
+            call_count = as_nonnegative_int(value("call_count"))
+            if input_tokens is None or cached_tokens is None or output_tokens is None:
+                raise ValueError("token fields are required")
+            if cached_tokens > input_tokens:
+                raise ValueError("cached tokens exceed input tokens")
+            if not call_count or call_count > 100_000:
+                raise ValueError("invalid call count")
+            raw_ts = safe_text(value("ts"), 64)
+            ts = normalize_timestamp(raw_ts) if raw_ts else utc_now()
+            identity = self.meter_server.resolver.resolve(alias, None)
+            if not identity.account_id_hash:
+                raise ValueError("alias is not mapped to a local account")
+            usage = NormalizedUsage(
+                input_tokens=input_tokens,
+                cached_tokens=cached_tokens,
+                output_tokens=output_tokens,
+                reasoning_tokens=reasoning_tokens,
+                total_tokens=input_tokens + output_tokens,
+            )
+            components = self.meter_server.repo.price_components_for(model, usage)
+            import_key = "manual:" + short_hash(
+                f"{utc_now()}\n{alias}\n{model}\n{input_tokens}\n{cached_tokens}\n{output_tokens}"
+            )
+            event = UsageEvent(
+                ts=ts,
+                identity_key=identity_key(
+                    identity.account_id_hash, alias, None, None, None
+                ),
+                endpoint="manual://chatgpt-codex",
+                method="MANUAL",
+                model=model,
+                status_code=200,
+                ok=1,
+                duration_ms=0,
+                stream=0,
+                session_id=None,
+                thread_id=None,
+                turn_id=None,
+                installation_id=None,
+                window_id=None,
+                usage_alias=alias,
+                usage_project=safe_text(value("note"), 120) or "ChatGPT Codex 手动补录",
+                auth_fingerprint=None,
+                account_id_hash=identity.account_id_hash,
+                account_id_tail=identity.account_id_tail,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cached_tokens=usage.cached_tokens,
+                cache_write_tokens=0,
+                reasoning_tokens=usage.reasoning_tokens,
+                total_tokens=usage.total_tokens,
+                estimated_api_cost_usd=components.total_cost_usd if components else None,
+                non_cached_input_cost_usd=(
+                    components.non_cached_input_cost_usd if components else None
+                ),
+                cached_input_cost_usd=(
+                    components.cached_input_cost_usd if components else None
+                ),
+                output_cost_usd=components.output_cost_usd if components else None,
+                long_context_pricing_applied=int(
+                    components.long_context_pricing_applied if components else False
+                ),
+                subscription_amortized_cost_usd=None,
+                api_equivalent_quota_usd=None,
+                usage_missing=0,
+                error_type=None,
+                error_message_redacted=None,
+                request_bytes=0,
+                response_bytes=0,
+                call_count=call_count,
+                source="manual_codex_app",
+                request_id=import_key,
+            )
+            self.meter_server.repo.record_imported_event(
+                event, import_key, "manual_codex_app"
+            )
+        except (ValueError, UnicodeDecodeError) as exc:
+            LOG.info("manual import rejected: %s", type(exc).__name__)
+            self._plain_response(400, b"invalid manual usage import\n")
+            return
+        self.send_response_only(303, "See Other")
+        self.send_header("Location", "/usage")
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
 
     def _read_request_body(self) -> bytes:
         transfer = self.headers.get("Transfer-Encoding", "").lower()
@@ -4698,6 +5586,11 @@ def create_server(
     usage_queue_timeout: float = 10.0,
     quota_poll_seconds: float = DEFAULT_QUOTA_POLL_SECONDS,
     quota_poll_timeout: float = DEFAULT_QUOTA_POLL_TIMEOUT,
+    codex_app_home: str | Path = DEFAULT_CODEX_APP_HOME,
+    codex_app_alias: str = DEFAULT_CODEX_APP_ALIAS,
+    codex_app_poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
+    codex_app_max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
+    codex_app_import_enabled: bool = True,
 ) -> MeterHTTPServer:
     repo = UsageRepository(db_path)
     resolver = account_resolver or AccountResolver(
@@ -4717,6 +5610,11 @@ def create_server(
         usage_queue_timeout=usage_queue_timeout,
         quota_poll_seconds=quota_poll_seconds,
         quota_poll_timeout=quota_poll_timeout,
+        codex_app_home=codex_app_home,
+        codex_app_alias=codex_app_alias,
+        codex_app_poll_seconds=codex_app_poll_seconds,
+        codex_app_max_files=codex_app_max_files,
+        codex_app_import_enabled=codex_app_import_enabled,
     )
 
 
@@ -4813,6 +5711,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("CLIPROXY_QUOTA_POLL_TIMEOUT", str(DEFAULT_QUOTA_POLL_TIMEOUT))),
     )
+    parser.add_argument(
+        "--codex-app-home",
+        default=os.environ.get("CODEX_APP_HOME", str(DEFAULT_CODEX_APP_HOME)),
+        help="ChatGPT/Codex local home whose safe token_count metadata is imported",
+    )
+    parser.add_argument(
+        "--codex-app-alias",
+        default=os.environ.get("CODEX_APP_USAGE_ALIAS", DEFAULT_CODEX_APP_ALIAS),
+        help="Existing local alias that must match the ChatGPT app account",
+    )
+    parser.add_argument(
+        "--codex-app-poll-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "CODEX_APP_USAGE_POLL_SECONDS", str(DEFAULT_CODEX_APP_POLL_SECONDS)
+            )
+        ),
+    )
+    parser.add_argument(
+        "--codex-app-max-files",
+        type=int,
+        default=int(
+            os.environ.get("CODEX_APP_USAGE_MAX_FILES", str(DEFAULT_CODEX_APP_MAX_FILES))
+        ),
+        help="Maximum most-recent local session JSONL files scanned per poll",
+    )
+    parser.add_argument(
+        "--no-codex-app-import",
+        action="store_true",
+        help="Disable read-only import from local ChatGPT/Codex session metadata",
+    )
     parser.add_argument("--no-usage-queue", action="store_true", help="Disable direct 8317 usage-queue polling")
     parser.add_argument("--cached-input-price", type=float, help="Cached input USD/M; defaults to input price")
     parser.add_argument("--price-source-note", help="Human-readable provenance for a manually supplied price")
@@ -4881,6 +5811,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             usage_queue_timeout=args.usage_queue_timeout,
             quota_poll_seconds=args.quota_poll_seconds,
             quota_poll_timeout=args.quota_poll_timeout,
+            codex_app_home=args.codex_app_home,
+            codex_app_alias=args.codex_app_alias,
+            codex_app_poll_seconds=args.codex_app_poll_seconds,
+            codex_app_max_files=args.codex_app_max_files,
+            codex_app_import_enabled=not args.no_codex_app_import,
         )
         LOG.info(
             "usage meter listening on http://%s:%d; upstream=%s; db=%s",
@@ -4891,6 +5826,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if not args.no_usage_queue:
             server.start_queue_poller()
+        else:
+            server.start_local_importer()
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:

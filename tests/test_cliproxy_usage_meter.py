@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import importlib.util
 import hashlib
+import base64
 import json
 import os
 import socket
@@ -35,6 +36,11 @@ CHROME_SPEC.loader.exec_module(chrome_key)
 
 AUTH_SECRET = "fixture-auth-value"
 ERROR_SECRET = "fixture-error-value"
+
+
+def fixture_jwt(claims: dict[str, object]) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"fixture.{payload}.signature"
 
 
 class FakeUpstreamHandler(BaseHTTPRequestHandler):
@@ -192,7 +198,11 @@ class UsageMeterMVPTest(unittest.TestCase):
             json.dumps(
                 {
                     "auth_mode": "chatgpt",
-                    "tokens": {"account_id": "acct-unit-test-ABCDEFGH", "access_token": AUTH_SECRET},
+                    "tokens": {
+                        "account_id": "acct-unit-test-ABCDEFGH",
+                        "access_token": AUTH_SECRET,
+                        "id_token": fixture_jwt({"email": "fixture@example.com"}),
+                    },
                 }
             ),
             encoding="utf-8",
@@ -744,6 +754,106 @@ class UsageMeterMVPTest(unittest.TestCase):
             parsed = json.loads(completed.stdout)
             self.assertTrue(parsed)
 
+    def test_codex_app_local_import_is_safe_idempotent_and_priced(self) -> None:
+        app_home = self.temp_path / "app-codex"
+        alias_home = self.temp_path / ".codex-c"
+        sessions = app_home / "sessions" / "2026" / "08" / "13"
+        sessions.mkdir(parents=True)
+        alias_home.mkdir(parents=True)
+        account_id = "acct-local-fa79c563"
+        auth = {"auth_mode": "chatgpt", "tokens": {"account_id": account_id}}
+        (app_home / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+        (alias_home / "auth.json").write_text(json.dumps(auth), encoding="utf-8")
+        (self.temp_path / ".zshrc").write_text(
+            'alias codex-13=\'__codex_switch "$HOME/.codex-c" codex-13\'\n',
+            encoding="utf-8",
+        )
+        session = sessions / "rollout-test.jsonl"
+        records = [
+            {
+                "timestamp": "2026-08-13T07:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-local",
+                    "session_id": "session-local",
+                    "originator": "Codex Desktop",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-08-13T07:00:01Z",
+                "type": "turn_context",
+                "payload": {"model": "fake-responses", "turn_id": "turn-local"},
+            },
+            {
+                "timestamp": "2026-08-13T07:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "message", "content": "must never be imported"},
+            },
+            {
+                "timestamp": "2026-08-13T07:00:03Z",
+                "ordinal": 4,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "cache_write_input_tokens": 0,
+                            "output_tokens": 50,
+                            "reasoning_output_tokens": 10,
+                            "total_tokens": 150,
+                        }
+                    },
+                    "rate_limits": {
+                        "plan_type": "pro",
+                        "primary": {
+                            "used_percent": 12.5,
+                            "window_minutes": 300,
+                            "resets_at": 1786608000,
+                        },
+                    },
+                },
+            },
+        ]
+        session.write_text(
+            "\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8"
+        )
+        resolver = meter.AccountResolver(home=self.temp_path, refresh_seconds=0)
+        importer = meter.CodexAppLocalImporter(
+            self.sidecar.repo, resolver, app_home, "codex-13"
+        )
+        first = importer.import_once()
+        second = importer.import_once()
+        self.assertEqual(first["imported"], 1)
+        self.assertEqual(second["imported"], 0)
+        self.assertEqual(second["quota_rows"], 0)
+        appended = {
+            **records[-1],
+            "timestamp": "2026-08-13T07:00:04Z",
+            "ordinal": 5,
+        }
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(appended) + "\n")
+        third = importer.import_once()
+        self.assertEqual(third["imported"], 1)
+        self.assertEqual(third["quota_rows"], 1)
+        row = self.rows("SELECT * FROM usage_events WHERE source='codex_app_local'")[0]
+        self.assertEqual(row["usage_alias"], "codex-13")
+        self.assertEqual(row["model"], "fake-responses")
+        self.assertEqual((row["input_tokens"], row["cached_tokens"], row["output_tokens"]), (100, 20, 50))
+        self.assertAlmostEqual(row["estimated_api_cost_usd"], 0.00019, places=10)
+        self.assertNotIn("must never be imported", json.dumps(dict(row)))
+        quota_rows = self.rows(
+            "SELECT * FROM subscription_quota_snapshots WHERE source='codex_app_local'"
+        )
+        self.assertEqual(len(quota_rows), 2)
+        quota = quota_rows[-1]
+        self.assertEqual(quota["window_kind"], "five_hour")
+        self.assertEqual(quota["used_percent"], 12.5)
+        self.assertEqual(quota["plan_type"], "pro")
+
     def test_all_time_query_keeps_history_outside_seven_day_view(self) -> None:
         self.request("POST", "/v1/responses", {"model": "fake-responses"})
         self.request("POST", "/v1/responses", {"model": "fake-responses"})
@@ -821,6 +931,77 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertIn("1 个账号已刷新", page_after_restart_timeout)
         self.assertIn("Quota snapshot <b>正常", page_after_restart_timeout)
         self.assertIn("codex-1", page)
+
+    def test_latest_subscription_quota_uses_fetched_time_not_backfill_id(self) -> None:
+        common = {
+            "identity_key": "account:fixture",
+            "account_id_hash": "fixturehash",
+            "account_id_tail": "ABCDEFGH",
+            "usage_alias": "codex-1",
+            "plan_type": "plus",
+            "window_kind": "weekly",
+            "window_seconds": 604800,
+            "source": "fixture",
+        }
+        # Insert the current reset first, then simulate an older JSONL file
+        # being backfilled later with a larger SQLite id.
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                **common,
+                "fetched_at": "2026-08-13T04:00:00Z",
+                "used_percent": 0,
+                "remaining_percent": 100,
+                "reset_at": "2026-08-20T04:00:00Z",
+            }
+        )
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                **common,
+                "fetched_at": "2026-08-12T16:00:00Z",
+                "used_percent": 43,
+                "remaining_percent": 57,
+                "reset_at": "2026-08-19T12:00:00Z",
+            }
+        )
+        row = next(
+            item for item in self.sidecar.repo.subscription_dashboard_rows()
+            if item["identity_key"] == "account:fixture"
+        )
+        self.assertEqual(row["windows"]["weekly"]["used_percent"], 0)
+        self.assertEqual(row["windows"]["weekly"]["remaining_percent"], 100)
+        self.assertEqual(row["windows"]["weekly"]["reset_at"], "2026-08-20T04:00:00Z")
+
+    def test_dashboard_displays_local_account_email_without_persisting_it(self) -> None:
+        identity = self.sidecar.resolver.resolve("codex-1", None)
+        self.assertEqual(identity.account_email, "fixture@example.com")
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-13T04:00:00Z",
+                "identity_key": f"account:{identity.account_id_hash}",
+                "account_id_hash": identity.account_id_hash,
+                "account_id_tail": identity.account_id_tail,
+                "usage_alias": "codex-1",
+                "plan_type": "plus",
+                "window_kind": "weekly",
+                "used_percent": 0,
+                "remaining_percent": 100,
+                "window_seconds": 604800,
+                "reset_at": "2026-08-20T04:00:00Z",
+                "source": "fixture",
+            }
+        )
+        page = meter.dashboard_html(
+            self.sidecar.repo,
+            account_resolver=self.sidecar.resolver,
+        )
+        self.assertIn("fixture@example.com", page)
+        with sqlite3.connect(self.db) as conn:
+            serialized = "\n".join(
+                str(value)
+                for row in conn.execute("SELECT * FROM subscription_quota_snapshots")
+                for value in row
+            )
+        self.assertNotIn("fixture@example.com", serialized)
 
     def test_subscription_estimate_uses_provider_window_and_meaningful_identity_badge(self) -> None:
         # A near-cap provider snapshot must use the observed spend, not the

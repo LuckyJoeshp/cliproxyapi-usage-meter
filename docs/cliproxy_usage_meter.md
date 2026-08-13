@@ -85,6 +85,22 @@ python3 \
 `usage_events`，不论成功、失败、streaming 或 usage 缺失。队列事件的 `source` 为
 `usage_queue`，显式 sidecar 请求的 `source` 为 `sidecar`。支持：
 
+### ChatGPT App 直登 Codex 的本地监控
+
+个人 ChatGPT/Pro 直登模式不经过 8327/8317，因此代理无法从网络流量中看到请求；也没有面向个人订阅的公开 token 账单 API。当前版本会额外只读扫描 `CODEX_APP_HOME`（默认 `~/.codex`）下 Codex 会话 JSONL 的 `event_msg.token_count` 元数据，并要求其本地账号与 `CODEX_APP_USAGE_ALIAS`（默认 `codex-13`）的 `auth.json` 账号一致。仅保存 input/cached/output/reasoning/total token、模型、时间和额度窗口；提示词、代码、工具输出、JWT/API key 永不写入数据库。导入事件的 `source` 为 `codex_app_local`，重复扫描是幂等的。
+
+启动 sidecar 时默认开启：
+
+```bash
+CODEX_APP_HOME="$HOME/.codex" \
+CODEX_APP_USAGE_ALIAS=codex-13 \
+scripts/start_cliproxy_usage_meter.sh
+```
+
+为避免每次轮询重读很大的历史目录，默认只扫描最近修改的 500 个 JSONL，并持久化每个文件的读取 offset；未变化文件不会重读，增长中的活动会话只读取追加部分。可用 `CODEX_APP_USAGE_MAX_FILES` 或 `--codex-app-max-files` 调整范围。
+
+若需要关闭本地日志导入，可增加 `--no-codex-app-import`。跨设备或日志缺失时，`/usage` 页面中的“手动补录用量”折叠表单会写入 `manual_codex_app` 事件。页面中的美元数字是按已配置 OpenAI API 单价计算的 API 等价估算，不代表 Pro 订阅实际扣款或剩余额度；订阅额度仍以 ChatGPT/Codex 产品界面为准。
+
 - Responses：`input_tokens` / `output_tokens` / `cached_tokens` / `reasoning_tokens` / `total_tokens`
 - Chat Completions：`prompt_tokens` / `completion_tokens` 及对应 details
 - 非 streaming JSON，以及不改写字节的 SSE streaming（尽量读取最终 usage）
@@ -125,7 +141,10 @@ CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。�
   看板文案称为“额外调用”，不等同于失败数。
 
 每个订阅卡也会单独显示总调用、成功调用、失败调用和额外调用，便于识别某个账号是否
-频繁失败或被账号池反复使用。
+频繁失败或被账号池反复使用。已映射本机 `CODEX_HOME` 的卡片还会显示对应订阅邮箱；
+邮箱只从本机 `auth.json` 的身份声明读入内存用于 loopback 页面展示，不写入 SQLite、
+日志、额度快照或健康检查响应。额度快照可能由历史 JSONL 乱序回填，因此“当前额度”
+按 `fetched_at`（同时间再按数据库 id）选择，而不是把最后插入的历史行误认为最新。
 
 不会删除或覆盖失败/重试行，因为它们是账号池行为和故障审计的一部分。token/cost 仍按
 attempt 如实累计；逻辑请求去重仅用于调用次数展示，不能猜测哪次成功 token 可以代表整组。
