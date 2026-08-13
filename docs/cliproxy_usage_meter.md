@@ -96,6 +96,10 @@ Authorization、access token、refresh token、id token 和 API key 永不打印
 `auth_fingerprint`、`account_id_hash`、`account_id_tail`。如果多个客户端共用同一个代理 key 且没有 alias header，
 meter 无法凭空知道它们对应哪个订阅账号，这是已知的 best-effort 限制。
 
+队列可能先于认证文件刷新完成，因此短暂写入的 `auth:<fingerprint>` 只是临时身份。sidecar 启动和
+`/usage` 渲染时会安全地重新扫描本地 auth 文件，并将可解析的临时记录回绑到 `codex-N` 或账号哈希；
+不会删除或改写任何认证 token。
+
 ### Token 与调用口径
 
 看板同时保留三种互不混淆的 token 口径：
@@ -130,7 +134,8 @@ attempt 如实累计；逻辑请求去重仅用于调用次数展示，不能猜
 
 未知价格时 `estimated_api_cost_usd` 为 `NULL`，不会伪造价格。推荐从
 [OpenAI 官方 API 定价页](https://developers.openai.com/api/docs/pricing)显式同步
-Standard / short-context 的 input、cached input、output 单价（USD / 每百万 token）：
+Standard 的 short/long-context input、cached input、cache write、output 单价
+（USD / 每百万 token）：
 
 ```bash
 PY=python3
@@ -145,8 +150,11 @@ $PY scripts/cliproxy_usage_meter.py --db datas/cliproxy_usage.sqlite \
 同步会记录官方 URL、抓取时间、页面 SHA256、parser 版本、同步状态、模型数和历史
 补价条数。抓取或解析失败时，已生效价格原子保留，代理请求不受影响；server 启动时
 不会自行联网。新同步的官方价格会用于后续请求，并对价格仍为 `NULL` 且 token 拆分
-完整的已有记录补价。当前官方页明确给出 `gpt-5.6-sol` Standard 短上下文价格：
-input `$5.00/M`、cached input `$0.50/M`、output `$30.00/M`。若官方页以后删除或未列出
+完整的已有记录补价，并安全校正能够证明原先按短档冻结的历史长上下文记录。每次调用按
+完整 `input_tokens` 判断：`<=272,000` 使用短档，`>272,000` 使用长档；`cached_tokens`
+是 input 的子集，因此既计入阈值，又按 cached-input 单价计算。当前官方页明确给出
+`gpt-5.6-sol` Standard 短档 input `$5.00/M`、cached input `$0.50/M`、output `$30.00/M`，
+长档分别为 `$10.00/M`、`$1.00/M`、`$45.00/M`。若官方页以后删除或未列出
 某个模型，meter 不猜价。
 
 也可以显式维护本地价格：
@@ -298,8 +306,9 @@ tmux new-session -s cliproxy_usage_meter_test \
 
 1. streaming upstream 不提供最终 usage 时只能记录 `usage_missing=1`；不会猜 token。
 2. alias/account 自动映射依赖 bearer 与本地 auth 相同，或客户端显式提供 `X-Usage-Alias`；共享代理 key 无法自动拆分。
-3. 官方价格同步解析 Standard 短上下文费率；长上下文、cache-write 或官方未列出的代理别名仍保持 `NULL`，
-   不做推断。建议定期显式运行 `--sync-official-prices`。
+3. 官方价格同步解析 Standard 短/长上下文及 cache-write 费率；官方未列出的代理别名仍保持 `NULL`，
+   不做推断。usage 未提供 `cache_write_tokens` 时无法单独展示写入 token，但不影响已上报
+   input/cached/output 的长上下文阈值判断。建议定期显式运行 `--sync-official-prices`。
 4. quota 等价额度只有观察到完整 quota/cooldown 事件才会封存；当前周期只提供 observed floor。
 5. 8317 queue 当前没有 session id，所以无法从历史数据库精确还原单个 Codex/tmux session；
    只能比较同口径 token，不能比较同范围总量。

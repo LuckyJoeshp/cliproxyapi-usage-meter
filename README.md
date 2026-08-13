@@ -41,7 +41,7 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | Capability | What is tracked |
 | --- | --- |
 | Token accounting | Non-cached input, cached input, output, reasoning subset, and raw API processing |
-| Cost estimation | Official OpenAI price sync or reviewed local prices, split by token type |
+| Cost estimation | Official OpenAI short/long-context price sync or reviewed local prices, split by token type |
 | Account behavior | Logical requests, account attempts, retries, aliases, models, sessions, and dates |
 | Quota visibility | Read-only 5-hour/week/month snapshots, reset times, cooldowns, and observed floors |
 | Collection paths | Transparent `8327` proxy plus optional destructive-read `8317` usage queue |
@@ -60,6 +60,24 @@ PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
 ```
 
 Open <http://127.0.0.1:8327/usage>.
+
+### Start Codex through CLIProxyAPI from any folder
+
+The repository includes [`scripts/codex-cliproxyapi`](scripts/codex-cliproxyapi),
+which follows the verified `codex-quant` profile (`cliproxy`, Responses API,
+and the local CLIProxyAPI account pool) without changing the working directory.
+Install it once on macOS so it is available from every folder:
+
+```bash
+install -m 755 scripts/codex-cliproxyapi /opt/homebrew/bin/codex-cliproxyapi
+cd /path/to/any/project
+codex-cliproxyapi
+```
+
+The command uses the current directory as Codex's workspace. It does not embed
+`QuantSystem` or any other project path. CLIProxyAPI must be running on
+`127.0.0.1:8317`; the existing `~/.codex/cliproxy.config.toml` profile supplies
+the endpoint and reads the bearer key at runtime.
 
 For a direct-8317 queue collector, use an external owner-only key file (never
 put a management credential in this checkout):

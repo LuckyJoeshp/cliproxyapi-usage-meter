@@ -433,6 +433,58 @@ class UsageMeterMVPTest(unittest.TestCase):
             self.sidecar.repo.price_for("fake-responses", meter.NormalizedUsage(total_tokens=3))
         )
 
+    def test_reconcile_provisional_auth_identity_after_auth_file_refresh(self) -> None:
+        fingerprint = meter.short_hash(AUTH_SECRET)
+        assert fingerprint
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, identity_key, usage_alias, auth_fingerprint, model,
+                    status_code, ok, call_count, usage_missing)
+                   VALUES ('2026-08-12T00:00:00.000000Z', ?, ?, ?,
+                           'fake-responses', 400, 0, 1, 1)""",
+                (f"alias:auth:{fingerprint}", f"auth:{fingerprint}", fingerprint),
+            )
+
+        self.assertEqual(
+            self.sidecar.resolver.resolve(f"auth:{fingerprint}", fingerprint).usage_alias,
+            "codex-1",
+        )
+        self.assertEqual(self.sidecar.repo.reconcile_auth_identities(self.sidecar.resolver), 1)
+        row = self.rows("SELECT * FROM usage_events")[0]
+        expected_hash = meter.short_hash("acct-unit-test-ABCDEFGH")
+        self.assertEqual(row["identity_key"], f"account:{expected_hash}")
+        self.assertEqual(row["usage_alias"], "codex-1")
+        self.assertEqual(row["account_id_hash"], expected_hash)
+        self.assertEqual(row["account_id_tail"], "ABCDEFGH")
+        self.assertEqual(self.sidecar.repo.reconcile_auth_identities(self.sidecar.resolver), 0)
+
+        # A rotated token may no longer be present in the auth file, while
+        # the event still carries the account hash from an earlier mapping.
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, identity_key, usage_alias, auth_fingerprint,
+                    account_id_hash, account_id_tail, model,
+                    status_code, ok, call_count, usage_missing)
+                   VALUES ('2026-08-12T00:00:01.000000Z', ?, ?, ?, ?, ?,
+                           'fake-responses', 400, 0, 1, 1)""",
+                (
+                    "account:" + expected_hash,
+                    "auth:deadbeefdeadbeef",
+                    "deadbeefdeadbeef",
+                    expected_hash,
+                    "ABCDEFGH",
+                ),
+            )
+        self.assertEqual(self.sidecar.repo.reconcile_auth_identities(self.sidecar.resolver), 1)
+        rotated = self.rows(
+            "SELECT usage_alias, identity_key FROM usage_events WHERE auth_fingerprint=?",
+            ("deadbeefdeadbeef",),
+        )[0]
+        self.assertEqual(rotated["usage_alias"], "codex-1")
+        self.assertEqual(rotated["identity_key"], f"account:{expected_hash}")
+
     def test_chrome_management_session_decoder_keeps_key_in_memory(self) -> None:
         host = "localhost:8317"
         user_agent = "fixture-user-agent"
@@ -924,23 +976,15 @@ class UsageMeterMVPTest(unittest.TestCase):
         </div>
         """
         rows = meter.parse_official_pricing_html(fake_html)
-        self.assertEqual(
-            rows,
-            [
-                {
-                    "model_pattern": "gpt-5.6-sol",
-                    "input_per_million": 5.0,
-                    "output_per_million": 30.0,
-                    "cached_input_per_million": 0.5,
-                },
-                {
-                    "model_pattern": "gpt-5.5",
-                    "input_per_million": 5.0,
-                    "output_per_million": 30.0,
-                    "cached_input_per_million": 0.5,
-                },
-            ],
-        )
+        self.assertEqual([row["model_pattern"] for row in rows], ["gpt-5.6-sol", "gpt-5.5"])
+        for row in rows:
+            self.assertEqual(row["input_per_million"], 5.0)
+            self.assertEqual(row["cached_input_per_million"], 0.5)
+            self.assertEqual(row["output_per_million"], 30.0)
+            self.assertEqual(row["long_context_threshold_tokens"], 272000)
+            self.assertEqual(row["long_input_per_million"], 10.0)
+            self.assertEqual(row["long_cached_input_per_million"], 1.0)
+            self.assertEqual(row["long_output_per_million"], 45.0)
 
     def test_official_pricing_parser_uses_complete_ssr_props_not_collapsed_rows(self) -> None:
         fake_html = """
@@ -957,6 +1001,90 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(rows[1]["cached_input_per_million"], 0.2)
         self.assertEqual(rows[1]["output_per_million"], 12.0)
 
+    def test_official_pricing_parser_reads_grouped_long_context_rates(self) -> None:
+        fake_html = """
+        <div data-content-switcher-pane="true" data-value="standard">
+          <astro-island component-export="GroupedPricingTable"
+            props="{&quot;headings&quot;:[1,[[0,&quot;Model&quot;],[0,&quot;Short context input&quot;],[0,&quot;Long context input&quot;]]],&quot;groups&quot;:[1,[[0,{&quot;model&quot;:[0,&quot;gpt-5.6-sol&quot;],&quot;rows&quot;:[1,[[1,[[0,5],[0,0.5],[0,6.25],[0,30],[0,10],[0,1],[0,12.5],[0,45]]]]]}],[0,{&quot;model&quot;:[0,&quot;gpt-no-long&quot;],&quot;rows&quot;:[1,[[1,[[0,1],[0,0.1],[0,&quot;-&quot;],[0,2],[0,&quot;-&quot;],[0,&quot;-&quot;],[0,&quot;-&quot;],[0,&quot;-&quot;]]]]]}]]}"></astro-island>
+          <astro-island component-export="TextTokenPricingTables">
+            <table><thead><tr><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th></tr></thead>
+            <tbody><tr><td>gpt-5.6-sol</td><td>$5</td><td>$0.5</td><td>$30</td></tr></tbody></table>
+          </astro-island>
+        </div>
+        """
+        rows = meter.parse_official_pricing_html(fake_html)
+        sol = next(row for row in rows if row["model_pattern"] == "gpt-5.6-sol")
+        self.assertEqual(sol["long_context_threshold_tokens"], 272000)
+        self.assertEqual(sol["long_input_per_million"], 10.0)
+        self.assertEqual(sol["long_cached_input_per_million"], 1.0)
+        self.assertEqual(sol["long_cache_write_per_million"], 12.5)
+        self.assertEqual(sol["long_output_per_million"], 45.0)
+        no_long = next(row for row in rows if row["model_pattern"] == "gpt-no-long")
+        self.assertIsNone(no_long["long_context_threshold_tokens"])
+
+    def test_long_context_pricing_counts_cached_input_and_uses_strict_threshold(self) -> None:
+        price = {
+            "input_per_million": 5.0,
+            "cached_input_per_million": 0.5,
+            "cache_write_per_million": 6.25,
+            "output_per_million": 30.0,
+            "long_context_threshold_tokens": 272000,
+            "long_input_per_million": 10.0,
+            "long_cached_input_per_million": 1.0,
+            "long_cache_write_per_million": 12.5,
+            "long_output_per_million": 45.0,
+        }
+        exact = meter.UsageRepository._components_for_price(
+            meter.NormalizedUsage(input_tokens=272000, cached_tokens=270000, output_tokens=1000),
+            price,
+        )
+        assert exact is not None
+        self.assertFalse(exact.long_context_pricing_applied)
+        self.assertAlmostEqual(exact.total_cost_usd, 0.175, places=12)
+
+        over = meter.UsageRepository._components_for_price(
+            meter.NormalizedUsage(input_tokens=272001, cached_tokens=270001, output_tokens=1000),
+            price,
+        )
+        assert over is not None
+        self.assertTrue(over.long_context_pricing_applied)
+        self.assertAlmostEqual(over.non_cached_input_cost_usd, 0.02, places=12)
+        self.assertAlmostEqual(over.cached_input_cost_usd, 0.270001, places=12)
+        self.assertAlmostEqual(over.output_cost_usd, 0.045, places=12)
+
+    def test_long_context_cost_upgrade_is_idempotent_and_provenance_safe(self) -> None:
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """UPDATE model_prices
+                      SET long_context_threshold_tokens=272000,
+                          long_input_per_million=2.0,
+                          long_cached_input_per_million=1.0,
+                          long_output_per_million=3.0
+                    WHERE model_pattern='fake-*'"""
+            )
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, model, input_tokens, cached_tokens, output_tokens, total_tokens,
+                    estimated_api_cost_usd, non_cached_input_cost_usd,
+                    cached_input_cost_usd, output_cost_usd, call_count)
+                   VALUES ('2026-08-13T00:00:00Z', 'fake-responses', 300000, 200000,
+                           10000, 310000, 0.22, 0.1, 0.1, 0.02, 1),
+                          ('2026-08-13T00:00:01Z', 'fake-responses', 300000, 200000,
+                           10000, 310000, 99, 33, 33, 33, 1)"""
+            )
+        self.assertEqual(self.sidecar.repo.upgrade_long_context_costs(), 1)
+        rows = self.rows(
+            """SELECT estimated_api_cost_usd, non_cached_input_cost_usd,
+                      cached_input_cost_usd, output_cost_usd,
+                      long_context_pricing_applied
+                 FROM usage_events ORDER BY id"""
+        )
+        self.assertAlmostEqual(rows[0]["estimated_api_cost_usd"], 0.43, places=12)
+        self.assertEqual(rows[0]["long_context_pricing_applied"], 1)
+        self.assertEqual(rows[1]["estimated_api_cost_usd"], 99)
+        self.assertEqual(rows[1]["long_context_pricing_applied"], 0)
+        self.assertEqual(self.sidecar.repo.upgrade_long_context_costs(), 0)
+
     def test_official_price_sync_is_atomic_and_failure_keeps_old_prices(self) -> None:
         with sqlite3.connect(self.db) as conn:
             conn.execute(
@@ -968,6 +1096,8 @@ class UsageMeterMVPTest(unittest.TestCase):
             )
         fake_html = b"""
         <div data-content-switcher-pane="true" data-value="standard">
+          <astro-island component-export="GroupedPricingTable"
+            props="{&quot;headings&quot;:[1,[[0,&quot;Model&quot;],[0,&quot;Short context input&quot;],[0,&quot;Long context input&quot;]]],&quot;groups&quot;:[1,[[0,{&quot;model&quot;:[0,&quot;gpt-5.6-sol&quot;],&quot;rows&quot;:[1,[[1,[[0,5],[0,0.5],[0,6.25],[0,30],[0,10],[0,1],[0,12.5],[0,45]]]]]}]]}"></astro-island>
           <astro-island component-export="TextTokenPricingTables">
             <table><thead><tr><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th></tr></thead>
             <tbody><tr><td>gpt-5.6-sol</td><td>$5.00</td><td>$0.50</td><td>$30.00</td></tr></tbody></table>
@@ -988,10 +1118,10 @@ class UsageMeterMVPTest(unittest.TestCase):
                       cached_input_cost_usd, output_cost_usd
                  FROM usage_events WHERE model='gpt-5.6-sol'"""
         )[0]
-        self.assertAlmostEqual(repriced["estimated_api_cost_usd"], 5.75, places=10)
-        self.assertAlmostEqual(repriced["non_cached_input_cost_usd"], 2.5, places=10)
-        self.assertAlmostEqual(repriced["cached_input_cost_usd"], 0.25, places=10)
-        self.assertAlmostEqual(repriced["output_cost_usd"], 3.0, places=10)
+        self.assertAlmostEqual(repriced["estimated_api_cost_usd"], 10.0, places=10)
+        self.assertAlmostEqual(repriced["non_cached_input_cost_usd"], 5.0, places=10)
+        self.assertAlmostEqual(repriced["cached_input_cost_usd"], 0.5, places=10)
+        self.assertAlmostEqual(repriced["output_cost_usd"], 4.5, places=10)
         price = next(row for row in self.sidecar.repo.list_prices() if row["model_pattern"] == "gpt-5.6-sol")
         self.assertEqual(price["source_kind"], "official")
         self.assertEqual(price["output_per_million"], 30.0)

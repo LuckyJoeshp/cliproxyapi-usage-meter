@@ -42,7 +42,8 @@ DEFAULT_UPSTREAM = "http://127.0.0.1:8317"
 DEFAULT_DB = Path(__file__).resolve().parents[1] / "datas" / "cliproxy_usage.sqlite"
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 OFFICIAL_PRICING_HOSTS = {"developers.openai.com", "platform.openai.com"}
-OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v1"
+OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v2-long-context"
+LONG_CONTEXT_THRESHOLD_TOKENS = 272_000
 DEFAULT_USAGE_QUEUE_PATH = "/v0/management/usage-queue"
 DEFAULT_USAGE_QUEUE_COUNT = 100
 DEFAULT_USAGE_QUEUE_POLL_SECONDS = 5.0
@@ -159,6 +160,19 @@ def safe_alias(value: Any) -> str | None:
     return None
 
 
+def is_auth_fallback_alias(value: Any) -> bool:
+    """Return whether an alias is the queue's temporary auth-fingerprint label.
+
+    Queue records can arrive while CLIProxyAPI is still writing a refreshed
+    auth file.  During that small race the resolver has no named ``codex-N``
+    alias and persists ``auth:<fingerprint>`` instead.  This is a provisional
+    label, not a user alias, and may be safely re-bound later.
+    """
+
+    text = safe_text(value, 128)
+    return bool(text and re.fullmatch(r"auth:[0-9a-f]{16}", text, re.IGNORECASE))
+
+
 def numeric_alias_key(value: Any) -> tuple[int, str]:
     text = safe_text(value, 128) or ""
     match = re.fullmatch(r"codex-(\d+)", text, re.IGNORECASE)
@@ -251,6 +265,7 @@ class NormalizedUsage:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
+    cache_write_tokens: int | None = None
     reasoning_tokens: int | None = None
     total_tokens: int | None = None
 
@@ -266,6 +281,7 @@ class PriceComponents:
     non_cached_input_cost_usd: float
     cached_input_cost_usd: float
     output_cost_usd: float
+    long_context_pricing_applied: bool = False
 
     @property
     def total_cost_usd(self) -> float:
@@ -292,6 +308,9 @@ def normalize_usage(value: Any) -> NormalizedUsage:
     cached_tokens = as_nonnegative_int(
         input_details.get("cached_tokens") if isinstance(input_details, Mapping) else None
     )
+    cache_write_tokens = as_nonnegative_int(
+        input_details.get("cache_write_tokens") if isinstance(input_details, Mapping) else None
+    )
     reasoning_tokens = as_nonnegative_int(
         output_details.get("reasoning_tokens") if isinstance(output_details, Mapping) else None
     )
@@ -301,6 +320,7 @@ def normalize_usage(value: Any) -> NormalizedUsage:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         total_tokens=total_tokens,
     )
@@ -440,7 +460,15 @@ class AccountResolver:
             return self._aliases[usage_alias]
         if auth_fingerprint and auth_fingerprint in self._tokens:
             matched = self._tokens[auth_fingerprint]
-            return AccountIdentity(usage_alias or matched.usage_alias, matched.account_id_hash, matched.account_id_tail)
+            # ``auth:<fingerprint>`` is emitted as a temporary fallback when
+            # the queue wins a refresh/write race.  Prefer the now-known
+            # local alias so new events do not create a second account card.
+            resolved_alias = (
+                matched.usage_alias
+                if not usage_alias or is_auth_fallback_alias(usage_alias)
+                else usage_alias
+            )
+            return AccountIdentity(resolved_alias, matched.account_id_hash, matched.account_id_tail)
         return AccountIdentity(usage_alias, None, None)
 
     def resolve_queue(
@@ -481,6 +509,18 @@ class AccountResolver:
         self._refresh_if_needed()
         identity = self._accounts.get(account)
         return identity if identity is not None else self._identity(None, account)
+
+    def resolve_account_hash(self, account_id_hash: str | None) -> AccountIdentity:
+        """Resolve a previously stored short account hash to a local alias."""
+
+        target = safe_text(account_id_hash, 64)
+        if not target:
+            return AccountIdentity(None, None, None)
+        self._refresh_if_needed()
+        for identity in self._accounts.values():
+            if identity.account_id_hash == target:
+                return identity
+        return AccountIdentity(None, None, None)
 
     def _refresh_if_needed(self) -> None:
         if not self.enabled or time.monotonic() - self._last_refresh < self.refresh_seconds:
@@ -702,12 +742,14 @@ class UsageEvent:
     input_tokens: int | None
     output_tokens: int | None
     cached_tokens: int | None
+    cache_write_tokens: int | None
     reasoning_tokens: int | None
     total_tokens: int | None
     estimated_api_cost_usd: float | None
     non_cached_input_cost_usd: float | None
     cached_input_cost_usd: float | None
     output_cost_usd: float | None
+    long_context_pricing_applied: int
     subscription_amortized_cost_usd: float | None
     api_equivalent_quota_usd: float | None
     usage_missing: int
@@ -781,12 +823,14 @@ class UsageRepository:
                   input_tokens INTEGER,
                   output_tokens INTEGER,
                   cached_tokens INTEGER,
+                  cache_write_tokens INTEGER,
                   reasoning_tokens INTEGER,
                   total_tokens INTEGER,
                   estimated_api_cost_usd REAL,
                   non_cached_input_cost_usd REAL,
                   cached_input_cost_usd REAL,
                   output_cost_usd REAL,
+                  long_context_pricing_applied INTEGER DEFAULT 0,
                   subscription_amortized_cost_usd REAL,
                   api_equivalent_quota_usd REAL,
                   usage_missing INTEGER,
@@ -804,6 +848,12 @@ class UsageRepository:
                   input_per_million REAL,
                   output_per_million REAL,
                   cached_input_per_million REAL,
+                  cache_write_per_million REAL,
+                  long_context_threshold_tokens INTEGER,
+                  long_input_per_million REAL,
+                  long_cached_input_per_million REAL,
+                  long_cache_write_per_million REAL,
+                  long_output_per_million REAL,
                   reasoning_per_million REAL,
                   currency TEXT,
                   source_note TEXT,
@@ -891,7 +941,20 @@ class UsageRepository:
             self._ensure_column(conn, "usage_events", "non_cached_input_cost_usd", "REAL")
             self._ensure_column(conn, "usage_events", "cached_input_cost_usd", "REAL")
             self._ensure_column(conn, "usage_events", "output_cost_usd", "REAL")
+            self._ensure_column(conn, "usage_events", "cache_write_tokens", "INTEGER")
+            self._ensure_column(
+                conn,
+                "usage_events",
+                "long_context_pricing_applied",
+                "INTEGER DEFAULT 0",
+            )
             self._ensure_column(conn, "model_prices", "source_kind", "TEXT DEFAULT 'manual'")
+            self._ensure_column(conn, "model_prices", "long_context_threshold_tokens", "INTEGER")
+            self._ensure_column(conn, "model_prices", "cache_write_per_million", "REAL")
+            self._ensure_column(conn, "model_prices", "long_input_per_million", "REAL")
+            self._ensure_column(conn, "model_prices", "long_cached_input_per_million", "REAL")
+            self._ensure_column(conn, "model_prices", "long_cache_write_per_million", "REAL")
+            self._ensure_column(conn, "model_prices", "long_output_per_million", "REAL")
             self._ensure_column(conn, "price_sync_metadata", "repriced_events", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "quota_events", "identity_key", "TEXT")
             self._ensure_column(conn, "account_quota_cycles", "identity_key", "TEXT")
@@ -908,6 +971,7 @@ class UsageRepository:
                 """
             )
             self._backfill_frozen_cost_components(conn)
+            self._upgrade_long_context_costs(conn)
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
@@ -936,14 +1000,40 @@ class UsageRepository:
         # input/output split; keep every cost field NULL instead of returning 0.
         if usage.input_tokens is None or usage.output_tokens is None:
             return None
+        price = dict(price)
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens
         cached_tokens = usage.cached_tokens or 0
-        raw_rates = (
-            price["input_per_million"],
-            price["cached_input_per_million"],
-            price["output_per_million"],
-        )
+        cache_write_tokens = usage.cache_write_tokens or 0
+        ordinary_input_tokens = max(input_tokens - cached_tokens - cache_write_tokens, 0)
+        long_context = False
+        threshold = as_nonnegative_int(price.get("long_context_threshold_tokens"))
+        if threshold is not None and input_tokens > threshold:
+            long_rates = (
+                price.get("long_input_per_million"),
+                price.get("long_cached_input_per_million"),
+                price.get("long_cache_write_per_million"),
+                price.get("long_output_per_million"),
+            )
+            # A partially documented long-context tier is not safe to infer.
+            # Use it only when every token category needed by this event has a
+            # corresponding official rate; otherwise leave the event unpriced.
+            if (
+                (ordinary_input_tokens > 0 and long_rates[0] is None)
+                or (cached_tokens > 0 and long_rates[1] is None)
+                or (cache_write_tokens > 0 and long_rates[2] is None)
+                or (output_tokens > 0 and long_rates[3] is None)
+            ):
+                return None
+            raw_rates = long_rates
+            long_context = True
+        else:
+            raw_rates = (
+                price["input_per_million"],
+                price["cached_input_per_million"],
+                price.get("cache_write_per_million"),
+                price["output_per_million"],
+            )
         rates: list[float | None] = []
         for raw in raw_rates:
             if raw is None:
@@ -956,22 +1046,28 @@ class UsageRepository:
             if not math.isfinite(rate) or rate < 0:
                 return None
             rates.append(rate)
-        input_rate, cached_rate, output_rate = rates
-        non_cached_tokens = max(input_tokens - cached_tokens, 0)
-        if non_cached_tokens and input_rate is None:
+        input_rate, cached_rate, cache_write_rate, output_rate = rates
+        if ordinary_input_tokens and input_rate is None:
             return None
         if cached_tokens and cached_rate is None:
+            return None
+        if cache_write_tokens and cache_write_rate is None:
             return None
         if output_tokens and output_rate is None:
             return None
         return PriceComponents(
             non_cached_input_cost_usd=(
-                non_cached_tokens * float(input_rate or 0.0) / 1_000_000
+                (
+                    ordinary_input_tokens * float(input_rate or 0.0)
+                    + cache_write_tokens * float(cache_write_rate or 0.0)
+                )
+                / 1_000_000
             ),
             cached_input_cost_usd=(
                 cached_tokens * float(cached_rate or 0.0) / 1_000_000
             ),
             output_cost_usd=output_tokens * float(output_rate or 0.0) / 1_000_000,
+            long_context_pricing_applied=long_context,
         )
 
     def price_components_for(
@@ -1008,7 +1104,7 @@ class UsageRepository:
             return 0
         events = conn.execute(
             """
-            SELECT id, model, input_tokens, cached_tokens, output_tokens,
+            SELECT id, model, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
                    estimated_api_cost_usd
               FROM usage_events
              WHERE estimated_api_cost_usd IS NOT NULL
@@ -1025,6 +1121,7 @@ class UsageRepository:
                 input_tokens=as_nonnegative_int(event["input_tokens"]),
                 output_tokens=as_nonnegative_int(event["output_tokens"]),
                 cached_tokens=as_nonnegative_int(event["cached_tokens"]),
+                cache_write_tokens=as_nonnegative_int(event["cache_write_tokens"]),
             )
             components = self._components_for_price(
                 usage,
@@ -1069,6 +1166,269 @@ class UsageRepository:
         with self.connect() as conn:
             return self._backfill_frozen_cost_components(conn)
 
+    def _upgrade_long_context_costs(self, conn: sqlite3.Connection) -> int:
+        """Upgrade frozen short-tier totals when the old total proves their origin.
+
+        Older versions stored only short-context rates.  A row is rewritten
+        only when all frozen components exactly match the current short tier
+        and the model price now supplies a complete long tier.  This preserves
+        manual/historical totals whose provenance cannot be established.
+        """
+
+        prices = conn.execute(
+            """SELECT * FROM model_prices
+                WHERE (currency='USD' OR currency IS NULL)
+                  AND long_context_threshold_tokens IS NOT NULL"""
+        ).fetchall()
+        if not prices:
+            return 0
+        events = conn.execute(
+            """
+            SELECT id, model, input_tokens, cached_tokens, cache_write_tokens, output_tokens,
+                   estimated_api_cost_usd, non_cached_input_cost_usd,
+                   cached_input_cost_usd, output_cost_usd
+              FROM usage_events
+             WHERE COALESCE(long_context_pricing_applied, 0)=0
+               AND input_tokens IS NOT NULL
+               AND output_tokens IS NOT NULL
+               AND estimated_api_cost_usd IS NOT NULL
+               AND non_cached_input_cost_usd IS NOT NULL
+               AND cached_input_cost_usd IS NOT NULL
+               AND output_cost_usd IS NOT NULL
+            """
+        ).fetchall()
+        updated = 0
+        for event in events:
+            price = self._matched_price(event["model"], prices)
+            if price is None:
+                continue
+            threshold = as_nonnegative_int(price["long_context_threshold_tokens"])
+            input_tokens = as_nonnegative_int(event["input_tokens"])
+            if threshold is None or input_tokens is None or input_tokens <= threshold:
+                continue
+            usage = NormalizedUsage(
+                input_tokens=input_tokens,
+                output_tokens=as_nonnegative_int(event["output_tokens"]),
+                cached_tokens=as_nonnegative_int(event["cached_tokens"]),
+                cache_write_tokens=as_nonnegative_int(event["cache_write_tokens"]),
+            )
+            short_price = dict(price)
+            short_price["long_context_threshold_tokens"] = None
+            short_components = self._components_for_price(usage, short_price)
+            long_components = self._components_for_price(usage, price)
+            if short_components is None or long_components is None:
+                continue
+            frozen = (
+                float(event["non_cached_input_cost_usd"]),
+                float(event["cached_input_cost_usd"]),
+                float(event["output_cost_usd"]),
+                float(event["estimated_api_cost_usd"]),
+            )
+            expected_short = (
+                short_components.non_cached_input_cost_usd,
+                short_components.cached_input_cost_usd,
+                short_components.output_cost_usd,
+                short_components.total_cost_usd,
+            )
+            if not all(
+                math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+                for actual, expected in zip(frozen, expected_short)
+            ):
+                continue
+            cursor = conn.execute(
+                """
+                UPDATE usage_events
+                   SET non_cached_input_cost_usd=?, cached_input_cost_usd=?,
+                       output_cost_usd=?, estimated_api_cost_usd=?,
+                       long_context_pricing_applied=1
+                 WHERE id=? AND COALESCE(long_context_pricing_applied, 0)=0
+                """,
+                (
+                    long_components.non_cached_input_cost_usd,
+                    long_components.cached_input_cost_usd,
+                    long_components.output_cost_usd,
+                    long_components.total_cost_usd,
+                    event["id"],
+                ),
+            )
+            updated += max(int(cursor.rowcount), 0)
+        return updated
+
+    def upgrade_long_context_costs(self) -> int:
+        """Public, idempotent long-context pricing migration entry point."""
+
+        with self.connect() as conn:
+            return self._upgrade_long_context_costs(conn)
+
+    def reconcile_auth_identities(self, resolver: AccountResolver) -> int:
+        """Re-bind provisional queue identities after auth files become visible.
+
+        CLIProxyAPI may publish a usage-queue item in the same moment that it
+        refreshes an auth file.  If the resolver scans before that file is
+        complete, the event is stored as ``alias:auth:<fingerprint>``.  That
+        identity would otherwise remain a permanent, misleading ``UNKNOWN``
+        dashboard card even after the file is available.  Reconciliation is
+        deliberately narrow: it only considers rows carrying an auth
+        fingerprint and only rewrites provisional/partially-resolved fields.
+        Tokens themselves are never read from or written to SQLite.
+        """
+
+        if not resolver.enabled:
+            return 0
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, identity_key, usage_alias, auth_fingerprint,
+                       account_id_hash, account_id_tail
+                 FROM usage_events
+                 WHERE auth_fingerprint IS NOT NULL
+                   AND (
+                         usage_alias LIKE 'auth:%'
+                         OR identity_key LIKE 'alias:auth:%'
+                         OR account_id_hash IS NULL
+                       )
+                """
+            ).fetchall()
+            changed = 0
+            related: dict[str, tuple[str, str | None, str | None, str | None]] = {}
+            for row in rows:
+                fingerprint = safe_text(row["auth_fingerprint"], 64)
+                if not fingerprint:
+                    continue
+                current_alias = safe_text(row["usage_alias"], 128)
+                identity_is_provisional = (
+                    is_auth_fallback_alias(current_alias)
+                    or str(row["identity_key"] or "").startswith("alias:auth:")
+                    or row["account_id_hash"] is None
+                )
+                if not identity_is_provisional:
+                    continue
+                identity = resolver.resolve(None, fingerprint.lower()[:16])
+                if not identity.account_id_hash and not identity.usage_alias:
+                    identity = resolver.resolve_account_hash(row["account_id_hash"])
+                if not identity.account_id_hash and not identity.usage_alias:
+                    continue
+                resolved_alias = identity.usage_alias
+                resolved_key = identity_key(
+                    identity.account_id_hash,
+                    resolved_alias,
+                    fingerprint.lower()[:16],
+                    None,
+                    None,
+                )
+                if (
+                    row["identity_key"] == resolved_key
+                    and row["usage_alias"] == resolved_alias
+                    and row["account_id_hash"] == identity.account_id_hash
+                    and row["account_id_tail"] == identity.account_id_tail
+                ):
+                    continue
+                cursor = conn.execute(
+                    """
+                    UPDATE usage_events
+                       SET identity_key=?, usage_alias=?, account_id_hash=?, account_id_tail=?
+                     WHERE id=?
+                    """,
+                    (
+                        resolved_key,
+                        resolved_alias,
+                        identity.account_id_hash,
+                        identity.account_id_tail,
+                        row["id"],
+                    ),
+                )
+                changed += max(int(cursor.rowcount), 0)
+                old_key = safe_text(row["identity_key"], 300)
+                if old_key:
+                    related[old_key] = (
+                        resolved_key,
+                        resolved_alias,
+                        identity.account_id_hash,
+                        identity.account_id_tail,
+                    )
+
+            # Keep quota markers/cycles aligned if a provisional identity had
+            # already produced one.  ``UPDATE OR IGNORE`` avoids violating the
+            # snapshot uniqueness constraint when a canonical row exists.
+            for old_key, (new_key, alias, account_hash, account_tail) in related.items():
+                for table in ("quota_events", "account_quota_cycles"):
+                    conn.execute(
+                        f"""
+                        UPDATE {table}
+                           SET identity_key=?, usage_alias=?, account_id_hash=?, account_id_tail=?
+                         WHERE identity_key=?
+                        """,
+                        (new_key, alias, account_hash, account_tail, old_key),
+                    )
+                conn.execute(
+                    """
+                    UPDATE OR IGNORE subscription_quota_snapshots
+                       SET identity_key=?, usage_alias=?, account_id_hash=?, account_id_tail=?
+                     WHERE identity_key=?
+                    """,
+                    (new_key, alias, account_hash, account_tail, old_key),
+                )
+
+            # Quota markers can outlive the usage row that first created them.
+            # Reconcile those rows independently as well, using the embedded
+            # auth fallback label or their already persisted account hash.
+            for table in ("quota_events", "account_quota_cycles", "subscription_quota_snapshots"):
+                related_rows = conn.execute(
+                    f"""
+                    SELECT id, identity_key, usage_alias, account_id_hash, account_id_tail
+                      FROM {table}
+                     WHERE usage_alias LIKE 'auth:%'
+                        OR identity_key LIKE 'alias:auth:%'
+                        OR account_id_hash IS NULL
+                    """
+                ).fetchall()
+                for row in related_rows:
+                    alias_text = safe_text(row["usage_alias"], 128)
+                    key_text = safe_text(row["identity_key"], 300) or ""
+                    fingerprint = None
+                    if is_auth_fallback_alias(alias_text):
+                        fingerprint = alias_text[5:]
+                    else:
+                        match = re.fullmatch(r"alias:(auth:[0-9a-f]{16})", key_text, re.IGNORECASE)
+                        if match:
+                            fingerprint = match.group(1)[5:]
+                    identity = resolver.resolve(None, fingerprint.lower() if fingerprint else None)
+                    if not identity.account_id_hash and not identity.usage_alias:
+                        identity = resolver.resolve_account_hash(row["account_id_hash"])
+                    if not identity.account_id_hash and not identity.usage_alias:
+                        continue
+                    resolved_alias = identity.usage_alias
+                    resolved_key = identity_key(
+                        identity.account_id_hash,
+                        resolved_alias,
+                        fingerprint.lower() if fingerprint else None,
+                        None,
+                        None,
+                    )
+                    if (
+                        row["identity_key"] == resolved_key
+                        and row["usage_alias"] == resolved_alias
+                        and row["account_id_hash"] == identity.account_id_hash
+                        and row["account_id_tail"] == identity.account_id_tail
+                    ):
+                        continue
+                    conn.execute(
+                        f"""
+                        UPDATE OR IGNORE {table}
+                           SET identity_key=?, usage_alias=?, account_id_hash=?, account_id_tail=?
+                         WHERE id=?
+                        """,
+                        (
+                            resolved_key,
+                            resolved_alias,
+                            identity.account_id_hash,
+                            identity.account_id_tail,
+                            row["id"],
+                        ),
+                    )
+                    changed += 1
+            return changed
+
     def set_price(
         self,
         pattern: str,
@@ -1084,13 +1444,23 @@ class UsageRepository:
                 """
                 INSERT INTO model_prices (
                   model_pattern, input_per_million, output_per_million,
-                  cached_input_per_million, reasoning_per_million, currency,
+                  cached_input_per_million, cache_write_per_million,
+                  long_context_threshold_tokens,
+                  long_input_per_million, long_cached_input_per_million,
+                  long_cache_write_per_million, long_output_per_million,
+                  reasoning_per_million, currency,
                   source_note, source_kind, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, 'USD', ?, 'manual', ?)
+                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'USD', ?, 'manual', ?)
                 ON CONFLICT(model_pattern) DO UPDATE SET
                   input_per_million=excluded.input_per_million,
                   output_per_million=excluded.output_per_million,
                   cached_input_per_million=excluded.cached_input_per_million,
+                  cache_write_per_million=NULL,
+                  long_context_threshold_tokens=NULL,
+                  long_input_per_million=NULL,
+                  long_cached_input_per_million=NULL,
+                  long_cache_write_per_million=NULL,
+                  long_output_per_million=NULL,
                   currency='USD', source_note=excluded.source_note,
                   source_kind='manual',
                   updated_at=excluded.updated_at
@@ -1184,7 +1554,7 @@ class UsageRepository:
             raise ValueError("official pricing parser returned an invalid model name")
         note = (
             f"official OpenAI pricing; URL={source_url}; fetched_at={fetched_at}; "
-            f"sha256={content_sha256}; parser={parser_version}; standard short-context rates"
+            f"sha256={content_sha256}; parser={parser_version}; standard short/long-context rates"
         )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1195,13 +1565,23 @@ class UsageRepository:
                     """
                     INSERT INTO model_prices (
                       model_pattern, input_per_million, output_per_million,
-                      cached_input_per_million, reasoning_per_million, currency,
+                      cached_input_per_million, cache_write_per_million,
+                      long_context_threshold_tokens,
+                      long_input_per_million, long_cached_input_per_million,
+                      long_cache_write_per_million, long_output_per_million,
+                      reasoning_per_million, currency,
                       source_note, source_kind, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, 'USD', ?, 'official', ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'USD', ?, 'official', ?)
                     ON CONFLICT(model_pattern) DO UPDATE SET
                       input_per_million=excluded.input_per_million,
                       output_per_million=excluded.output_per_million,
                       cached_input_per_million=excluded.cached_input_per_million,
+                      cache_write_per_million=excluded.cache_write_per_million,
+                      long_context_threshold_tokens=excluded.long_context_threshold_tokens,
+                      long_input_per_million=excluded.long_input_per_million,
+                      long_cached_input_per_million=excluded.long_cached_input_per_million,
+                      long_cache_write_per_million=excluded.long_cache_write_per_million,
+                      long_output_per_million=excluded.long_output_per_million,
                       reasoning_per_million=NULL,
                       currency='USD', source_note=excluded.source_note,
                       source_kind='official', updated_at=excluded.updated_at
@@ -1211,26 +1591,20 @@ class UsageRepository:
                         row.get("input_per_million"),
                         row.get("output_per_million"),
                         row.get("cached_input_per_million"),
+                        row.get("cache_write_per_million"),
+                        row.get("long_context_threshold_tokens"),
+                        row.get("long_input_per_million"),
+                        row.get("long_cached_input_per_million"),
+                        row.get("long_cache_write_per_million"),
+                        row.get("long_output_per_million"),
                         note,
                         fetched_at,
                     ),
                 )
-                reprice_cursor = conn.execute(
+                unpriced = conn.execute(
                     """
-                    UPDATE usage_events
-                       SET non_cached_input_cost_usd =
-                             MAX(input_tokens - COALESCE(cached_tokens, 0), 0)
-                               * COALESCE(?, 0) / 1000000.0,
-                           cached_input_cost_usd =
-                             COALESCE(cached_tokens, 0) * COALESCE(?, 0) / 1000000.0,
-                           output_cost_usd =
-                             output_tokens * COALESCE(?, 0) / 1000000.0,
-                           estimated_api_cost_usd = (
-                             MAX(input_tokens - COALESCE(cached_tokens, 0), 0)
-                               * COALESCE(?, 0)
-                             + COALESCE(cached_tokens, 0) * COALESCE(?, 0)
-                             + output_tokens * COALESCE(?, 0)
-                           ) / 1000000.0
+                    SELECT id, input_tokens, cached_tokens, cache_write_tokens, output_tokens
+                      FROM usage_events
                      WHERE estimated_api_cost_usd IS NULL
                        AND non_cached_input_cost_usd IS NULL
                        AND cached_input_cost_usd IS NULL
@@ -1238,24 +1612,38 @@ class UsageRepository:
                        AND model=?
                        AND input_tokens IS NOT NULL
                        AND output_tokens IS NOT NULL
-                       AND (input_tokens=0 OR ? IS NOT NULL)
-                       AND (COALESCE(cached_tokens, 0)=0 OR ? IS NOT NULL)
-                       AND (output_tokens=0 OR ? IS NOT NULL)
                     """,
-                    (
-                        row.get("input_per_million"),
-                        row.get("cached_input_per_million"),
-                        row.get("output_per_million"),
-                        row.get("input_per_million"),
-                        row.get("cached_input_per_million"),
-                        row.get("output_per_million"),
-                        row["model_pattern"],
-                        row.get("input_per_million"),
-                        row.get("cached_input_per_million"),
-                        row.get("output_per_million"),
-                    ),
-                )
-                repriced_events += max(int(reprice_cursor.rowcount), 0)
+                    (row["model_pattern"],),
+                ).fetchall()
+                for event in unpriced:
+                    usage = NormalizedUsage(
+                        input_tokens=as_nonnegative_int(event["input_tokens"]),
+                        output_tokens=as_nonnegative_int(event["output_tokens"]),
+                        cached_tokens=as_nonnegative_int(event["cached_tokens"]),
+                        cache_write_tokens=as_nonnegative_int(event["cache_write_tokens"]),
+                    )
+                    components = self._components_for_price(usage, row)
+                    if components is None:
+                        continue
+                    cursor = conn.execute(
+                        """
+                        UPDATE usage_events
+                           SET non_cached_input_cost_usd=?, cached_input_cost_usd=?,
+                               output_cost_usd=?, estimated_api_cost_usd=?,
+                               long_context_pricing_applied=?
+                         WHERE id=? AND estimated_api_cost_usd IS NULL
+                        """,
+                        (
+                            components.non_cached_input_cost_usd,
+                            components.cached_input_cost_usd,
+                            components.output_cost_usd,
+                            components.total_cost_usd,
+                            int(components.long_context_pricing_applied),
+                            event["id"],
+                        ),
+                    )
+                    repriced_events += max(int(cursor.rowcount), 0)
+            repriced_events += self._upgrade_long_context_costs(conn)
             conn.execute(
                 """
                 INSERT INTO price_sync_metadata (
@@ -1606,6 +1994,8 @@ class UsageRepository:
                   COALESCE(SUM(cached_tokens), 0) cached_tokens,
                   COALESCE(SUM(reasoning_tokens), 0) reasoning_tokens,
                   COALESCE(SUM(total_tokens), 0) total_tokens,
+                  COALESCE(SUM(CASE WHEN long_context_pricing_applied=1 THEN call_count ELSE 0 END), 0)
+                    long_context_priced_calls,
                   COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)), 0)
                     non_cached_input_tokens,
                   COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)
@@ -2209,6 +2599,8 @@ class UsageRepository:
                   COALESCE(SUM(output_tokens), 0) output_tokens,
                   COALESCE(SUM(reasoning_tokens), 0) reasoning_tokens,
                   COALESCE(SUM(total_tokens), 0) total_tokens,
+                  COALESCE(SUM(CASE WHEN long_context_pricing_applied=1 THEN call_count ELSE 0 END), 0)
+                    long_context_priced_calls,
                   COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)), 0)
                     non_cached_input_tokens,
                   COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)
@@ -2247,9 +2639,10 @@ class UsageRepository:
                 SELECT ts, usage_alias, account_id_tail, account_id_hash,
                   auth_fingerprint, session_id, model, endpoint, method,
                   status_code, ok, duration_ms, stream, input_tokens,
-                  cached_tokens, output_tokens, reasoning_tokens, total_tokens,
+                  cached_tokens, cache_write_tokens, output_tokens, reasoning_tokens, total_tokens,
                   estimated_api_cost_usd, non_cached_input_cost_usd,
-                  cached_input_cost_usd, output_cost_usd, usage_missing, error_type,
+                  cached_input_cost_usd, output_cost_usd, long_context_pricing_applied,
+                  usage_missing, error_type,
                   error_message_redacted, source, request_id
                 FROM usage_events ORDER BY ts DESC, id DESC LIMIT ?
                 """,
@@ -2501,6 +2894,11 @@ def _parse_pricing_props_rows(fragment: str) -> list[dict[str, Any]]:
             continue
         input_rate = _pricing_number(str(values[0]) if values[0] is not None else None)
         cached_rate = _pricing_number(str(values[1]) if values[1] is not None else None)
+        cache_write_rate = (
+            _pricing_number(str(values[2]) if values[2] is not None else None)
+            if len(values) >= 4
+            else None
+        )
         output_index = 3 if len(values) >= 4 else 2
         output_rate = _pricing_number(str(values[output_index]) if values[output_index] is not None else None)
         if input_rate is None and output_rate is None:
@@ -2512,18 +2910,137 @@ def _parse_pricing_props_rows(fragment: str) -> list[dict[str, Any]]:
                 "input_per_million": input_rate,
                 "output_per_million": output_rate,
                 "cached_input_per_million": cached_rate,
+                "cache_write_per_million": cache_write_rate,
             },
         )
     return list(parsed.values())
 
 
+def _complete_context_tiers(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Derive documented Standard long tiers when the page omits props fields.
+
+    OpenAI model pages state that GPT-5.4/5.5 1.05M models and the GPT-5.6
+    family charge 2x input and 1.5x output above 272K input tokens.  The same
+    pricing page defines cache writes as 1.25x input and cached reads as their
+    own input category.  Apply this only to the explicitly documented model
+    IDs, never to similarly named mini/nano/cyber variants.
+    """
+
+    eligible = {
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    }
+    completed: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        model = row.get("model_pattern")
+        if model not in eligible:
+            completed.append(row)
+            continue
+        input_rate = row.get("input_per_million")
+        cached_rate = row.get("cached_input_per_million")
+        output_rate = row.get("output_per_million")
+        cache_write_rate = row.get("cache_write_per_million")
+        row["long_context_threshold_tokens"] = LONG_CONTEXT_THRESHOLD_TOKENS
+        row["long_input_per_million"] = (
+            float(input_rate) * 2.0 if input_rate is not None else None
+        )
+        row["long_cached_input_per_million"] = (
+            float(cached_rate) * 2.0 if cached_rate is not None else None
+        )
+        if cache_write_rate is None and input_rate is not None and str(model).startswith("gpt-5.6-"):
+            cache_write_rate = float(input_rate) * 1.25
+            row["cache_write_per_million"] = cache_write_rate
+        row["long_cache_write_per_million"] = (
+            float(cache_write_rate) * 2.0 if cache_write_rate is not None else None
+        )
+        row["long_output_per_million"] = (
+            float(output_rate) * 1.5 if output_rate is not None else None
+        )
+        completed.append(row)
+    return completed
+
+
+def _parse_grouped_context_pricing_rows(fragment: str) -> list[dict[str, Any]]:
+    """Read the Standard grouped short/long-context table from Astro props."""
+
+    if "Short context input" not in fragment or "Long context input" not in fragment:
+        return []
+    heading_pos = fragment.find("Short context input")
+    island_start = fragment.rfind("<astro-island", 0, heading_pos)
+    # In raw HTML the heading text lives inside &quot; entities, so callers
+    # that unescape first can move it before the literal opening tag boundary.
+    # When that happens, take the first island containing the heading.
+    if island_start < 0:
+        island_start = fragment.find("<astro-island")
+    island_end = fragment.find("</astro-island>", heading_pos)
+    if island_start >= 0 and island_start < heading_pos and island_end > island_start:
+        fragment = fragment[island_start : island_end + len("</astro-island>")]
+    group_pattern = re.compile(
+        r'"model":\[0,"((?:\\.|[^"\\])*)"\].*?'
+        r'"rows":\[1,\[\[1,\[(.*?)\]\]\]\]',
+        re.DOTALL,
+    )
+    scalar_pattern = re.compile(r'\[0,("(?:\\.|[^"\\])*"|null|-?\d+(?:\.\d+)?)\]')
+    parsed: dict[str, dict[str, Any]] = {}
+    for match in group_pattern.finditer(fragment):
+        try:
+            model = _normalize_official_model(json.loads(f'"{match.group(1)}"'))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not model:
+            continue
+        values: list[Any] = []
+        values_fragment = match.group(2)
+        if values_fragment and not values_fragment.endswith("]"):
+            values_fragment += "]"
+        for raw in scalar_pattern.findall(values_fragment):
+            if raw == "null":
+                values.append(None)
+            elif raw.startswith('"'):
+                try:
+                    values.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    values.append(None)
+            else:
+                try:
+                    values.append(float(raw))
+                except ValueError:
+                    values.append(None)
+        if len(values) < 8:
+            continue
+        rates = [_pricing_number(str(value) if value is not None else None) for value in values[:8]]
+        if rates[0] is None and rates[3] is None:
+            continue
+        has_long_tier = any(value is not None for value in rates[4:8])
+        parsed[model] = {
+            "model_pattern": model,
+            "input_per_million": rates[0],
+            "cached_input_per_million": rates[1],
+            "cache_write_per_million": rates[2],
+            "output_per_million": rates[3],
+            "long_context_threshold_tokens": (
+                LONG_CONTEXT_THRESHOLD_TOKENS if has_long_tier else None
+            ),
+            "long_input_per_million": rates[4],
+            "long_cached_input_per_million": rates[5],
+            "long_cache_write_per_million": rates[6],
+            "long_output_per_million": rates[7],
+        }
+    return list(parsed.values())
+
+
 def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
-    """Parse standard short-context model prices from an official HTML page.
+    """Parse Standard short- and long-context prices from the official page.
 
     Returned prices are USD per million tokens.  The sidecar does not infer a
-    price for a model absent from this table.  Cache-write and long-context
-    columns are intentionally ignored because the MVP usage payload does not
-    expose those dimensions.
+    price for a model absent from this table.  Long-context pricing is enabled
+    only when the official table provides a complete tier for that model.
     """
 
     if isinstance(document, bytes):
@@ -2536,9 +3053,14 @@ def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
     if not text or len(text) > 20 * 1024 * 1024:
         raise OfficialPriceSyncError("pricing page is empty or too large")
 
-    marker = 'component-export="TextTokenPricingTables"'
     standard_marker = 'data-content-switcher-pane="true" data-value="standard"'
     standard_pos = text.find(standard_marker)
+    # The current page renders the compact TextTokenPricingTables and the
+    # complete grouped context table as separate islands.  Locate the unique
+    # grouped table by its explicit headings instead of assuming adjacency.
+    grouped_rows = _parse_grouped_context_pricing_rows(html.unescape(text))
+
+    marker = 'component-export="TextTokenPricingTables"'
     marker_pos = text.find(marker, max(0, standard_pos)) if standard_pos >= 0 else -1
     if marker_pos < 0:
         marker_pos = text.find(marker)
@@ -2549,9 +3071,16 @@ def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
     else:
         fragment = text
 
-    props_rows = _parse_pricing_props_rows(html.unescape(fragment))
+    unescaped_fragment = html.unescape(fragment)
+    props_rows = _parse_pricing_props_rows(unescaped_fragment)
+    if grouped_rows:
+        by_model = {row["model_pattern"]: row for row in props_rows}
+        for grouped_row in grouped_rows:
+            model = grouped_row["model_pattern"]
+            by_model[model] = grouped_row
+        return _complete_context_tiers(list(by_model.values()))
     if props_rows:
-        return props_rows
+        return _complete_context_tiers(props_rows)
 
     parser = _PricingHTMLParser()
     try:
@@ -2616,7 +3145,7 @@ def parse_official_pricing_html(document: str | bytes) -> list[dict[str, Any]]:
         )
     if not parsed:
         raise OfficialPriceSyncError("standard pricing table contained no usable model rows")
-    return list(parsed.values())
+    return _complete_context_tiers(list(parsed.values()))
 
 
 def _validate_official_url(url: str) -> str:
@@ -2762,6 +3291,7 @@ def queue_record_event(
             if token_block.get("cached_tokens") is not None
             else token_block.get("cache_read_tokens")
         ),
+        cache_write_tokens=as_nonnegative_int(token_block.get("cache_write_tokens")),
         reasoning_tokens=as_nonnegative_int(token_block.get("reasoning_tokens")),
         total_tokens=as_nonnegative_int(token_block.get("total_tokens")),
     )
@@ -2829,6 +3359,7 @@ def queue_record_event(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         cached_tokens=usage.cached_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
         reasoning_tokens=usage.reasoning_tokens,
         total_tokens=usage.total_tokens,
         estimated_api_cost_usd=components.total_cost_usd if components else None,
@@ -2837,6 +3368,9 @@ def queue_record_event(
         ),
         cached_input_cost_usd=components.cached_input_cost_usd if components else None,
         output_cost_usd=components.output_cost_usd if components else None,
+        long_context_pricing_applied=int(
+            components.long_context_pricing_applied if components else False
+        ),
         subscription_amortized_cost_usd=None,
         api_equivalent_quota_usd=None,
         usage_missing=int(usage.missing),
@@ -3608,12 +4142,13 @@ def dashboard_html(
         f'<tr><td><b>{html.escape(str(row["model"]))}</b></td><td>{fmt_int(row["logical_requests"])}</td>'
         f'<td>{fmt_int(row["account_attempts"])}</td><td>{fmt_int(row["non_cached_input_tokens"])}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
+        f'<td>{fmt_int(row["long_context_priced_calls"])}</td>'
         f'<td>{fmt_money(row["non_cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["output_cost_usd"])}</td>'
         f'<td>{fmt_money(row["cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["estimated_api_cost_usd"])}</td></tr>'
         for row in models
-    ) or '<tr><td colspan="10" class="empty">暂无数据</td></tr>'
+    ) or '<tr><td colspan="11" class="empty">暂无数据</td></tr>'
     account_rows = "".join(
         f'<tr><td><b>{html.escape(display_identity(row))}</b></td>'
         f'<td>{fmt_int(row.get("all_time_logical_requests"))}</td>'
@@ -3635,12 +4170,13 @@ def dashboard_html(
         f'<td>{html.escape(str(row["model"] or "—"))}</td><td><span class="status-pill {_status_class(row)}">{row["status_code"]}</span></td>'
         f'<td>{fmt_int(max(int(row["input_tokens"] or 0) - int(row["cached_tokens"] or 0), 0))}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
+        f'<td>{"长上下文" if row.get("long_context_pricing_applied") else "短上下文"}</td>'
         f'<td>{fmt_money(row["non_cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["output_cost_usd"])}</td>'
         f'<td>{fmt_money(row["cached_input_cost_usd"])}</td>'
         f'<td>{fmt_money(row["estimated_api_cost_usd"])}</td></tr>'
         for row in recent
-    ) or '<tr><td colspan="11" class="empty">暂无数据</td></tr>'
+    ) or '<tr><td colspan="12" class="empty">暂无数据</td></tr>'
 
     session_notice = (
         '<div class="notice warning-notice"><b>当前不能按 Codex session 精确拆分</b>'
@@ -3676,6 +4212,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
 {session_notice}
+<div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
 <section class="period-grid">{period_cards}</section>
 <div class="section-title"><div><h2>近 7 天趋势</h2><p>柱高为非缓存输入 + 输出；悬停可看缓存和 API 原始处理量。</p></div></div>
@@ -3683,11 +4220,11 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex 真实 5 小时/周窗口；美元额度优先按 provider 当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
 <section class="subscription-grid">{subscriptions_html}</section>
 <div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近调用。</p></div></div>
-  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
+  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
 <div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>逻辑请求/尝试 <b>{fmt_int(all_time['logical_requests'])}/{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
-<footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；输入、缓存输入和输出成本分别按对应模型的 OpenAI 官方费率逐条计算。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
+<footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；输入、缓存输入和输出成本分别按对应模型的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
 
 
@@ -3793,6 +4330,9 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 self._plain_response(405, b"method not allowed\n")
                 return
             try:
+                rebound = self.meter_server.repo.reconcile_auth_identities(self.meter_server.resolver)
+                if rebound:
+                    LOG.info("reconciled %d provisional auth identity event(s)", rebound)
                 body = dashboard_html(
                     self.meter_server.repo,
                     self.meter_server.queue_poller.status(),
@@ -4075,6 +4615,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cached_tokens=usage.cached_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             total_tokens=usage.total_tokens,
             estimated_api_cost_usd=components.total_cost_usd if components else None,
@@ -4083,6 +4624,9 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             ),
             cached_input_cost_usd=components.cached_input_cost_usd if components else None,
             output_cost_usd=components.output_cost_usd if components else None,
+            long_context_pricing_applied=int(
+                components.long_context_pricing_applied if components else False
+            ),
             subscription_amortized_cost_usd=None,
             api_equivalent_quota_usd=None,
             usage_missing=int(usage.missing),
@@ -4319,6 +4863,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     repo = UsageRepository(args.db)
     resolver = AccountResolver(enabled=not args.no_account_scan)
+    rebound = repo.reconcile_auth_identities(resolver)
+    if rebound:
+        LOG.info("reconciled %d provisional auth identity event(s)", rebound)
     if args.serve:
         server = MeterHTTPServer(
             (args.host, args.port),
