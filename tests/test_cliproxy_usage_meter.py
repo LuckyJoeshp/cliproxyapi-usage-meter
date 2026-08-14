@@ -495,6 +495,93 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(rotated["usage_alias"], "codex-1")
         self.assertEqual(rotated["identity_key"], f"account:{expected_hash}")
 
+    def test_custom_named_team_auth_reconciles_usage_with_quota_card(self) -> None:
+        proxy_home = self.temp_path / "home" / ".cli-proxy-api"
+        team_token = "fixture-team-auth-value"
+        team_account = "acct-team-fixture-QRSTUVWX"
+        team_email = "team-fixture@example.test"
+        (proxy_home / "workspace-auth-fixture.json").write_text(
+            json.dumps(
+                {
+                    "type": "codex",
+                    "account_id": team_account,
+                    "access_token": team_token,
+                    "email": team_email,
+                    "plan_type": "team",
+                    "name": "workspace-auth-fixture.json",
+                }
+            ),
+            encoding="utf-8",
+        )
+        ignored_token = "fixture-unrelated-provider-value"
+        (proxy_home / "unrelated-provider.json").write_text(
+            json.dumps(
+                {
+                    "type": "gemini",
+                    "account_id": "acct-unrelated-fixture",
+                    "access_token": ignored_token,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        identity = self.sidecar.resolver.resolve_queue(
+            "opaque-team-auth-index",
+            hashlib.sha256(team_token.encode()).hexdigest(),
+        )
+        expected_hash = meter.short_hash(team_account)
+        self.assertEqual(identity.account_id_hash, expected_hash)
+        self.assertEqual(identity.account_id_tail, "QRSTUVWX")
+        self.assertEqual(identity.account_email, team_email)
+        self.assertIsNone(identity.usage_alias)
+        ignored = self.sidecar.resolver.resolve(None, meter.short_hash(ignored_token))
+        self.assertIsNone(ignored.account_id_hash)
+
+        fingerprint = meter.short_hash(team_token)
+        assert fingerprint and expected_hash
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events
+                   (ts, identity_key, usage_alias, auth_fingerprint, model,
+                    status_code, ok, call_count, usage_missing)
+                   VALUES ('2026-08-12T00:00:00.000000Z', ?, ?, ?,
+                           'fixture-model', 200, 1, 7, 0)""",
+                (f"alias:auth:{fingerprint}", f"auth:{fingerprint}", fingerprint),
+            )
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-12T00:05:00Z",
+                "identity_key": f"account:{expected_hash}",
+                "account_id_hash": expected_hash,
+                "account_id_tail": "QRSTUVWX",
+                "usage_alias": None,
+                "plan_type": "team",
+                "window_kind": "weekly",
+                "used_percent": 25,
+                "remaining_percent": 75,
+                "source": "fixture",
+            }
+        )
+
+        self.assertEqual(
+            self.sidecar.repo.reconcile_auth_identities(self.sidecar.resolver),
+            1,
+        )
+        subscriptions = self.sidecar.repo.subscription_dashboard_rows()
+        team_row = next(
+            row
+            for row in subscriptions
+            if row["identity_key"] == f"account:{expected_hash}"
+        )
+        self.assertEqual(team_row["plan_type"], "team")
+        self.assertEqual(team_row["all_time_calls"], 7)
+        self.assertEqual(team_row["all_time_successful_calls"], 7)
+        self.assertEqual(team_row["all_time_failed_calls"], 0)
+        self.assertEqual(
+            self.sidecar.resolver.resolve_account_hash(expected_hash).account_email,
+            team_email,
+        )
+
     def test_chrome_management_session_decoder_keeps_key_in_memory(self) -> None:
         host = "localhost:8317"
         user_agent = "fixture-user-agent"

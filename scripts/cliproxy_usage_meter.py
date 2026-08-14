@@ -607,11 +607,23 @@ class AccountResolver:
 
         proxy_dir = self.home / ".cli-proxy-api"
         try:
-            proxy_files = list(proxy_dir.glob("codex-*.json"))
+            # CLIProxyAPI accepts Codex auth files with user-defined names.
+            # Team/workspace exports in particular do not necessarily use the
+            # historical ``codex-*.json`` convention, so inspect every JSON
+            # file and then filter by its provider metadata.  Keep the legacy
+            # filename fallback for older records that predate ``type``.
+            proxy_files = list(proxy_dir.glob("*.json"))
         except OSError:
             proxy_files = []
         for path in proxy_files:
             data = self._read_json(path)
+            provider = (
+                safe_text(data.get("provider") or data.get("type"), 64)
+                if isinstance(data, Mapping)
+                else None
+            )
+            if (provider or "").lower() != "codex" and not path.name.startswith("codex-"):
+                continue
             account_id, access_tokens, account_email = self._account_and_tokens(data)
             if not account_id:
                 continue

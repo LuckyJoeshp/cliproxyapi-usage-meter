@@ -106,8 +106,9 @@ scripts/start_cliproxy_usage_meter.sh
 - 非 streaming JSON，以及不改写字节的 SSE streaming（尽量读取最终 usage）
 - 其他 `/v1/...` 路径透明转发并计为一次调用
 
-身份解析优先级为显式 `X-Usage-Alias`，其次是本地 `~/.codex-*/auth.json` / `~/.cli-proxy-api/codex-*.json`
-中 access token 的短 hash 匹配，最后退化为 Authorization 短 hash、installation 或 session 标识。原始
+身份解析优先级为显式 `X-Usage-Alias`，其次是本地 `~/.codex-*/auth.json` / `~/.cli-proxy-api/*.json`
+中 Codex 认证记录（包括 Team/工作区账号的自定义文件名）与 access token 的短 hash 匹配，最后退化为
+Authorization 短 hash、installation 或 session 标识。原始
 Authorization、access token、refresh token、id token 和 API key 永不打印或落库；数据库只保存
 `auth_fingerprint`、`account_id_hash`、`account_id_tail`。如果多个客户端共用同一个代理 key 且没有 alias header，
 meter 无法凭空知道它们对应哪个订阅账号，这是已知的 best-effort 限制。
