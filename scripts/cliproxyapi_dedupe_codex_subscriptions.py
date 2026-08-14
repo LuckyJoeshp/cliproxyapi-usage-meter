@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Normalize Codex Plus files without exposing archive files to CLIProxyAPI.
 
-CLIProxyAPI recursively walks ``auth-dir``.  Therefore backup directories must
-live *outside* ``~/.cli-proxy-api``; placing ``*.json`` archives below that
-directory makes the management panel load them as active credentials.
+CLIProxyAPI recursively walks ``auth-dir``.  Therefore backup and quarantine
+directories must live *outside* ``~/.cli-proxy-api``; placing ``*.json`` files
+below that directory makes the management panel load them as credentials.
 
-The command keeps one canonical file per e-mail, moves valid duplicates to an
-external backup directory, removes invalid duplicates, and migrates legacy
-backup directories that were created inside the auth directory by older
-versions of this helper.  Token values are never printed.
+The command keeps one canonical file per e-mail, moves valid duplicates and
+explicitly disabled credentials to an external backup directory, removes
+invalid duplicates, and migrates legacy backup directories that were created
+inside the auth directory by older versions of this helper.  Token values are
+never printed.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ DEFAULT_DIR = Path.home() / ".cli-proxy-api"
 DEFAULT_BACKUP_DIR = Path.home() / ".cli-proxy-api-backups"
 BACKUP_ENV_NAMES = ("CLIPROXYAPI_BACKUP_DIR", "CLIPROXY_BACKUP_DIR")
 LEGACY_BACKUP_PREFIXES = ("duplicate_subscription_backup_", "backup_")
+DISABLED_QUARANTINE_PREFIX = "disabled_subscription_quarantine_"
 SINGLE_FAILURE_RC = 10
 
 
@@ -123,6 +125,49 @@ def migrate_legacy_backups(root: Path, backup_root: Path, dry_run: bool) -> int:
     return moved
 
 
+def quarantine_disabled_subscriptions(
+    subscriptions: list[SubFile],
+    backup_root: Path,
+    dry_run: bool,
+) -> tuple[list[SubFile], int]:
+    """Remove explicitly disabled credentials from CLIProxyAPI's auth tree.
+
+    The files are moved, rather than deleted, so the operation remains
+    recoverable.  ``backup_root`` is already guaranteed to be outside the auth
+    directory, which prevents CLIProxyAPI's recursive scanner from loading the
+    quarantined credentials.
+    """
+    disabled = [sf for sf in subscriptions if bool(sf.data.get("disabled"))]
+    if not disabled:
+        return subscriptions, 0
+
+    quarantine_dir: Path | None = None
+    if not dry_run:
+        quarantine_dir = _unique_destination(
+            backup_root,
+            f"{DISABLED_QUARANTINE_PREFIX}{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        )
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        quarantine_dir.chmod(0o700)
+
+    for sf in disabled:
+        if dry_run:
+            print(f"DRY-RUN: would quarantine disabled subscription {sf.path.name} -> {backup_root}")
+            continue
+        assert quarantine_dir is not None
+        destination = _unique_destination(quarantine_dir, sf.path.name)
+        shutil.move(str(sf.path), str(destination))
+        try:
+            destination.chmod(0o600)
+        except OSError:
+            pass
+        print(f"quarantined disabled subscription {sf.path.name} -> {quarantine_dir.name}/")
+
+    disabled_paths = {sf.path for sf in disabled}
+    active = [sf for sf in subscriptions if sf.path not in disabled_paths]
+    return active, len(disabled)
+
+
 def load_sub_file(path: Path) -> SubFile | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -209,11 +254,12 @@ def _proxy_failure_reason(data: dict[str, Any]) -> str | None:
 
 
 def unpaired_failed_subscriptions(root: Path) -> list[tuple[Path, str]]:
-    """Find lone failed files that must remain as manual re-login handles.
+    """Find lone unusable files that must block automatic reconciliation.
 
     A malformed file is grouped by its filename because its e-mail cannot be
     trusted.  In that case we fail closed and preserve it rather than guessing
-    that it is a duplicate of another account.
+    that it is a duplicate of another account.  Normal cleanup quarantines
+    explicit ``disabled`` files before this check runs.
     """
     grouped: dict[str, list[tuple[Path, str | None]]] = {}
     for path in sorted(root.glob("codex-*-plus.json")):
@@ -271,13 +317,13 @@ def dedupe(
 ) -> int:
     files = sorted(root.glob("codex-*-plus.json"))
     subscriptions = [sf for path in files if (sf := load_sub_file(path))]
+    migrated = migrate_legacy_backups(root, backup_root, dry_run) if migrate_legacy else 0
+    subscriptions, quarantined = quarantine_disabled_subscriptions(subscriptions, backup_root, dry_run)
     groups: dict[str, list[SubFile]] = {}
     for sf in subscriptions:
         groups.setdefault(sf.email, []).append(sf)
 
-    changed = False
-    migrated = migrate_legacy_backups(root, backup_root, dry_run) if migrate_legacy else 0
-    changed = changed or migrated > 0
+    changed = migrated > 0 or quarantined > 0
     run_backup_dir: Path | None = None
 
     for email, items in sorted(groups.items()):
@@ -285,7 +331,8 @@ def dedupe(
             if items and not is_valid_proxy(items[0].data):
                 # A lone failed/expired record is an operator's re-login
                 # handle. Keep it visible and untouched so the account can be
-                # repaired manually; cleanup is reserved for true duplicates.
+                # repaired manually; explicit disabled records were already
+                # quarantined above.
                 print(f"  retained single failed subscription: {items[0].path.name} (no cleanup)")
             continue
         valid_items = [sf for sf in items if is_valid_proxy(sf.data)]
@@ -354,8 +401,14 @@ def dedupe(
     if migrated:
         verb = "Planned migration of" if dry_run else "Migrated"
         print(f"\n{verb} {migrated} legacy backup director{'y' if migrated == 1 else 'ies'} outside auth-dir: {backup_root}")
+    if quarantined:
+        verb = "Planned quarantine of" if dry_run else "Quarantined"
+        print(
+            f"\n{verb} {quarantined} disabled subscription file"
+            f"{'s' if quarantined != 1 else ''} outside auth-dir: {backup_root}"
+        )
     if not changed:
-        print("No duplicate Codex subscription files found.")
+        print("No duplicate or disabled Codex subscription files found.")
     elif restart:
         run_brew_restart(dry_run)
     else:
@@ -386,7 +439,7 @@ def main() -> int:
         if not failures:
             print("No lone failed subscription files found.")
             return 0
-        print("Lone failed subscription file(s) preserved for manual re-login:")
+        print("Lone unusable subscription file(s) require manual attention:")
         for path, reason in failures:
             print(f"  - {path.name}: {reason}")
         return SINGLE_FAILURE_RC

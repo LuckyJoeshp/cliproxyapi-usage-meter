@@ -115,6 +115,43 @@ def test_single_failed_subscription_is_preserved(tmp_path: Path) -> None:
     assert SINGLE_FAILURE_RC == 10
 
 
+def test_single_disabled_subscription_is_quarantined_outside_auth_dir(tmp_path: Path) -> None:
+    auth_dir = tmp_path / "auth"
+    backup_dir = tmp_path / "auth-backups"
+    auth_dir.mkdir()
+    disabled = auth_dir / "codex-disabled@example.com-plus.json"
+    write_subscription(disabled, "disabled@example.com", "disabled")
+    data = json.loads(disabled.read_text(encoding="utf-8"))
+    data["disabled"] = True
+    disabled.write_text(json.dumps(data), encoding="utf-8")
+
+    assert dedupe(auth_dir, False, False, False, backup_dir, True) == 0
+
+    assert not disabled.exists()
+    quarantined = list(
+        backup_dir.glob("disabled_subscription_quarantine_*/codex-disabled@example.com-plus.json")
+    )
+    assert len(quarantined) == 1
+    assert recursive_json(auth_dir) == []
+    assert quarantined[0].stat().st_mode & 0o777 == 0o600
+
+
+def test_disabled_subscription_dry_run_does_not_move_file(tmp_path: Path) -> None:
+    auth_dir = tmp_path / "auth"
+    backup_dir = tmp_path / "auth-backups"
+    auth_dir.mkdir()
+    disabled = auth_dir / "codex-disabled@example.com-plus.json"
+    write_subscription(disabled, "disabled@example.com", "disabled")
+    data = json.loads(disabled.read_text(encoding="utf-8"))
+    data["disabled"] = True
+    disabled.write_text(json.dumps(data), encoding="utf-8")
+
+    assert dedupe(auth_dir, True, False, False, backup_dir, True) == 0
+
+    assert disabled.exists()
+    assert not backup_dir.exists()
+
+
 def test_failed_duplicate_is_removed_only_when_a_peer_exists(tmp_path: Path) -> None:
     auth_dir = tmp_path / "auth"
     backup_dir = tmp_path / "auth-backups"
