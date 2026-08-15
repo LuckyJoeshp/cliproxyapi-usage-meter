@@ -61,6 +61,11 @@ PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
 
 Open <http://127.0.0.1:8327/usage>.
 
+The launcher applies an owner-only `umask`; on POSIX the meter also attempts to
+repair existing SQLite, WAL, and SHM permissions to `0600` when opened
+directly. Runtime databases remain local data and are intentionally not part
+of the repository (Windows relies on ACLs).
+
 The dashboard also monitors direct ChatGPT App Codex sessions when the local
 Codex JSONL history is available. It imports only token-count and rate-limit
 metadata from the `CODEX_APP_HOME` (default `~/.codex`) and matches the local

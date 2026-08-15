@@ -1602,7 +1602,41 @@ class UsageRepository:
         # retries after a restart, so no identifiable pages are abandoned.
         self._privacy_checkpoint_pending = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # A repository can be opened directly (without the shell launcher),
+        # and SQLite may inherit permissive modes from an older database.  Do
+        # a best-effort owner-only pass before and after WAL setup so existing
+        # databases and their sidecars receive the same privacy boundary.
+        self._harden_storage_permissions()
         self.initialize()
+
+    def _harden_storage_permissions(self) -> None:
+        """Keep local SQLite files readable only by the current owner.
+
+        ``umask`` in the launcher covers the creation race, while this pass
+        repairs existing databases and sidecars for direct CLI/server starts.
+        Windows ACLs do not map cleanly to POSIX mode bits, so the explicit
+        chmod is intentionally a no-op there.  Detected sidecar symlinks are
+        skipped; callers should provide a regular database path.
+        """
+
+        if os.name == "nt":
+            return
+        for candidate in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+            Path(f"{self.path}-journal"),
+        ):
+            try:
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                if candidate.stat().st_mode & 0o777 != 0o600:
+                    candidate.chmod(0o600)
+            except OSError as exc:
+                # Do not include the local path in logs; it can contain an
+                # account name.  The database remains usable, but the caller
+                # gets a clear diagnostic if the OS rejects the hardening.
+                LOG.warning("database permission hardening failed: %s", type(exc).__name__)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=15.0)
@@ -1610,11 +1644,13 @@ class UsageRepository:
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA secure_delete=ON")
+        self._harden_storage_permissions()
         return conn
 
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            self._harden_storage_permissions()
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS usage_events (
@@ -3058,6 +3094,12 @@ class UsageRepository:
             )
             result["retired"] = len(retired)
             result["retired_keys"] = retired
+            # The state row is initialized after the first complete scan and
+            # remains initialized on every later authoritative scan.  Keep
+            # the in-memory health payload truthful as well; otherwise a
+            # healthy second poll would misleadingly report ``initialized``
+            # as false even though deletion safeguards are active.
+            result["initialized"] = True
         if result["retired"] or self._privacy_checkpoint_pending:
             self._checkpoint_privacy_wal("retired subscription")
         return result

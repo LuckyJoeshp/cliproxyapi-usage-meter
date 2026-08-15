@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -137,6 +138,26 @@ class SubscriptionPrivacyTest(unittest.TestCase):
             return conn.execute(
                 "SELECT * FROM active_subscription_registry ORDER BY identity_key"
             ).fetchall()
+
+    def test_sqlite_database_and_sidecars_are_owner_only(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX mode bits are not an ACL model on Windows")
+        for path in (
+            self.repo.path,
+            Path(f"{self.repo.path}-wal"),
+            Path(f"{self.repo.path}-shm"),
+        ):
+            self.assertTrue(path.exists(), path)
+            path.chmod(0o644)
+        # Direct CLI/server starts must repair an older permissive database,
+        # not only protect files created under the launcher umask.
+        meter.UsageRepository(self.repo.path)
+        for path in (
+            self.repo.path,
+            Path(f"{self.repo.path}-wal"),
+            Path(f"{self.repo.path}-shm"),
+        ):
+            self.assertEqual(path.stat().st_mode & 0o077, 0, path)
 
     def test_structured_email_sources_are_supported_but_filename_is_never_email(self) -> None:
         account_prefix = "acct-email-source-"
@@ -802,6 +823,9 @@ class SubscriptionPrivacyTest(unittest.TestCase):
         third = self.repo.reconcile_subscription_inventory(
             {active_key}, "2026-08-15T00:12:00Z", authoritative=True
         )
+        self.assertTrue(first["initialized"])
+        self.assertTrue(second["initialized"])
+        self.assertTrue(third["initialized"])
         self.assertEqual((first["suspect"], first["retired"]), (1, 0))
         self.assertEqual((second["suspect"], second["retired"]), (1, 0))
         self.assertEqual(third["retired"], 1)

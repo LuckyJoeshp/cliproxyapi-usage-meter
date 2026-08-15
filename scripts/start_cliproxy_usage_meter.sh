@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The SQLite database and its WAL/SHM sidecars contain local usage
+# aggregates.  Keep every file created by this process owner-only, including
+# files created before the Python repository can apply its explicit chmod.
+umask 077
+
 WORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${QLAB_PYTHON_BIN:-python3}"
 METER_PORT="${PORT:-8327}"

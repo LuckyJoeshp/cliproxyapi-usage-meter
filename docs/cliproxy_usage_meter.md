@@ -23,6 +23,10 @@ cd <repo>
 PORT=8327 UPSTREAM=http://127.0.0.1:8317 scripts/start_cliproxy_usage_meter.sh
 ```
 
+启动脚本使用 `umask 077`；在 POSIX 上即使直接运行 Python 入口，sidecar 也会尝试在
+打开时把 SQLite 主库及 WAL/SHM sidecar 修复为 owner-only `0600`。Windows 依赖 ACL。
+运行库仍只属于本机，不会提交到仓库。
+
 长时间运行可放在 tmux 前台：
 
 ```bash

@@ -1222,6 +1222,102 @@ class UsageMeterMVPTest(unittest.TestCase):
         )
         self.assertEqual(quotas[0]["remaining_percent"], 84)
 
+    def test_stale_401_rotation_falls_through_to_same_email_file(self) -> None:
+        """A stale RT must not hide a newer file for the same mailbox."""
+
+        fixture = self.shared_workspace_fixture()
+        resolver = fixture["resolver"]
+        principals = fixture["principals"]
+        shared_account = str(fixture["shared_account"])
+        assert isinstance(resolver, meter.AccountResolver)
+        assert isinstance(principals, dict)
+        principal = principals["a"]
+        rotated = {
+            **principal,
+            "file": "member-alpha@example.cpa.2026-08-15_00-02-03.json",
+            "token": "fixture-access-alpha-current",
+        }
+        proxy_home = Path(fixture["home"]) / ".cli-proxy-api"
+        (proxy_home / str(rotated["file"])).write_text(
+            json.dumps(
+                {
+                    "type": "codex",
+                    "account_id": shared_account,
+                    "access_token": rotated["token"],
+                    "id_token": rotated["id_token"],
+                    "email": rotated["email"],
+                    "plan_type": "team",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        identity = resolver.resolve_auth_file(str(principal["file"]))
+        rotated_identity = resolver.resolve_auth_file(str(rotated["file"]))
+        self.assertEqual(
+            meter.resolved_identity_key(identity),
+            meter.resolved_identity_key(rotated_identity),
+        )
+        auth_files = [
+            {
+                "provider": "codex",
+                "auth_index": auth_index,
+                "name": auth["file"],
+                "account": auth["email"],
+                "id_token": {"chatgpt_account_id": shared_account, "plan_type": "team"},
+            }
+            for auth_index, auth in (
+                ("opaque-stale", principal),
+                ("opaque-current", rotated),
+            )
+        ]
+        calls: list[str] = []
+
+        def management(
+            _key: str,
+            method: str,
+            _path: str,
+            payload: dict[str, object] | None = None,
+        ) -> tuple[int, object]:
+            if method == "GET":
+                return 200, {"files": auth_files}
+            assert payload is not None
+            auth_index = str(payload["auth_index"])
+            calls.append(auth_index)
+            if auth_index == "opaque-stale":
+                return 200, {"status_code": 401, "body": "{}"}
+            return 200, {
+                "status_code": 200,
+                "body": json.dumps(
+                    {
+                        "plan_type": "team",
+                        "rate_limit": {
+                            "secondary_window": {
+                                "used_percent": 22,
+                                "limit_window_seconds": 604800,
+                                "reset_at": "2026-08-22T14:32:00Z",
+                            }
+                        },
+                    }
+                ),
+            }
+
+        poller = meter.CodexQuotaPoller(
+            self.sidecar.repo,
+            resolver,
+            meter.urlsplit("http://127.0.0.1:8317"),
+            key_loader=lambda: "fixture-management",
+        )
+        with mock.patch.object(poller, "_management_request", side_effect=management), mock.patch.object(
+            meter, "utc_now", return_value="2026-08-15T00:00:00Z"
+        ):
+            self.assertEqual(poller.poll_once("fixture-management"), (1, 1))
+
+        self.assertEqual(calls, ["opaque-stale", "opaque-current"])
+        self.assertEqual(len(self.sidecar.repo.subscription_dashboard_rows()), 1)
+        card = self.sidecar.repo.subscription_dashboard_rows()[0]
+        self.assertEqual(card["windows"]["weekly"]["remaining_percent"], 78)
+
     def test_chrome_management_session_decoder_keeps_key_in_memory(self) -> None:
         host = "localhost:8317"
         user_agent = "fixture-user-agent"
