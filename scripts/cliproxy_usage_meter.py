@@ -257,15 +257,67 @@ def open_sqlite_readonly(path: Path | str, timeout: float = 2.0) -> sqlite3.Conn
     """Open an external SQLite database without creating or modifying it."""
 
     target = Path(path).expanduser().absolute()
-    connection = sqlite3.connect(
-        f"{target.as_uri()}?mode=ro",
-        uri=True,
-        timeout=max(0.1, float(timeout)),
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute(f"PRAGMA busy_timeout={max(100, int(timeout * 1000))}")
-    connection.execute("PRAGMA query_only=ON")
-    return connection
+    timeout_seconds = max(0.1, float(timeout))
+    busy_timeout_ms = max(100, int(timeout_seconds * 1000))
+
+    def connect(uri: str) -> sqlite3.Connection:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=timeout_seconds,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            connection.execute("PRAGMA query_only=ON")
+            # Opening a WAL database can succeed before SQLite has acquired a
+            # usable read snapshot.  Touch the schema now so the immutable
+            # fallback below can handle that transient state too.
+            connection.execute(
+                "SELECT 1 FROM sqlite_master LIMIT 1"
+            ).fetchone()
+            return connection
+        except sqlite3.Error:
+            if connection is not None:
+                connection.close()
+            raise
+
+    # A WAL database normally needs its ``-shm`` sidecar to be present even
+    # for a read-only connection.  Cockpit opens/closes its log database in
+    # short-lived commands and can remove that sidecar between polls.  Try
+    # the normal read-only VFS first so active WAL frames are included.
+    errors: list[sqlite3.OperationalError] = []
+    for query in ("mode=ro", "mode=ro&cache=shared"):
+        try:
+            return connect(f"{target.as_uri()}?{query}")
+        except sqlite3.OperationalError as exc:
+            errors.append(exc)
+
+    # If no WAL or rollback journal contains uncheckpointed frames, an
+    # immutable read-only view is a safe fallback: it never creates sidecars,
+    # takes a writer lock, or changes the external database.  Refuse this
+    # fallback while either journal has content so we cannot silently import a
+    # stale/incomplete snapshot.
+    try:
+        journal_pending = any(
+            candidate.is_file() and candidate.stat().st_size > 0
+            for candidate in (
+                Path(f"{target}-wal"),
+                Path(f"{target}-journal"),
+            )
+        )
+    except OSError:
+        journal_pending = True
+    if not journal_pending:
+        try:
+            return connect(f"{target.as_uri()}?mode=ro&immutable=1")
+        except sqlite3.OperationalError as exc:
+            errors.append(exc)
+
+    if errors:
+        raise errors[-1]
+    raise sqlite3.OperationalError("unable to open database file")
 
 
 def canonical_subscription_key(value: Any) -> str | None:

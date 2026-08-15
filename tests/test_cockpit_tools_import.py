@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import cliproxy_usage_meter as meter
 
@@ -310,6 +311,38 @@ class CockpitToolsImporterTest(unittest.TestCase):
         self.assertEqual((result["imported"], result["scanned"]), (1, 1))
         self.assertEqual(len(self._usage_rows()), 1)
         self.assertTrue(self.resolver.cockpit_inventory()["authoritative"])
+
+    def test_readonly_wal_lock_uses_immutable_view_without_pending_journal(self) -> None:
+        database = self.root / "wal-readonly.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE fixture (value TEXT)")
+            connection.execute("INSERT INTO fixture VALUES ('safe-fixture')")
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        for sidecar in (
+            Path(f"{database}-wal"),
+            Path(f"{database}-shm"),
+        ):
+            sidecar.unlink(missing_ok=True)
+
+        real_connect = sqlite3.connect
+        attempted: list[str] = []
+
+        def locked_connect(database_uri: object, *args: object, **kwargs: object):
+            if isinstance(database_uri, str):
+                attempted.append(database_uri)
+                if "immutable=1" not in database_uri:
+                    raise sqlite3.OperationalError("simulated WAL sidecar lock")
+            return real_connect(database_uri, *args, **kwargs)
+
+        with patch.object(meter.sqlite3, "connect", side_effect=locked_connect):
+            with meter.open_sqlite_readonly(database) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM fixture").fetchone()[0],
+                    "safe-fixture",
+                )
+        self.assertTrue(any("immutable=1" in uri for uri in attempted))
 
     def test_incremental_import_is_idempotent_and_reprices_in_place(self) -> None:
         self._insert_request("event-one", 1_786_665_600)

@@ -119,6 +119,28 @@ Cockpit、meter 只负责导入和 8327 看板时无需关闭 importer；如果�
 的代理入口，则必须加 `--no-cockpit-tools-import`。脱敏后的 importer 运行状态、所选来源是否
 可读及最近轮询结果统一查看 `http://127.0.0.1:8327/healthz`，健康检查不会返回凭据或真实账号。
 
+### CLIProxyAPI → Cockpit 增量账号迁移脚本
+
+可复用脚本为 `scripts/migrate_cliproxyapi_to_cockpit.py`。默认只读盘点，确认后才执行：
+
+```bash
+python3 scripts/migrate_cliproxyapi_to_cockpit.py --json
+python3 scripts/migrate_cliproxyapi_to_cockpit.py --apply --yes --json
+```
+
+脚本比较 CLIProxyAPI auth 文件与 Cockpit 的凭据 cache，只导入新增账号或 token chain
+发生变化的账号；相同 workspace/account ID 但邮箱或用户身份不同的成员不会被错误合并，
+Cockpit 独有账号也不会删除。执行时通过 Cockpit 官方 `cockpit-tools://import` 入口和一次性
+loopback bundle 传递凭据，不直接改写两边的账号数据库。缓存不可读时，已有账号默认
+fail-closed，不会盲目覆盖。
+
+迁移记录位于 `~/.antigravity_cockpit/cliproxyapi_migration_history.json`，只保存时间、
+版本、数量、状态和 keyed 不可逆指纹，不保存邮箱、账号 ID、token、源文件名或本地绝对路径。
+每次实际执行前还会在 `~/.antigravity_cockpit/backups/cliproxyapi_migration_*` 保存加密账号
+文件的本地回滚快照；这些快照含凭据，只应保留在本机并限制文件权限。
+Cockpit 的 WAL/SHM 短暂切换不会触发版本拒收：脚本会优先用正常只读快照，只有在没有未提交
+日志时才使用 immutable 只读视图；检测到活动日志则 fail-closed，稍后重复运行即可。
+
 ### 确认耗尽后的持久路由锁（可选）
 
 CLIProxyAPI 7.2.130 在 `usage_limit_reached` 没有携带 reset hint 时，会从 1 秒开始

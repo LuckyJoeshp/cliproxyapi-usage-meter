@@ -116,6 +116,33 @@ meter running only to import Cockpit data and serve
 > clients directly to Cockpit, or add `--no-cockpit-tools-import` when using
 > `8327` as that proxy path.
 
+### Incremental CLIProxyAPI → Cockpit account migration
+
+Keep the reusable migration helper in `scripts/migrate_cliproxyapi_to_cockpit.py`.
+It is read-only by default and compares the local CLIProxyAPI auth directory
+with Cockpit's credential cache, importing only new accounts or changed token
+chains on an explicit apply:
+
+```bash
+python3 scripts/migrate_cliproxyapi_to_cockpit.py --json
+python3 scripts/migrate_cliproxyapi_to_cockpit.py --apply --yes --json
+```
+
+The apply path uses Cockpit's supported `cockpit-tools://import` flow and a
+one-shot loopback bundle; it does not rewrite either account store. Shared
+workspace/account IDs are not treated as the same member when the emails or
+user identities differ, and Cockpit-only accounts are preserved. A private
+keyed migration history is kept at
+`~/.antigravity_cockpit/cliproxyapi_migration_history.json`; it contains only
+counts, status, and non-reversible fingerprints. Before an apply, encrypted
+Cockpit account files receive a local rollback snapshot under
+`~/.antigravity_cockpit/backups/cliproxyapi_migration_*`.
+
+The helper reopens Cockpit's WAL-backed SQLite cache/log files without taking
+write locks. If an active journal has uncheckpointed bytes, it waits/fails
+closed rather than importing a stale snapshot; rerunning the same command is
+safe and idempotent.
+
 ### Start Codex through CLIProxyAPI from any folder
 
 The repository includes [`scripts/codex-cliproxyapi`](scripts/codex-cliproxyapi),
