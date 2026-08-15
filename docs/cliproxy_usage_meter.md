@@ -57,6 +57,63 @@ CLIPROXY_MANAGEMENT_KEY_FILE="$HOME/.config/cliproxyapi-management.key" \
 `--usage-queue-poll-seconds`、`--usage-queue-timeout`，必要时用
 `--no-usage-queue` 明确关闭。
 
+### Cockpit Tools `request_logs` 只读导入（默认开启）
+
+迁移到 Cockpit Tools 后，不必再让业务流量经过 8327 才能进入同一个用量看板。meter
+默认启动一个只读 importer，从 Cockpit 的 SQLite `request_logs` 导入调用；落库事件的
+`source` 固定为 `cockpit_tools`。数据文件按以下顺序选择：
+
+1. `--cockpit-tools-data-dir /path/to/cockpit-data`；
+2. `COCKPIT_TOOLS_DATA_DIR` 指向的数据目录；
+3. 默认的 `~/.antigravity_cockpit/codex_local_access_logs.sqlite`。
+
+前两种方式都在所选目录下读取 `codex_local_access_logs.sqlite`。importer 不修改 Cockpit
+数据库；数据库或 `request_logs` 表暂时为空时只表示当前没有可导入记录，是正常状态，
+不会阻止 8327 看板启动。轮询间隔可用 `COCKPIT_TOOLS_USAGE_POLL_SECONDS` 或
+`--cockpit-tools-poll-seconds SECONDS` 调整，完全关闭则使用
+`--no-cockpit-tools-import`。
+
+macOS 上还会自动发现 Cockpit 的 WebKit accounts cache，用于把允许的 identity/quota
+字段接入既有 keyed identity 与额度视图。需要显式选择测试副本或非标准位置时，可传：
+
+```bash
+python3 scripts/cliproxy_usage_meter.py --serve \
+  --cockpit-tools-data-dir /path/to/cockpit-data \
+  --cockpit-tools-localstorage-db /path/to/cockpit-webkit/localstorage.sqlite3 \
+  --cockpit-tools-poll-seconds 30
+```
+
+LocalStorage 覆盖也可通过 `COCKPIT_TOOLS_LOCALSTORAGE_DB` 设置。
+
+WebKit cache 只按 allowlist 提取安全的身份与额度字段；OAuth/API token、cookie、授权头、
+原始账号 cache 记录和其他凭据不会写入 meter SQLite。可读账号信息仍遵守既有隐私边界：
+只在本机运行时用于映射，持久关联使用 keyed identity。
+
+迁移期间 resolver 会优先用 Cockpit cache 中的 workspace + email/user 复用原
+CLIProxyAPI canonical identity；缺少 workspace 时只在邮箱唯一匹配时沿用旧身份，否则使用
+Cockpit selector 的域隔离 HMAC fallback。CLIProxyAPI 与 Cockpit 的完整账号清单按并集进行
+退役核对，避免删掉旧 auth 文件后误把已迁移账号的历史匿名化；索引或 cache 不完整时核对
+会 fail closed，不执行账号退役。
+
+Cockpit 已在每条请求上冻结当时的 input/cache/output 价格快照，并记录 cache-read、
+cache-write 与 reasoning 等 token breakdown。importer 沿用这些逐请求快照与分项，
+不用 meter 当前价格表重新解释历史请求；若 Cockpit 提升 `model_pricing_version` 并重写其
+历史快照，importer 会原位同步同一事件，不会重复计数。`/usage`
+因此可以把 Cockpit 用量并入 token 与 API 等价成本统计，同时保留历史计费口径。
+
+推荐的迁移拓扑是：
+
+```text
+client -> Cockpit Tools
+Cockpit request_logs --read-only import--> meter -> 127.0.0.1:8327/usage
+```
+
+不要把同一批流量先经 8327 代理到 Cockpit，同时又保持 Cockpit importer 开启；这样一条
+请求会分别以代理事件和 `source=cockpit_tools` 导入事件出现，造成双计数。业务流量直连
+Cockpit、meter 只负责导入和 8327 看板时无需关闭 importer；如果确实把 8327 当作 Cockpit
+的代理入口，则必须加 `--no-cockpit-tools-import`。脱敏后的 importer 运行状态、所选来源是否
+可读及最近轮询结果统一查看 `http://127.0.0.1:8327/healthz`，健康检查不会返回凭据或真实账号。
+
 ### 确认耗尽后的持久路由锁（可选）
 
 CLIProxyAPI 7.2.130 在 `usage_limit_reached` 没有携带 reset hint 时，会从 1 秒开始
@@ -129,9 +186,10 @@ python3 \
 
 ## 计量与身份
 
-每次经过 8327 的 `/v1/...` 请求，以及从 8317 usage queue 读到的每条调用，都会落一条
-`usage_events`，不论成功、失败、streaming 或 usage 缺失。队列事件的 `source` 为
-`usage_queue`，显式 sidecar 请求的 `source` 为 `sidecar`。支持：
+每次经过 8327 的 `/v1/...` 请求、从 8317 usage queue 读到的每条调用，以及从 Cockpit
+Tools 导入的每条 `request_logs` 调用，都会落一条 `usage_events`，不论成功、失败、
+streaming 或 usage 缺失。队列事件的 `source` 为 `usage_queue`，显式 sidecar 请求的
+`source` 为 `sidecar`，Cockpit 导入事件的 `source` 为 `cockpit_tools`。支持：
 
 ### ChatGPT App 直登 Codex 的本地监控
 
@@ -286,7 +344,8 @@ http://127.0.0.1:8327/usage
 看板展示今日/近 7 日/SQLite 全量累计、成功/失败/streaming、各 token 与估算成本、全量按日历史、
 alias/account 与模型排行、quota 周期统计以及最近 50 条调用。页面顶部明确标出 SQLite 第一条和最后一条
 记录时间，并显示 direct-8317 collector 是 active、backoff 还是因缺少 key 而 idle；
-`/healthz` 也提供同样的脱敏状态。页面只读取 SQLite，不接入 cliproxyapi 本体。`/usage` 与
+Cockpit importer 的脱敏状态也由 `/healthz` 提供。页面只读取 meter SQLite，不直接接入
+cliproxyapi 或 Cockpit 本体。`/usage` 与
 `/healthz` 都是动态本机状态，响应带 `Cache-Control: no-store`，避免浏览器复用旧额度或身份映射。
 额度卡通过运行时 resolver 补回邮箱/alias；SQLite 中的额度快照本身不含这些可读身份信息。
 

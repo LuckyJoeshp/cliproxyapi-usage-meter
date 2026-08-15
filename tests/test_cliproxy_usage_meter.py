@@ -1650,12 +1650,15 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertIn(b'data-role="theme-toggle"', page)
         self.assertIn(b"cliproxy-usage-theme", page)
         self.assertIn(b"codex-1", page)
-        health_status, health_headers, _ = self.request("GET", "/healthz", None, alias=None)
+        health_status, health_headers, health_body = self.request(
+            "GET", "/healthz", None, alias=None
+        )
         self.assertEqual(health_status, 200)
         self.assertEqual(
             dict((key.lower(), value) for key, value in health_headers)["cache-control"],
             "no-store",
         )
+        self.assertIn("cockpit_tools", json.loads(health_body))
 
         commands = [
             ("--summary", "today"),

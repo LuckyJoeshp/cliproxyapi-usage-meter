@@ -33,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import unicodedata
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,6 +72,14 @@ DEFAULT_CODEX_APP_ALIAS = "codex-13"
 DEFAULT_CODEX_APP_POLL_SECONDS = 15.0
 MAX_CODEX_APP_JSONL_BYTES = 128 * 1024 * 1024
 DEFAULT_CODEX_APP_MAX_FILES = 500
+DEFAULT_COCKPIT_TOOLS_DATA_DIR = Path.home() / ".antigravity_cockpit"
+COCKPIT_TOOLS_LOG_DB_NAME = "codex_local_access_logs.sqlite"
+COCKPIT_TOOLS_ACCOUNTS_INDEX_NAME = "codex_accounts.json"
+COCKPIT_TOOLS_ACCOUNT_CACHE_KEY = "agtools.codex.accounts.cache"
+DEFAULT_COCKPIT_TOOLS_POLL_SECONDS = 15.0
+MAX_COCKPIT_TOOLS_CACHE_BYTES = 16 * 1024 * 1024
+COCKPIT_TOOLS_REQUEST_SOURCE = "cockpit_tools"
+COCKPIT_TOOLS_QUOTA_SOURCE = "cockpit_tools_quota"
 MAX_MANUAL_IMPORT_BYTES = 64 * 1024
 DEFAULT_MANAGEMENT_BACKOFF_SECONDS = 300.0
 MAX_MANAGEMENT_BACKOFF_SECONDS = 1800.0
@@ -242,6 +251,21 @@ def safe_plan_type(value: Any) -> str | None:
         "enterprise",
         "edu",
     } else None
+
+
+def open_sqlite_readonly(path: Path | str, timeout: float = 2.0) -> sqlite3.Connection:
+    """Open an external SQLite database without creating or modifying it."""
+
+    target = Path(path).expanduser().absolute()
+    connection = sqlite3.connect(
+        f"{target.as_uri()}?mode=ro",
+        uri=True,
+        timeout=max(0.1, float(timeout)),
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout={max(100, int(timeout * 1000))}")
+    connection.execute("PRAGMA query_only=ON")
+    return connection
 
 
 def canonical_subscription_key(value: Any) -> str | None:
@@ -597,6 +621,9 @@ class AccountResolver:
         enabled: bool = True,
         refresh_seconds: float = 60.0,
         identity_key_file: Path | str | None = None,
+        cockpit_tools_data_dir: Path | str | None = None,
+        cockpit_tools_localstorage_db: Path | str | None = None,
+        cockpit_tools_enabled: bool = True,
     ):
         self.home = home or Path.home()
         self.enabled = enabled
@@ -605,6 +632,29 @@ class AccountResolver:
             Path(identity_key_file).expanduser()
             if identity_key_file is not None
             else self.home / ".config" / "cliproxy-usage" / "identity.key"
+        )
+        configured_cockpit_dir = (
+            cockpit_tools_data_dir
+            if cockpit_tools_data_dir is not None
+            else os.environ.get("COCKPIT_TOOLS_DATA_DIR")
+        )
+        self._cockpit_data_dir_explicit = bool(configured_cockpit_dir)
+        self.cockpit_tools_data_dir = (
+            Path(configured_cockpit_dir).expanduser()
+            if configured_cockpit_dir
+            else self.home / ".antigravity_cockpit"
+        )
+        configured_localstorage = (
+            cockpit_tools_localstorage_db
+            if cockpit_tools_localstorage_db is not None
+            else os.environ.get("COCKPIT_TOOLS_LOCALSTORAGE_DB")
+        )
+        self._cockpit_localstorage_explicit = bool(configured_localstorage)
+        self.cockpit_tools_enabled = bool(cockpit_tools_enabled)
+        self.cockpit_tools_localstorage_db = (
+            Path(configured_localstorage).expanduser()
+            if configured_localstorage
+            else None
         )
         self._identity_secret: bytes | None = None
         # ``0.0`` is a valid monotonic timestamp on fresh processes.  Use a
@@ -618,6 +668,32 @@ class AccountResolver:
         self._identity_keys: dict[str, AccountIdentity] = {}
         self._legacy_identity_keys: dict[str, str] = {}
         self._ambiguous_legacy_identity_keys: set[str] = set()
+        self._active_subscription_keys: set[str] = set()
+        self._cockpit_accounts: dict[str, AccountIdentity] = {}
+        self._cockpit_records: list[dict[str, Any]] = []
+        self._cockpit_inventory_keys: set[str] = set()
+        self._cockpit_inventory_authoritative = False
+        self._cockpit_detected = False
+
+    def configure_cockpit_sources(
+        self,
+        *,
+        data_dir: Path | str | None = None,
+        localstorage_db: Path | str | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        """Configure Cockpit sources before an importer starts polling."""
+
+        with self._lock:
+            if data_dir is not None:
+                self.cockpit_tools_data_dir = Path(data_dir).expanduser()
+                self._cockpit_data_dir_explicit = True
+            if localstorage_db is not None:
+                self.cockpit_tools_localstorage_db = Path(localstorage_db).expanduser()
+                self._cockpit_localstorage_explicit = True
+            if enabled is not None:
+                self.cockpit_tools_enabled = bool(enabled)
+            self._last_refresh = -float("inf")
 
     def resolve(self, usage_alias: str | None, auth_fingerprint: str | None) -> AccountIdentity:
         self._refresh_if_needed()
@@ -823,10 +899,87 @@ class AccountResolver:
         """Return current local canonical keys without exposing their inputs."""
 
         self._refresh_if_needed(force=force_refresh)
+        return set(self._active_subscription_keys)
+
+    def resolve_cockpit_account(
+        self,
+        storage_id: str | None,
+        email: str | None = None,
+    ) -> AccountIdentity:
+        """Resolve a Cockpit selector without persisting its raw identifier.
+
+        Cockpit's ``request_logs.account_id`` is an internal selector, not the
+        OpenAI workspace id.  A structured workspace/member record from the
+        WebKit cache is preferred.  Unknown selectors receive only a
+        domain-separated keyed fallback, which can later be migrated when the
+        safe cache record becomes available.
+        """
+
+        storage = safe_text(storage_id, 512)
+        if not self.enabled or not storage:
+            return AccountIdentity(None, None, None)
+        self._refresh_if_needed()
+        known = self._cockpit_accounts.get(storage)
+        normalized_email = normalize_email_identity(email)
+        if known is not None:
+            known_email = normalize_email_identity(known.account_email)
+            if normalized_email and known_email and normalized_email != known_email:
+                return AccountIdentity(None, None, None)
+            return known
+
+        if normalized_email:
+            matching = {
+                key: identity
+                for key, identity in self._identity_keys.items()
+                if normalize_email_identity(identity.account_email) == normalized_email
+                and canonical_subscription_key(key)
+            }
+            if len(matching) == 1:
+                return next(iter(matching.values()))
+        fallback = self._private_hash(
+            "cockpit-tools-account-v1",
+            storage,
+            normalized_email or "",
+        )
+        return AccountIdentity(
+            None,
+            None,
+            None,
+            safe_email(email),
+            None,
+            fallback,
+            None,
+        )
+
+    def cockpit_event_import_key(self, event_key: str | None) -> str | None:
+        """Return a stable, non-reversible import key for a Cockpit event."""
+
+        if not isinstance(event_key, str) or not event_key or len(event_key) > 65_536:
+            return None
+        return "cockpit:" + self._private_hash(
+            "cockpit-tools-event-v1", event_key
+        )
+
+    def cockpit_account_records(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return an in-memory copy containing only allowlisted safe fields."""
+
+        self._refresh_if_needed(force=force_refresh)
+        return [dict(record) for record in self._cockpit_records]
+
+    def cockpit_inventory(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        """Return sanitized Cockpit inventory health and canonical keys."""
+
+        self._refresh_if_needed(force=force_refresh)
+        keys = set(self._cockpit_inventory_keys)
         return {
-            key
-            for key in self._identity_keys
-            if canonical_subscription_key(key)
+            "detected": self._cockpit_detected,
+            "authoritative": self._cockpit_inventory_authoritative,
+            "account_count": len(keys),
+            "active_keys": keys,
         }
 
     def identity_migrations(self) -> dict[str, str]:
@@ -871,6 +1024,12 @@ class AccountResolver:
                 identity_keys,
                 legacy_identity_keys,
                 ambiguous_legacy_identity_keys,
+                active_subscription_keys,
+                cockpit_accounts,
+                cockpit_records,
+                cockpit_inventory_keys,
+                cockpit_inventory_authoritative,
+                cockpit_detected,
             ) = self._scan()
             self._aliases = aliases
             self._tokens = tokens
@@ -879,7 +1038,219 @@ class AccountResolver:
             self._identity_keys = identity_keys
             self._legacy_identity_keys = legacy_identity_keys
             self._ambiguous_legacy_identity_keys = ambiguous_legacy_identity_keys
+            self._active_subscription_keys = active_subscription_keys
+            self._cockpit_accounts = cockpit_accounts
+            self._cockpit_records = cockpit_records
+            self._cockpit_inventory_keys = cockpit_inventory_keys
+            self._cockpit_inventory_authoritative = cockpit_inventory_authoritative
+            self._cockpit_detected = cockpit_detected
             self._last_refresh = time.monotonic()
+
+    def _cockpit_localstorage_candidates(self) -> list[Path]:
+        if self.cockpit_tools_localstorage_db is not None:
+            return [self.cockpit_tools_localstorage_db]
+        root = (
+            self.home
+            / "Library"
+            / "WebKit"
+            / "com.jlcodes.cockpit-tools"
+            / "WebsiteData"
+        )
+        try:
+            candidates = list(root.rglob("LocalStorage/localstorage.sqlite3"))
+        except OSError:
+            return []
+        try:
+            return sorted(
+                candidates,
+                key=lambda candidate: candidate.stat().st_mtime_ns,
+                reverse=True,
+            )
+        except OSError:
+            return candidates
+
+    @staticmethod
+    def _safe_cockpit_account_record(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, Mapping):
+            return None
+        storage_id = safe_text(value.get("id") or value.get("storage_id"), 512)
+        if not storage_id:
+            return None
+        quota = value.get("quota") if isinstance(value.get("quota"), Mapping) else {}
+        return {
+            "id": storage_id,
+            "account_id": safe_text(value.get("account_id"), 512),
+            "email": safe_email(value.get("email")),
+            "user_id": safe_text(value.get("user_id"), 512),
+            "plan_type": safe_plan_type(value.get("plan_type")),
+            "subscription_active_until": normalize_optional_timestamp(
+                value.get("subscription_active_until")
+            ),
+            "usage_updated_at": normalize_optional_timestamp(
+                value.get("usage_updated_at")
+            ),
+            "hourly_percentage": _percent_value(quota.get("hourly_percentage")),
+            "hourly_reset_time": normalize_optional_timestamp(
+                quota.get("hourly_reset_time")
+            ),
+            "hourly_window_minutes": as_nonnegative_int(
+                quota.get("hourly_window_minutes")
+            ),
+            "hourly_window_present": quota.get("hourly_window_present") is True,
+            "weekly_percentage": _percent_value(quota.get("weekly_percentage")),
+            "weekly_reset_time": normalize_optional_timestamp(
+                quota.get("weekly_reset_time")
+            ),
+            "weekly_window_minutes": as_nonnegative_int(
+                quota.get("weekly_window_minutes")
+            ),
+            "weekly_window_present": quota.get("weekly_window_present") is True,
+        }
+
+    def _read_cockpit_localstorage_records(
+        self,
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
+        candidates = self._cockpit_localstorage_candidates()
+        detected = bool(
+            self._cockpit_localstorage_explicit
+            or any(candidate.exists() for candidate in candidates)
+        )
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                with closing(open_sqlite_readonly(path)) as connection:
+                    row = connection.execute(
+                        """SELECT value FROM ItemTable
+                             WHERE key=? AND length(value)<=? LIMIT 1""",
+                        (
+                            COCKPIT_TOOLS_ACCOUNT_CACHE_KEY,
+                            MAX_COCKPIT_TOOLS_CACHE_BYTES,
+                        ),
+                    ).fetchone()
+                if row is None:
+                    continue
+                raw = row[0]
+                if isinstance(raw, bytes):
+                    if len(raw) > MAX_COCKPIT_TOOLS_CACHE_BYTES:
+                        continue
+                    text = raw.decode("utf-16le")
+                elif isinstance(raw, str):
+                    if len(raw.encode("utf-8", "ignore")) > MAX_COCKPIT_TOOLS_CACHE_BYTES:
+                        continue
+                    text = raw
+                else:
+                    continue
+                payload = json.loads(text.lstrip("\ufeff"))
+                if isinstance(payload, Mapping):
+                    payload = first_present(payload, ("accounts", "data", "items"))
+                if not isinstance(payload, list):
+                    continue
+                records: list[dict[str, Any]] = []
+                seen: dict[str, dict[str, Any]] = {}
+                conflicts: set[str] = set()
+                complete = True
+                for item in payload[:100_000]:
+                    record = self._safe_cockpit_account_record(item)
+                    if record is None:
+                        complete = False
+                        continue
+                    storage_id = record["id"]
+                    existing = seen.get(storage_id)
+                    if existing is not None and existing != record:
+                        conflicts.add(storage_id)
+                        complete = False
+                        continue
+                    seen[storage_id] = record
+                for storage_id, record in seen.items():
+                    if storage_id not in conflicts:
+                        records.append(record)
+                if len(payload) > 100_000:
+                    complete = False
+                return records, True, complete
+            except (
+                OSError,
+                sqlite3.Error,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+                ValueError,
+            ):
+                continue
+        return [], detected, not detected
+
+    def _read_cockpit_index_records(
+        self,
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
+        path = self.cockpit_tools_data_dir / COCKPIT_TOOLS_ACCOUNTS_INDEX_NAME
+        log_path = self.cockpit_tools_data_dir / COCKPIT_TOOLS_LOG_DB_NAME
+        detected = bool(
+            self._cockpit_data_dir_explicit
+            or self.cockpit_tools_data_dir.exists()
+            or path.exists()
+            or log_path.exists()
+        )
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_COCKPIT_TOOLS_CACHE_BYTES:
+                return [], False, detected
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return [], False, detected
+        raw_accounts = payload.get("accounts") if isinstance(payload, Mapping) else None
+        if not isinstance(raw_accounts, list):
+            return [], False, True
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        complete = True
+        for item in raw_accounts:
+            record = self._safe_cockpit_account_record(item)
+            if record is None or record["id"] in seen:
+                complete = False
+                continue
+            seen.add(record["id"])
+            records.append(record)
+        return records, complete, True
+
+    def _cockpit_source_records(
+        self,
+    ) -> tuple[list[dict[str, Any]], set[str], bool, bool]:
+        if not self.cockpit_tools_enabled:
+            return [], set(), True, False
+        index_records, index_complete, index_detected = self._read_cockpit_index_records()
+        (
+            cache_records,
+            cache_detected,
+            cache_complete,
+        ) = self._read_cockpit_localstorage_records()
+        cache_by_id = {record["id"]: record for record in cache_records}
+        combined: list[dict[str, Any]] = []
+        indexed_ids: set[str] = set()
+        for indexed in index_records:
+            storage_id = indexed["id"]
+            indexed_ids.add(storage_id)
+            cached = cache_by_id.pop(storage_id, None)
+            if cached is None:
+                combined.append(indexed)
+                continue
+            indexed_email = normalize_email_identity(indexed.get("email"))
+            cached_email = normalize_email_identity(cached.get("email"))
+            if indexed_email and cached_email and indexed_email != cached_email:
+                # The index and credential-bearing cache disagree.  Keep only
+                # the index's safe summary and prevent authoritative deletion.
+                index_complete = False
+                combined.append(indexed)
+                continue
+            merged = dict(indexed)
+            for key, value in cached.items():
+                if value is not None and value is not False:
+                    merged[key] = value
+            combined.append(merged)
+        combined.extend(cache_by_id.values())
+        detected = index_detected or cache_detected
+        # A machine without Cockpit has an empty, complete contribution to a
+        # CLIProxy-only union.  Once any Cockpit artifact is detected, only a
+        # complete codex_accounts.json may authorize deletion decisions.
+        authoritative = (index_complete and cache_complete) if detected else True
+        return combined, indexed_ids, authoritative, detected
 
     def _scan(
         self,
@@ -891,6 +1262,12 @@ class AccountResolver:
         dict[str, AccountIdentity],
         dict[str, str],
         set[str],
+        set[str],
+        dict[str, AccountIdentity],
+        list[dict[str, Any]],
+        set[str],
+        bool,
+        bool,
     ]:
         aliases: dict[str, AccountIdentity] = {}
         tokens: dict[str, AccountIdentity] = {}
@@ -1168,6 +1545,138 @@ class AccountResolver:
                 if fingerprint:
                     remember_token_identity(fingerprint, identity, alias)
 
+        cli_active_keys = {
+            key for key in identity_keys if canonical_subscription_key(key)
+        }
+        email_candidates: dict[str, dict[str, AccountIdentity]] = {}
+        for key, identity in identity_keys.items():
+            normalized = normalize_email_identity(identity.account_email)
+            canonical = canonical_subscription_key(key)
+            if normalized and canonical:
+                email_candidates.setdefault(normalized, {})[canonical] = identity
+
+        (
+            cockpit_records,
+            indexed_cockpit_ids,
+            cockpit_inventory_authoritative,
+            cockpit_detected,
+        ) = self._cockpit_source_records()
+        cockpit_accounts: dict[str, AccountIdentity] = {}
+        cockpit_inventory_keys: set[str] = set()
+        cockpit_principal_targets: dict[str, set[str]] = {}
+        for record in cockpit_records:
+            workspace_id = safe_text(record.get("account_id"), 512)
+            normalized_email = normalize_email_identity(record.get("email"))
+            user_id = safe_text(record.get("user_id"), 512)
+            if not workspace_id or not normalized_email or not user_id:
+                continue
+            principal_key = "subscription:" + self._private_hash(
+                "codex-workspace-principal-v1", workspace_id, user_id
+            )
+            target_hash = self._subscription_hash(
+                workspace_id,
+                normalized_email,
+                user_id,
+            )
+            if target_hash:
+                cockpit_principal_targets.setdefault(principal_key, set()).add(
+                    f"subscription:{target_hash}"
+                )
+        for record in cockpit_records:
+            storage_id = str(record["id"])
+            workspace_id = safe_text(record.get("account_id"), 512)
+            email = safe_email(record.get("email"))
+            normalized_email = normalize_email_identity(email)
+            user_id = safe_text(record.get("user_id"), 512)
+            identity: AccountIdentity | None = None
+            if workspace_id and (normalized_email or user_id):
+                identity = self._identity(
+                    None,
+                    workspace_id,
+                    email,
+                    user_id,
+                )
+            elif normalized_email:
+                matches = email_candidates.get(normalized_email, {})
+                if len(matches) == 1:
+                    identity = next(iter(matches.values()))
+
+            fallback_with_email = self._private_hash(
+                "cockpit-tools-account-v1",
+                storage_id,
+                normalized_email or "",
+            )
+            fallback_without_email = self._private_hash(
+                "cockpit-tools-account-v1",
+                storage_id,
+                "",
+            )
+            if identity is None or not identity.subscription_id_hash:
+                identity = AccountIdentity(
+                    None,
+                    None,
+                    None,
+                    email,
+                    None,
+                    fallback_with_email,
+                    None,
+                )
+            canonical_key = f"subscription:{identity.subscription_id_hash}"
+            if workspace_id and normalized_email and user_id:
+                principal_fallback = self._private_hash(
+                    "codex-workspace-principal-v1",
+                    workspace_id,
+                    user_id,
+                )
+                if f"subscription:{principal_fallback}" != canonical_key:
+                    remember_legacy_identity(
+                        f"subscription:{principal_fallback}",
+                        canonical_key,
+                    )
+                principal_key = f"subscription:{principal_fallback}"
+                if cockpit_principal_targets.get(principal_key) == {canonical_key}:
+                    previous = identity_keys.get(principal_key)
+                    if previous is not None:
+                        identity = AccountIdentity(
+                            previous.usage_alias,
+                            identity.account_id_hash,
+                            identity.account_id_tail,
+                            identity.account_email,
+                            identity.principal_id_hash,
+                            identity.subscription_id_hash,
+                            identity.legacy_subscription_id_hash,
+                        )
+                        for alias_name, alias_identity in list(aliases.items()):
+                            if resolved_identity_key(alias_identity) == principal_key:
+                                aliases[alias_name] = identity
+                        for fingerprint, token_identity in list(tokens.items()):
+                            if resolved_identity_key(token_identity) == principal_key:
+                                tokens[fingerprint] = identity
+                        for filename, file_identity in list(auth_indexes.items()):
+                            if resolved_identity_key(file_identity) == principal_key:
+                                auth_indexes[filename] = identity
+                        identity_keys.pop(principal_key, None)
+            existing = identity_keys.get(canonical_key)
+            if existing is not None:
+                identity = AccountIdentity(
+                    existing.usage_alias,
+                    identity.account_id_hash or existing.account_id_hash,
+                    identity.account_id_tail or existing.account_id_tail,
+                    identity.account_email or existing.account_email,
+                    identity.principal_id_hash or existing.principal_id_hash,
+                    identity.subscription_id_hash,
+                    identity.legacy_subscription_id_hash
+                    or existing.legacy_subscription_id_hash,
+                )
+            identity_keys[canonical_key] = identity
+            cockpit_accounts[storage_id] = identity
+            for fallback in {fallback_with_email, fallback_without_email}:
+                old_key = f"subscription:{fallback}"
+                if old_key != canonical_key:
+                    remember_legacy_identity(old_key, canonical_key)
+            if storage_id in indexed_cockpit_ids:
+                cockpit_inventory_keys.add(canonical_key)
+
         for account_id, keyed in account_identities.items():
             sample = next(iter(keyed.values()))
             accounts[account_id] = AccountIdentity(
@@ -1175,6 +1684,20 @@ class AccountResolver:
                 sample.account_id_hash,
                 sample.account_id_tail,
             )
+
+        def migrated_active_key(value: str) -> str:
+            current = value
+            visited: set[str] = set()
+            while current in legacy_identity_keys and current not in visited:
+                visited.add(current)
+                current = legacy_identity_keys[current]
+            return current
+
+        active_subscription_keys: set[str] = set()
+        for key in cli_active_keys | cockpit_inventory_keys:
+            migrated = migrated_active_key(key)
+            if canonical_subscription_key(migrated):
+                active_subscription_keys.add(migrated)
         return (
             aliases,
             tokens,
@@ -1183,6 +1706,12 @@ class AccountResolver:
             identity_keys,
             legacy_identity_keys,
             conflicted_legacy_keys,
+            active_subscription_keys,
+            cockpit_accounts,
+            cockpit_records,
+            cockpit_inventory_keys,
+            cockpit_inventory_authoritative,
+            cockpit_detected,
         )
 
     @staticmethod
@@ -2947,11 +3476,15 @@ class UsageRepository:
                         """
                         SELECT identity_key FROM usage_events
                          WHERE identity_key LIKE 'subscription:%'
-                           AND COALESCE(source, 'sidecar') IN ('sidecar', 'usage_queue')
+                           AND COALESCE(source, 'sidecar') IN (
+                                 'sidecar', 'usage_queue', 'cockpit_tools'
+                               )
                         UNION
                         SELECT identity_key FROM subscription_quota_snapshots
                          WHERE identity_key LIKE 'subscription:%'
-                           AND source='cliproxy_wham_usage'
+                           AND source IN (
+                                 'cliproxy_wham_usage', 'cockpit_tools_quota'
+                               )
                         """
                     ).fetchall()
                     if canonical_subscription_key(row[0])
@@ -3631,7 +4164,8 @@ class UsageRepository:
         event_id, _identity_allowed = self._insert_event_with_status(event)
         return event_id
 
-    def _insert_event_with_status(self, event: UsageEvent) -> tuple[int, bool]:
+    @staticmethod
+    def _validate_event_costs(event: UsageEvent) -> None:
         component_values = (
             event.non_cached_input_cost_usd,
             event.cached_input_cost_usd,
@@ -3651,6 +4185,9 @@ class UsageRepository:
                 abs_tol=1e-12,
             ):
                 raise ValueError("event cost components do not equal total cost")
+
+    def _insert_event_with_status(self, event: UsageEvent) -> tuple[int, bool]:
+        self._validate_event_costs(event)
         values = self._minimized_event_values(event)
         columns = list(values)
         placeholders = ",".join("?" for _ in columns)
@@ -3868,6 +4405,7 @@ class UsageRepository:
         if not safe_key or not safe_source:
             raise ValueError("invalid import identity")
         event.source = safe_source
+        self._validate_event_costs(event)
         values = self._minimized_event_values(event)
         columns = list(values)
         placeholders = ",".join("?" for _ in columns)
@@ -3882,6 +4420,74 @@ class UsageRepository:
                 conn, canonical_key
             ):
                 values["identity_key"] = "unknown"
+            cursor = conn.execute(
+                f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
+                tuple(values[column] for column in columns),
+            )
+            conn.execute(
+                """INSERT INTO local_import_records
+                   (import_key, source, usage_event_id, imported_at)
+                   VALUES (?, ?, ?, ?)""",
+                (safe_key, safe_source, int(cursor.lastrowid), utc_now()),
+            )
+        return True
+
+    def sync_imported_event(
+        self,
+        event: UsageEvent,
+        import_key: str,
+        source: str,
+    ) -> bool:
+        """Insert or safely refresh one externally priced imported event.
+
+        ``True`` means a new usage row was inserted.  An existing live row is
+        updated in place and returns ``False``; a privacy-retired import record
+        whose ``usage_event_id`` is NULL is never re-created.
+        """
+
+        safe_key = safe_text(import_key, 300)
+        safe_source = safe_alias(source)
+        if not safe_key or not safe_source:
+            raise ValueError("invalid import identity")
+        event.source = safe_source
+        self._validate_event_costs(event)
+        values = self._minimized_event_values(event)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            imported = conn.execute(
+                """SELECT source, usage_event_id FROM local_import_records
+                     WHERE import_key=?""",
+                (safe_key,),
+            ).fetchone()
+            canonical_key = canonical_subscription_key(event.identity_key)
+            identity_allowed = bool(
+                canonical_key
+                and self._subscription_detail_allowed_conn(conn, canonical_key)
+            )
+            if imported is not None:
+                if imported["source"] != safe_source or imported["usage_event_id"] is None:
+                    return False
+                existing = conn.execute(
+                    "SELECT identity_key FROM usage_events WHERE id=?",
+                    (imported["usage_event_id"],),
+                ).fetchone()
+                if existing is None:
+                    return False
+                if not identity_allowed:
+                    # A suspect or retired key must not downgrade a still-live
+                    # historical row during a Cockpit repricing scan.
+                    values["identity_key"] = existing["identity_key"]
+                assignments = ", ".join(f"{column}=?" for column in values)
+                conn.execute(
+                    f"UPDATE usage_events SET {assignments} WHERE id=?",
+                    (*[values[column] for column in values], imported["usage_event_id"]),
+                )
+                return False
+
+            if not identity_allowed:
+                values["identity_key"] = "unknown"
+            columns = list(values)
+            placeholders = ",".join("?" for _ in columns)
             cursor = conn.execute(
                 f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
@@ -4481,7 +5087,7 @@ class UsageRepository:
             )
         return result
 
-    def insert_subscription_quota_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+    def insert_subscription_quota_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
         allowed_windows = {"five_hour", "weekly", "monthly"}
         window_kind = safe_text(snapshot.get("window_kind"), 32)
         if window_kind not in allowed_windows:
@@ -4517,7 +5123,7 @@ class UsageRepository:
             if not self._subscription_detail_allowed_conn(
                 conn, values["identity_key"]
             ):
-                return
+                return False
             # Sparse management/JWT responses can omit either field
             # independently.  Look up each value independently as well: a
             # newer plan-only row must not hide an older, still valid renewal
@@ -4534,7 +5140,7 @@ class UsageRepository:
                 ).fetchone()
                 if previous is not None:
                     values[field] = previous[field]
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO subscription_quota_snapshots (
                   fetched_at, identity_key, account_id_hash, account_id_tail,
@@ -4552,6 +5158,7 @@ class UsageRepository:
                 """,
                 values,
             )
+            return max(int(cursor.rowcount), 0) > 0
 
     def latest_subscription_quotas(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -5920,6 +6527,466 @@ def parse_codex_app_rate_windows(
     return windows
 
 
+class CockpitToolsImporter:
+    """Read Cockpit Tools request and quota statistics without modifying it."""
+
+    REQUEST_COLUMNS = (
+        "id",
+        "event_key",
+        "timestamp",
+        "account_id",
+        "model_id",
+        "success",
+        "http_status",
+        "latency_ms",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
+        "token_breakdown_json",
+        "estimated_cost_usd",
+        "model_pricing_version",
+        "input_usd_per_million",
+        "output_usd_per_million",
+        "cached_input_usd_per_million",
+    )
+
+    def __init__(
+        self,
+        repo: UsageRepository,
+        resolver: AccountResolver,
+        data_dir: Path | str | None = None,
+        localstorage_db: Path | str | None = None,
+        poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
+    ) -> None:
+        self.repo = repo
+        self.resolver = resolver
+        if data_dir is not None or localstorage_db is not None:
+            resolver.configure_cockpit_sources(
+                data_dir=data_dir,
+                localstorage_db=localstorage_db,
+            )
+        self.data_dir = (
+            Path(data_dir).expanduser()
+            if data_dir is not None
+            else resolver.cockpit_tools_data_dir
+        )
+        self.database_path = self.data_dir / COCKPIT_TOOLS_LOG_DB_NAME
+        self.poll_seconds = max(1.0, float(poll_seconds))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_poll_at: str | None = None
+        self._last_success_at: str | None = None
+        self._last_error_type: str | None = None
+        self._last_imported = 0
+        self._last_scanned = 0
+        self._last_quota_rows = 0
+        self._database_available = False
+        self._identity_migration_marker: str | None = None
+        self._inventory_result: dict[str, Any] = {
+            "authoritative": False,
+            "active": 0,
+            "suspect": 0,
+            "retired": 0,
+        }
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cockpit-tools-import",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def status(self) -> dict[str, Any]:
+        persisted = self.repo.import_status(COCKPIT_TOOLS_REQUEST_SOURCE)
+        inventory = {
+            key: value
+            for key, value in self._inventory_result.items()
+            if key != "retired_keys"
+        }
+        return {
+            "enabled": True,
+            "database_available": self._database_available,
+            "last_poll_at": self._last_poll_at,
+            "last_success_at": self._last_success_at,
+            "last_error_type": self._last_error_type,
+            "last_imported": self._last_imported,
+            "last_scanned": self._last_scanned,
+            "last_quota_rows": self._last_quota_rows,
+            "poll_seconds": self.poll_seconds,
+            "inventory": inventory,
+            **persisted,
+        }
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                result = self.import_once()
+                self._last_poll_at = utc_now()
+                self._last_success_at = self._last_poll_at
+                self._last_error_type = None
+                self._last_imported = result["imported"]
+                self._last_scanned = result["scanned"]
+                self._last_quota_rows = result["quota_rows"]
+                self._database_available = bool(result["database_available"])
+            except Exception as exc:
+                self._last_poll_at = utc_now()
+                self._last_error_type = type(exc).__name__
+                self._database_available = self.database_path.is_file()
+                LOG.warning("Cockpit Tools import failed: %s", type(exc).__name__)
+            self._stop.wait(self.poll_seconds)
+
+    @staticmethod
+    def _safe_rate(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return (
+            result
+            if math.isfinite(result) and 0 <= result <= 1_000_000
+            else None
+        )
+
+    @staticmethod
+    def _breakdown(value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, str) or not value.strip():
+            return {}
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return parsed if isinstance(parsed, Mapping) else {}
+
+    @classmethod
+    def _usage_and_components(
+        cls,
+        row: Mapping[str, Any],
+    ) -> tuple[NormalizedUsage, PriceComponents | None]:
+        input_tokens = as_nonnegative_int(row.get("input_tokens")) or 0
+        output_tokens = as_nonnegative_int(row.get("output_tokens")) or 0
+        total_tokens = as_nonnegative_int(row.get("total_tokens"))
+        cached_tokens = as_nonnegative_int(row.get("cached_tokens")) or 0
+        reasoning_tokens = as_nonnegative_int(row.get("reasoning_tokens")) or 0
+        breakdown = cls._breakdown(row.get("token_breakdown_json"))
+        input_breakdown = (
+            breakdown.get("input")
+            if isinstance(breakdown.get("input"), Mapping)
+            else {}
+        )
+        output_breakdown = (
+            breakdown.get("output")
+            if isinstance(breakdown.get("output"), Mapping)
+            else {}
+        )
+        breakdown_cached = as_nonnegative_int(
+            input_breakdown.get("cache_read_tokens")
+        )
+        if breakdown_cached is not None and breakdown_cached <= input_tokens:
+            cached_tokens = breakdown_cached
+        cached_tokens = min(cached_tokens, input_tokens)
+        cache_write_tokens = as_nonnegative_int(
+            input_breakdown.get("cache_write_tokens")
+        ) or 0
+        cache_write_tokens = min(cache_write_tokens, max(input_tokens - cached_tokens, 0))
+        breakdown_reasoning = as_nonnegative_int(
+            output_breakdown.get("reasoning_tokens")
+        )
+        if breakdown_reasoning is not None and breakdown_reasoning <= output_tokens:
+            reasoning_tokens = breakdown_reasoning
+        reasoning_tokens = min(reasoning_tokens, output_tokens)
+        if total_tokens is None:
+            total_tokens = input_tokens + output_tokens
+        usage = NormalizedUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            reasoning_tokens=reasoning_tokens,
+            total_tokens=total_tokens,
+        )
+
+        input_rate = cls._safe_rate(row.get("input_usd_per_million"))
+        output_rate = cls._safe_rate(row.get("output_usd_per_million"))
+        cached_rate = cls._safe_rate(row.get("cached_input_usd_per_million"))
+        if cached_rate is None:
+            cached_rate = input_rate
+        uncached_tokens = as_nonnegative_int(input_breakdown.get("uncached_tokens"))
+        if uncached_tokens is None:
+            uncached_tokens = max(
+                input_tokens - cached_tokens - cache_write_tokens,
+                0,
+            )
+        elif uncached_tokens + cached_tokens + cache_write_tokens > input_tokens:
+            uncached_tokens = max(
+                input_tokens - cached_tokens - cache_write_tokens,
+                0,
+            )
+        applicable_rates = [
+            rate
+            for tokens, rate in (
+                (uncached_tokens + cache_write_tokens, input_rate),
+                (cached_tokens, cached_rate),
+                (output_tokens, output_rate),
+            )
+            if tokens > 0
+        ]
+        has_tokens = input_tokens > 0 or output_tokens > 0
+        if (
+            any(rate is None for rate in applicable_rates)
+            or (
+                has_tokens
+                and applicable_rates
+                and all(float(rate or 0.0) == 0.0 for rate in applicable_rates)
+            )
+        ):
+            return usage, None
+        components = PriceComponents(
+            non_cached_input_cost_usd=(
+                (uncached_tokens + cache_write_tokens)
+                * float(input_rate or 0.0)
+                / 1_000_000
+            ),
+            cached_input_cost_usd=(
+                cached_tokens * float(cached_rate or 0.0) / 1_000_000
+            ),
+            output_cost_usd=(
+                output_tokens * float(output_rate or 0.0) / 1_000_000
+            ),
+            long_context_pricing_applied=input_tokens > LONG_CONTEXT_THRESHOLD_TOKENS,
+        )
+        return usage, components
+
+    def _event_from_row(self, row: Mapping[str, Any]) -> tuple[UsageEvent, str] | None:
+        import_key = self.resolver.cockpit_event_import_key(row.get("event_key"))
+        timestamp = normalize_optional_timestamp(row.get("timestamp"))
+        if not import_key or not timestamp:
+            return None
+        storage_id = safe_text(row.get("account_id"), 512)
+        identity = self.resolver.resolve_cockpit_account(storage_id)
+        identity_key_value = (
+            f"subscription:{identity.subscription_id_hash}"
+            if identity.subscription_id_hash
+            else "unknown"
+        )
+        usage, components = self._usage_and_components(row)
+        success = bool(as_nonnegative_int(row.get("success")))
+        raw_status = as_nonnegative_int(row.get("http_status"))
+        status_code = (
+            raw_status
+            if raw_status is not None and 100 <= raw_status <= 599
+            else (200 if success else 500)
+        )
+        model = safe_model_identifier(row.get("model_id"))
+        total_only_snapshot = self._safe_rate(row.get("estimated_cost_usd"))
+        if total_only_snapshot is not None and total_only_snapshot <= 0:
+            total_only_snapshot = None
+        event = UsageEvent(
+            ts=timestamp,
+            identity_key=identity_key_value,
+            endpoint="local://cockpit-tools",
+            method="LOCAL",
+            model=model,
+            status_code=status_code,
+            ok=int(success),
+            duration_ms=as_nonnegative_int(row.get("latency_ms")) or 0,
+            stream=0,
+            session_id=None,
+            thread_id=None,
+            turn_id=None,
+            installation_id=None,
+            window_id=None,
+            usage_alias=identity.usage_alias,
+            usage_project=None,
+            auth_fingerprint=None,
+            account_id_hash=identity.account_id_hash,
+            account_id_tail=identity.account_id_tail,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_tokens=usage.cached_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            total_tokens=usage.total_tokens,
+            estimated_api_cost_usd=(
+                components.total_cost_usd
+                if components
+                else total_only_snapshot
+            ),
+            non_cached_input_cost_usd=(
+                components.non_cached_input_cost_usd if components else None
+            ),
+            cached_input_cost_usd=(
+                components.cached_input_cost_usd if components else None
+            ),
+            output_cost_usd=(components.output_cost_usd if components else None),
+            long_context_pricing_applied=int(
+                bool(
+                    components
+                    and model
+                    and (usage.input_tokens or 0) > LONG_CONTEXT_THRESHOLD_TOKENS
+                )
+            ),
+            subscription_amortized_cost_usd=None,
+            api_equivalent_quota_usd=None,
+            usage_missing=0,
+            error_type=None,
+            error_message_redacted=None,
+            request_bytes=0,
+            response_bytes=0,
+            source=COCKPIT_TOOLS_REQUEST_SOURCE,
+            request_id=None,
+        )
+        return event, import_key
+
+    def _import_quota_records(self, records: Sequence[Mapping[str, Any]]) -> int:
+        count = 0
+        for record in records:
+            fetched_at = normalize_optional_timestamp(record.get("usage_updated_at"))
+            if not fetched_at:
+                continue
+            identity = self.resolver.resolve_cockpit_account(
+                safe_text(record.get("id"), 512),
+                safe_email(record.get("email")),
+            )
+            if not identity.subscription_id_hash:
+                continue
+            key = f"subscription:{identity.subscription_id_hash}"
+            for prefix, kind in (("hourly", "five_hour"), ("weekly", "weekly")):
+                remaining = _percent_value(record.get(f"{prefix}_percentage"))
+                if record.get(f"{prefix}_window_present") is not True or remaining is None:
+                    continue
+                minutes = as_nonnegative_int(record.get(f"{prefix}_window_minutes"))
+                inserted = self.repo.insert_subscription_quota_snapshot(
+                    {
+                        "fetched_at": fetched_at,
+                        "identity_key": key,
+                        "plan_type": record.get("plan_type"),
+                        "subscription_active_until": record.get(
+                            "subscription_active_until"
+                        ),
+                        "window_kind": kind,
+                        "used_percent": 100.0 - remaining,
+                        "remaining_percent": remaining,
+                        "window_seconds": minutes * 60 if minutes is not None else None,
+                        "reset_at": record.get(f"{prefix}_reset_time"),
+                        "source": COCKPIT_TOOLS_QUOTA_SOURCE,
+                    }
+                )
+                count += int(inserted)
+        return count
+
+    def import_once(self) -> dict[str, Any]:
+        inventory = self.resolver.cockpit_inventory(force_refresh=True)
+        # Apply resolver-proven fallback lineage while the old registry key is
+        # still active.  Reconciling the new inventory first would mark that
+        # predecessor suspect and deliberately make privacy migration fail.
+        migrations = self.resolver.identity_migrations()
+        migration_marker = short_hash(
+            json.dumps(sorted(migrations.items()), separators=(",", ":"))
+        )
+        if migration_marker != self._identity_migration_marker:
+            self.repo.apply_privacy_minimization(self.resolver)
+            self._identity_migration_marker = migration_marker
+        if inventory["detected"] and inventory["authoritative"]:
+            self._inventory_result = self.repo.reconcile_subscription_inventory(
+                self.resolver.active_subscription_keys(),
+                utc_now(),
+                authoritative=True,
+            )
+        else:
+            self._inventory_result = {
+                "authoritative": False,
+                "active": len(self.resolver.active_subscription_keys()),
+                "suspect": 0,
+                "retired": 0,
+            }
+        quota_rows = self._import_quota_records(
+            self.resolver.cockpit_account_records()
+        )
+        if not self.database_path.is_file():
+            return {
+                "imported": 0,
+                "scanned": 0,
+                "quota_rows": quota_rows,
+                "database_available": False,
+            }
+
+        with closing(open_sqlite_readonly(self.database_path)) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_logs'"
+            ).fetchone()
+            if table is None:
+                raise ValueError("cockpit_request_logs_missing")
+            available_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(request_logs)")
+            }
+            missing = set(self.REQUEST_COLUMNS) - available_columns
+            if missing:
+                raise ValueError("cockpit_request_logs_schema")
+            maxima = connection.execute(
+                """SELECT COALESCE(MAX(id), 0) AS max_id,
+                          COALESCE(MAX(model_pricing_version), 0) AS max_version
+                     FROM request_logs"""
+            ).fetchone()
+            max_id = as_nonnegative_int(maxima["max_id"]) or 0
+            max_version = as_nonnegative_int(maxima["max_version"]) or 0
+            state = self.repo.local_import_file_state(self.database_path) or {}
+            cursor_id = as_nonnegative_int(state.get("offset")) or 0
+            previous_version = as_nonnegative_int(state.get("size")) or 0
+            if max_id < cursor_id or (state and max_version != previous_version):
+                cursor_id = 0
+            columns = ", ".join(self.REQUEST_COLUMNS)
+            rows = connection.execute(
+                f"SELECT {columns} FROM request_logs WHERE id>? AND id<=? ORDER BY id",
+                (cursor_id, max_id),
+            )
+            imported = 0
+            scanned = 0
+            for sqlite_row in rows:
+                scanned += 1
+                converted = self._event_from_row(dict(sqlite_row))
+                if converted is None:
+                    continue
+                event, import_key = converted
+                if self.repo.sync_imported_event(
+                    event,
+                    import_key,
+                    COCKPIT_TOOLS_REQUEST_SOURCE,
+                ):
+                    imported += 1
+        try:
+            database_mtime = self.database_path.stat().st_mtime_ns
+        except OSError:
+            database_mtime = 0
+        self.repo.save_local_import_file_state(
+            {
+                "path": self.database_path,
+                "size": max_version,
+                "mtime_ns": database_mtime,
+                "offset": max_id,
+            }
+        )
+        return {
+            "imported": imported,
+            "scanned": scanned,
+            "quota_rows": quota_rows,
+            "database_available": True,
+        }
+
+
 class CodexAppLocalImporter:
     """Incrementally import safe usage fields from ChatGPT Codex JSONL files.
 
@@ -6470,7 +7537,15 @@ class CodexQuotaPoller:
         candidates: list[dict[str, Any]] = []
         # A forced scan prevents a just-deleted or just-written local auth file
         # from being hidden behind the resolver's normal 60-second cache.
-        self.resolver.active_subscription_keys(force_refresh=True)
+        resolver_present_keys = self.resolver.active_subscription_keys(
+            force_refresh=True
+        )
+        cockpit_inventory = self.resolver.cockpit_inventory()
+        if (
+            cockpit_inventory.get("detected")
+            and not cockpit_inventory.get("authoritative")
+        ):
+            authoritative = False
         for item in files:
             if not isinstance(item, Mapping):
                 authoritative = False
@@ -6576,6 +7651,10 @@ class CodexQuotaPoller:
                 }
             )
 
+        # A migration can temporarily split the authoritative inventory
+        # across CLIProxyAPI and Cockpit Tools.  Reconcile only their union so
+        # neither collector can retire identities owned by the other.
+        present_keys.update(resolver_present_keys)
         self._inventory_result = self.repo.reconcile_subscription_inventory(
             present_keys,
             fetched_at,
@@ -7042,6 +8121,7 @@ def dashboard_html(
     quota_status: Mapping[str, Any] | None = None,
     codex_app_status: Mapping[str, Any] | None = None,
     account_resolver: AccountResolver | None = None,
+    cockpit_status: Mapping[str, Any] | None = None,
 ) -> str:
     today = repo.token_breakdown("today")
     week = repo.token_breakdown("7d")
@@ -7063,6 +8143,7 @@ def dashboard_html(
     queue_status = queue_status or {}
     quota_status = quota_status or {}
     codex_app_status = codex_app_status or {}
+    cockpit_status = cockpit_status or {}
 
     hero_metrics = "".join(
         f'<article class="hero-card {tone}"><span>{html.escape(label)}</span>'
@@ -7101,7 +8182,7 @@ def dashboard_html(
             (
                 "API 等价成本",
                 fmt_money(all_time["estimated_api_cost_usd"]),
-                "非缓存输入 + 缓存输入 + 输出 · 按官方单价",
+                "非缓存输入 + 缓存输入 + 输出 · 按采集时价格快照",
                 "violet-card",
             ),
             (
@@ -7264,9 +8345,22 @@ def dashboard_html(
         '（非缓存输入 + 输出）。</span></div>'
     )
 
+    cockpit_notice = (
+        '<div class="notice app-import-notice"><b>Cockpit Tools 只读导入</b>'
+        f'<span>已导入 {fmt_int(cockpit_status.get("imported_events"))} 条请求统计；'
+        '账号缓存只在内存中用于身份与额度映射，凭据、请求 ID、错误正文和原始账号 ID 均不落库。'
+        '迁移后请让客户端直连 Cockpit；若同一请求仍先经过 8327，再开启此导入会产生双计数。</span></div>'
+        if cockpit_status.get("enabled")
+        else ""
+    )
+
     collector_ok = queue_status.get("key_loaded") and queue_status.get("last_status") == 200
     quota_ok = quota_status.get("last_success_at") is not None or persisted_quota_accounts > 0
     codex_app_ok = codex_app_status.get("last_success_at") is not None
+    cockpit_ok = (
+        cockpit_status.get("last_success_at") is not None
+        or int(cockpit_status.get("imported_events") or 0) > 0
+    )
     guard_status = queue_status.get("quota_routing_guard")
     guard_status = guard_status if isinstance(guard_status, Mapping) else {}
     guard_enabled = bool(guard_status.get("enabled"))
@@ -7296,6 +8390,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
 <div class="notice app-import-notice"><b>ChatGPT Codex 本地监控</b><span>{html.escape(str(codex_app_status.get('usage_alias') or '本地账号'))} 已完成内存映射；只读取本机会话中的 token_count / rate_limits 元数据，不读取或保存提示词、代码、推理、工具输出和凭据。已自动导入 {fmt_int(codex_app_status.get('imported_events'))} 条，最近扫描 {fmt_local_time(codex_app_status.get('last_import_at'))}。下方“API 等价成本”仅是按模型 API 单价估算，不是 Pro 订阅实际扣款。</span></div>
+{cockpit_notice}
 <details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="codex-13" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><button type="submit">导入并估价</button><p>只接收模型、时间、调用数和 token 统计，不接收备注、提示词或代码。输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。</p></form></details>
 {session_notice}
 <div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
@@ -7309,8 +8404,8 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
-<footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；输入、缓存输入和输出成本分别按对应模型的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
+<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+<footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
 
 
@@ -7342,6 +8437,10 @@ class MeterHTTPServer(ThreadingHTTPServer):
         codex_app_poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
         codex_app_max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
         codex_app_import_enabled: bool = True,
+        cockpit_tools_data_dir: str | Path | None = None,
+        cockpit_tools_localstorage_db: str | Path | None = None,
+        cockpit_tools_poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
+        cockpit_tools_import_enabled: bool = True,
     ):
         super().__init__(address, UsageMeterHandler)
         parsed = urlsplit(upstream)
@@ -7352,6 +8451,11 @@ class MeterHTTPServer(ThreadingHTTPServer):
         self.repo = repo
         self.upstream = parsed
         self.resolver = resolver
+        self.resolver.configure_cockpit_sources(
+            data_dir=cockpit_tools_data_dir,
+            localstorage_db=cockpit_tools_localstorage_db,
+            enabled=cockpit_tools_import_enabled,
+        )
         self.upstream_timeout = upstream_timeout
         self.quota_routing_guard = QuotaRoutingGuard(
             repo,
@@ -7389,6 +8493,31 @@ class MeterHTTPServer(ThreadingHTTPServer):
             max_files=codex_app_max_files,
         )
         self.codex_app_import_enabled = bool(codex_app_import_enabled)
+        self.cockpit_tools_importer = CockpitToolsImporter(
+            repo,
+            resolver,
+            data_dir=cockpit_tools_data_dir,
+            localstorage_db=cockpit_tools_localstorage_db,
+            poll_seconds=cockpit_tools_poll_seconds,
+        )
+        self.cockpit_tools_import_enabled = bool(cockpit_tools_import_enabled)
+
+    def cockpit_tools_status(self) -> dict[str, Any]:
+        if self.cockpit_tools_import_enabled:
+            return self.cockpit_tools_importer.status()
+        return {
+            "enabled": False,
+            "database_available": False,
+            "last_poll_at": None,
+            "last_success_at": None,
+            "last_error_type": None,
+            "last_imported": 0,
+            "last_scanned": 0,
+            "last_quota_rows": 0,
+            "imported_events": self.repo.import_status(
+                COCKPIT_TOOLS_REQUEST_SOURCE
+            ).get("imported_events", 0),
+        }
 
     def start_queue_poller(self) -> None:
         self.queue_poller.start()
@@ -7397,12 +8526,17 @@ class MeterHTTPServer(ThreadingHTTPServer):
         # management queue and must remain active when both are enabled.
         if self.codex_app_import_enabled:
             self.codex_app_importer.start()
+        if self.cockpit_tools_import_enabled:
+            self.cockpit_tools_importer.start()
 
     def start_local_importer(self) -> None:
         if self.codex_app_import_enabled:
             self.codex_app_importer.start()
+        if self.cockpit_tools_import_enabled:
+            self.cockpit_tools_importer.start()
 
     def server_close(self) -> None:
+        self.cockpit_tools_importer.stop()
         self.codex_app_importer.stop()
         self.quota_poller.stop()
         self.queue_poller.stop()
@@ -7459,6 +8593,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     self.meter_server.quota_poller.status(),
                     self.meter_server.codex_app_importer.status(),
                     self.meter_server.resolver,
+                    self.meter_server.cockpit_tools_status(),
                 ).encode("utf-8")
             except Exception as exc:  # dashboard failure must not expose DB internals
                 LOG.error("dashboard rendering failed: %s", type(exc).__name__)
@@ -7489,6 +8624,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     "subscription_quota": self.meter_server.quota_poller.status(),
                     "quota_routing_guard": self.meter_server.quota_routing_guard.status(),
                     "codex_app_local": self.meter_server.codex_app_importer.status(),
+                    "cockpit_tools": self.meter_server.cockpit_tools_status(),
                 }
             ).encode()
             self._send_bytes(
@@ -7956,11 +9092,25 @@ def create_server(
     codex_app_poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
     codex_app_max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
     codex_app_import_enabled: bool = True,
+    cockpit_tools_data_dir: str | Path | None = None,
+    cockpit_tools_localstorage_db: str | Path | None = None,
+    cockpit_tools_poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
+    cockpit_tools_import_enabled: bool = True,
 ) -> MeterHTTPServer:
     repo = UsageRepository(db_path)
     resolver = account_resolver or AccountResolver(
-        enabled=os.environ.get("CLIPROXY_USAGE_ACCOUNT_SCAN", "1").lower() not in {"0", "false", "no"}
+        enabled=os.environ.get("CLIPROXY_USAGE_ACCOUNT_SCAN", "1").lower()
+        not in {"0", "false", "no"},
+        cockpit_tools_data_dir=cockpit_tools_data_dir,
+        cockpit_tools_localstorage_db=cockpit_tools_localstorage_db,
+        cockpit_tools_enabled=cockpit_tools_import_enabled,
     )
+    if account_resolver is not None:
+        resolver.configure_cockpit_sources(
+            data_dir=cockpit_tools_data_dir,
+            localstorage_db=cockpit_tools_localstorage_db,
+            enabled=cockpit_tools_import_enabled,
+        )
     repo.reconcile_auth_identities(resolver)
     repo.apply_privacy_minimization(resolver)
     return MeterHTTPServer(
@@ -7985,6 +9135,10 @@ def create_server(
         codex_app_poll_seconds=codex_app_poll_seconds,
         codex_app_max_files=codex_app_max_files,
         codex_app_import_enabled=codex_app_import_enabled,
+        cockpit_tools_data_dir=cockpit_tools_data_dir,
+        cockpit_tools_localstorage_db=cockpit_tools_localstorage_db,
+        cockpit_tools_poll_seconds=cockpit_tools_poll_seconds,
+        cockpit_tools_import_enabled=cockpit_tools_import_enabled,
     )
 
 
@@ -8137,6 +9291,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable read-only import from local ChatGPT/Codex session metadata",
     )
+    parser.add_argument(
+        "--cockpit-tools-data-dir",
+        default=os.environ.get("COCKPIT_TOOLS_DATA_DIR"),
+        help=(
+            "Cockpit Tools data directory (defaults to ~/.antigravity_cockpit)"
+        ),
+    )
+    parser.add_argument(
+        "--cockpit-tools-localstorage-db",
+        default=os.environ.get("COCKPIT_TOOLS_LOCALSTORAGE_DB"),
+        help="Optional Cockpit WebKit LocalStorage SQLite override",
+    )
+    parser.add_argument(
+        "--cockpit-tools-poll-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "COCKPIT_TOOLS_USAGE_POLL_SECONDS",
+                str(DEFAULT_COCKPIT_TOOLS_POLL_SECONDS),
+            )
+        ),
+        help="Seconds between read-only Cockpit request-log imports",
+    )
+    parser.add_argument(
+        "--no-cockpit-tools-import",
+        action="store_true",
+        help="Disable read-only Cockpit Tools request/quota import",
+    )
     parser.add_argument("--no-usage-queue", action="store_true", help="Disable direct 8317 usage-queue polling")
     parser.add_argument("--cached-input-price", type=float, help="Cached input USD/M; defaults to input price")
     parser.add_argument("--price-source-note", help="Human-readable provenance for a manually supplied price")
@@ -8186,7 +9368,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     repo = UsageRepository(args.db)
-    resolver = AccountResolver(enabled=not args.no_account_scan)
+    resolver = AccountResolver(
+        enabled=not args.no_account_scan,
+        cockpit_tools_data_dir=args.cockpit_tools_data_dir,
+        cockpit_tools_localstorage_db=args.cockpit_tools_localstorage_db,
+        cockpit_tools_enabled=not args.no_cockpit_tools_import,
+    )
     rebound = repo.reconcile_auth_identities(resolver)
     if rebound:
         LOG.info("reconciled %d provisional auth identity event(s)", rebound)
@@ -8218,6 +9405,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             codex_app_poll_seconds=args.codex_app_poll_seconds,
             codex_app_max_files=args.codex_app_max_files,
             codex_app_import_enabled=not args.no_codex_app_import,
+            cockpit_tools_data_dir=args.cockpit_tools_data_dir,
+            cockpit_tools_localstorage_db=args.cockpit_tools_localstorage_db,
+            cockpit_tools_poll_seconds=args.cockpit_tools_poll_seconds,
+            cockpit_tools_import_enabled=not args.no_cockpit_tools_import,
         )
         LOG.info(
             "usage meter listening on http://%s:%d; upstream=%s; db=%s",

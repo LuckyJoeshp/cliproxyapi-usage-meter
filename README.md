@@ -41,10 +41,10 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | Capability | What is tracked |
 | --- | --- |
 | Token accounting | Non-cached input, cached input, output, reasoning subset, and raw API processing |
-| Cost estimation | Official OpenAI short/long-context price sync or reviewed local prices, split by token type |
+| Cost estimation | Collector-frozen per-request prices or official OpenAI short/long-context prices, split by token type |
 | Account behavior | Per-subscription calls, success/failure, models, dates, and token totals |
 | Quota visibility | Read-only 5-hour/week/month snapshots, reset times, cooldowns, and observed floors |
-| Collection paths | Transparent `8327` proxy plus optional destructive-read `8317` usage queue |
+| Collection paths | Transparent `8327` proxy, optional destructive-read `8317` usage queue, and default-on read-only Cockpit Tools import |
 | Dashboard | Inline, dependency-free `/usage` HTML with trend, account, model, and recent-call views |
 | Privacy boundary | Loopback by default; credentials and request metadata discarded; email is memory-only |
 
@@ -74,6 +74,43 @@ credentials. If that alias has no structured member identity, token totals are
 kept anonymous and no quota card is created. A manual usage form is available
 on `/usage` for canonically mapped sessions from another device. Dollar values
 are API-equivalent estimates, not Pro subscription billing.
+
+### Migrate traffic to Cockpit Tools
+
+The Cockpit Tools collector is enabled by default. It opens Cockpit's request
+log database read-only and imports `request_logs` rows into the same dashboard
+with `source=cockpit_tools`. Set `COCKPIT_TOOLS_DATA_DIR` or pass
+`--cockpit-tools-data-dir /path/to/cockpit-data` to select the data directory;
+otherwise it looks for
+`~/.antigravity_cockpit/codex_local_access_logs.sqlite`. An existing database
+with an empty `request_logs` table is a normal initial state, not a startup
+error.
+
+On macOS the meter also auto-discovers Cockpit's WebKit accounts cache for
+identity and quota mapping. Use
+`COCKPIT_TOOLS_LOCALSTORAGE_DB` or
+`--cockpit-tools-localstorage-db /path/to/cockpit-webkit/localstorage.sqlite3`
+to override that discovery. Only allowlisted identity/quota fields are
+extracted: credentials and raw account-cache records are never copied into the
+meter database. Imported requests retain Cockpit's cache-read/cache-write token
+breakdown and frozen input/cache/output price snapshot, so historical totals do
+not follow later meter price syncs. If Cockpit increments its pricing version
+and rewrites those snapshots, the same imported rows are updated in place
+without being counted twice.
+
+For migration, point request traffic directly at Cockpit Tools and keep this
+meter running only to import Cockpit data and serve
+<http://127.0.0.1:8327/usage>. Tune the importer with
+`COCKPIT_TOOLS_USAGE_POLL_SECONDS` or
+`--cockpit-tools-poll-seconds SECONDS`, or disable it with
+`--no-cockpit-tools-import`. Sanitized importer state is available at
+<http://127.0.0.1:8327/healthz>.
+
+> **Double-count warning:** if clients send the same requests through `8327`
+> with Cockpit Tools configured as its upstream while Cockpit import remains
+> enabled, the meter sees both the proxied request and Cockpit's log row. Route
+> clients directly to Cockpit, or add `--no-cockpit-tools-import` when using
+> `8327` as that proxy path.
 
 ### Start Codex through CLIProxyAPI from any folder
 
