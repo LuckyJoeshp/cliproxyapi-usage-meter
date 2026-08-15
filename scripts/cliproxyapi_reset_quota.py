@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clear one confirmed CLIProxyAPI quota cooldown through its management API.
+"""Clear one or all confirmed CLIProxyAPI quota cooldowns through its management API.
 
 The helper never edits or deletes ``.cds`` files directly.  It resolves an
 exact local Codex alias, auth filename, auth id, or auth index and calls the
@@ -322,12 +322,88 @@ def print_locked_credentials(
         print(f"- {missing} additional guard lock(s) are waiting for their credential inventory")
 
 
+def confirmed_lock_targets(
+    files: Iterable[Mapping[str, Any]],
+    guard_locks: Mapping[str, GuardLock],
+) -> list[Mapping[str, Any]]:
+    """Resolve every confirmed official or guard-owned lock before mutation."""
+
+    targets: list[Mapping[str, Any]] = []
+    seen_indexes: set[str] = set()
+    for item in files:
+        raw_index = item.get("auth_index") or item.get("authIndex")
+        index_hint = raw_index.strip() if isinstance(raw_index, str) else ""
+        deadline = quota_lock_deadline(item)
+        if deadline is None and index_hint not in guard_locks:
+            continue
+        index = auth_index(item)
+        if index in seen_indexes:
+            raise QuotaResetError("confirmed quota inventory contains a duplicate auth_index")
+        seen_indexes.add(index)
+        targets.append(item)
+    missing = set(guard_locks) - seen_indexes
+    if missing:
+        raise QuotaResetError(
+            f"{len(missing)} guard lock(s) could not be resolved in the current credential inventory"
+        )
+    return targets
+
+
+def clear_confirmed_lock(
+    parsed_base: SplitResult,
+    key: str,
+    item: Mapping[str, Any],
+    guard_locks: dict[str, GuardLock],
+    state_file: str | Path,
+    *,
+    timeout: float,
+) -> None:
+    index = auth_index(item)
+    guard_lock = guard_locks.get(index)
+    if quota_lock_deadline(item) is None and guard_lock is None:
+        raise QuotaResetError("matched credential is not in a confirmed quota cooldown")
+    status, response_payload = management_request(
+        parsed_base,
+        key,
+        "POST",
+        "/v0/management/reset-quota",
+        {"auth_index": index},
+        timeout=timeout,
+    )
+    if (
+        status != 200
+        or not isinstance(response_payload, Mapping)
+        or response_payload.get("status") != "ok"
+    ):
+        raise QuotaResetError(f"quota reset failed (HTTP {status})")
+    if guard_lock is not None:
+        restore_guard_weight(
+            parsed_base,
+            key,
+            item,
+            guard_lock,
+            guard_locks,
+            state_file,
+            timeout=timeout,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("selector", nargs="?", help="Exact codex-N alias, auth filename, auth id, or auth_index")
     parser.add_argument("--list", action="store_true", help="List confirmed quota locks without changing them")
+    parser.add_argument(
+        "--all",
+        dest="all_locked",
+        action="store_true",
+        help="Clear every confirmed official cooldown and guard-owned routing lock",
+    )
     parser.add_argument("--show-names", action="store_true", help="Show auth filenames for locked records without codex-N aliases")
-    parser.add_argument("--dry-run", action="store_true", help="Resolve and validate the selected lock without clearing it")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and validate the selected lock or batch without clearing it",
+    )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Loopback CLIProxyAPI management origin")
     parser.add_argument(
         "--management-key-file",
@@ -358,11 +434,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.list and args.selector:
-        print("--list does not accept a selector", file=sys.stderr)
+    action_count = int(bool(args.selector)) + int(args.list) + int(args.all_locked)
+    if action_count > 1:
+        print("selector, --list, and --all are mutually exclusive", file=sys.stderr)
         return 2
-    if not args.list and not args.selector:
-        print("a selector is required unless --list is used", file=sys.stderr)
+    if action_count == 0:
+        print("a selector, --list, or --all is required", file=sys.stderr)
         return 2
     try:
         parsed_base = parse_loopback_base_url(args.base_url)
@@ -391,6 +468,25 @@ def main(argv: list[str] | None = None) -> int:
                 guard_locks=guard_locks,
             )
             return 0
+        if args.all_locked:
+            targets = confirmed_lock_targets(files, guard_locks)
+            if args.dry_run:
+                print(
+                    "dry-run: "
+                    f"{len(targets)} confirmed quota cooldown(s) would be cleared"
+                )
+                return 0
+            for target in targets:
+                clear_confirmed_lock(
+                    parsed_base,
+                    key,
+                    target,
+                    guard_locks,
+                    args.quota_guard_state_file,
+                    timeout=args.timeout,
+                )
+            print(f"confirmed quota cooldowns cleared: {len(targets)}")
+            return 0
         target = select_target(files, args.selector, resolver)
         deadline = quota_lock_deadline(target)
         index = auth_index(target)
@@ -404,26 +500,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"current retry deadline is {effective_deadline}"
             )
             return 0
-        status, response_payload = management_request(
+        clear_confirmed_lock(
             parsed_base,
             key,
-            "POST",
-            "/v0/management/reset-quota",
-            {"auth_index": index},
+            target,
+            guard_locks,
+            args.quota_guard_state_file,
             timeout=args.timeout,
         )
-        if status != 200 or not isinstance(response_payload, Mapping) or response_payload.get("status") != "ok":
-            raise QuotaResetError(f"quota reset failed (HTTP {status})")
-        if guard_lock is not None:
-            restore_guard_weight(
-                parsed_base,
-                key,
-                target,
-                guard_lock,
-                guard_locks,
-                args.quota_guard_state_file,
-                timeout=args.timeout,
-            )
         print("confirmed quota cooldown cleared")
         return 0
     except (QuotaResetError, QuotaGuardError) as exc:

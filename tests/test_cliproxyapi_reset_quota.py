@@ -196,6 +196,113 @@ class CLIProxyQuotaResetTest(unittest.TestCase):
             )
             self.assertEqual(guard.load_guard_locks(state_path), {})
 
+    def test_all_clears_official_and_guard_locks_in_one_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "guard-locks.json"
+            official_item = locked_item("official.json", "official-index")
+            guard_item = locked_item("guard.json", "guard-index")
+            guard_item["unavailable"] = False
+            guard_item.pop("next_retry_after")
+            guard_item["status_message"] = ""
+            guard_item["weight"] = 0
+            lock = guard.GuardLock(
+                auth_index="guard-index",
+                identity_key="subscription:" + "b" * 64,
+                locked_until="2030-01-02T03:04:05Z",
+                locked_at="2030-01-01T00:00:00Z",
+                original_weight=None,
+            )
+            guard.save_guard_locks(state_path, {lock.auth_index: lock})
+            requests: list[tuple[str, str, object]] = []
+
+            def fake_request(parsed, key, method, path, payload=None, *, timeout=10.0):
+                del parsed, key, timeout
+                requests.append((method, path, payload))
+                if method == "GET":
+                    return 200, {"files": [official_item, guard_item]}
+                return 200, {"status": "ok"}
+
+            fake_resolver = FakeResolver(
+                {"official.json": "codex-1", "guard.json": "codex-2"}
+            )
+            with mock.patch.object(
+                reset, "load_management_key", return_value="fixture-key"
+            ), mock.patch.object(
+                reset, "management_request", side_effect=fake_request
+            ), mock.patch.object(
+                reset, "AccountResolver", return_value=fake_resolver
+            ), mock.patch(
+                "builtins.print"
+            ):
+                code = reset.main(
+                    [
+                        "--all",
+                        "--quota-guard-state-file",
+                        str(state_path),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                requests,
+                [
+                    ("GET", "/v0/management/auth-files", None),
+                    (
+                        "POST",
+                        "/v0/management/reset-quota",
+                        {"auth_index": "official-index"},
+                    ),
+                    (
+                        "POST",
+                        "/v0/management/reset-quota",
+                        {"auth_index": "guard-index"},
+                    ),
+                    (
+                        "PATCH",
+                        "/v0/management/auth-files/fields",
+                        {"name": "guard.json", "weight": None},
+                    ),
+                ],
+            )
+            self.assertEqual(guard.load_guard_locks(state_path), {})
+
+    def test_all_fails_before_writes_when_guard_inventory_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "guard-locks.json"
+            lock = guard.GuardLock(
+                auth_index="missing-index",
+                identity_key="subscription:" + "c" * 64,
+                locked_until="2030-01-02T03:04:05Z",
+                locked_at="2030-01-01T00:00:00Z",
+                original_weight=None,
+            )
+            guard.save_guard_locks(state_path, {lock.auth_index: lock})
+            requests: list[tuple[str, str, object]] = []
+
+            def fake_request(parsed, key, method, path, payload=None, *, timeout=10.0):
+                del parsed, key, payload, timeout
+                requests.append((method, path, None))
+                return 200, {"files": []}
+
+            with mock.patch.object(
+                reset, "load_management_key", return_value="fixture-key"
+            ), mock.patch.object(
+                reset, "management_request", side_effect=fake_request
+            ), mock.patch.object(
+                reset, "AccountResolver", return_value=FakeResolver({})
+            ), mock.patch(
+                "builtins.print"
+            ):
+                code = reset.main(
+                    [
+                        "--all",
+                        "--quota-guard-state-file",
+                        str(state_path),
+                    ]
+                )
+            self.assertEqual(code, 3)
+            self.assertEqual(requests, [("GET", "/v0/management/auth-files", None)])
+            self.assertIn("missing-index", guard.load_guard_locks(state_path))
+
 
 if __name__ == "__main__":
     unittest.main()

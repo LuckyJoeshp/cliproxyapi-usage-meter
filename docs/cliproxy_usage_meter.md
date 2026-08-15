@@ -91,10 +91,14 @@ token 或 management key。提前恢复额度时运行：
 ```bash
 python3 scripts/cliproxyapi_reset_quota.py --list
 python3 scripts/cliproxyapi_reset_quota.py codex-1
+python3 scripts/cliproxyapi_reset_quota.py --all --dry-run
+python3 scripts/cliproxyapi_reset_quota.py --all
 ```
 
-该工具会同时清除官方 cooldown 和守卫 weight，不删除 `.cds`。额度卡分别显示“上游报告
-0%”“上游 0% · 实测可用”和“已确认耗尽 · 冷却中”，避免把百分比取整误认为真实封禁。
+`--all` 只处理官方 cooldown 或守卫已经确认的锁，并在任何写入前核对完整 guard inventory；
+它也能覆盖没有 `codex-N` alias 的凭证。该工具会同时清除官方 cooldown 和守卫 weight，
+不删除 `.cds`。额度卡分别显示“上游报告 0%”“上游 0% · 实测可用”和“已确认耗尽 · 冷却中”，
+避免把百分比取整误认为真实封禁。
 
 如果 Chrome 已经保持 management 页面登录状态，可用本机专用启动器（凭据只在内存中
 传给 sidecar，不写入 key 文件）：

@@ -145,6 +145,13 @@ CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
 
 CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
   python3 scripts/cliproxyapi_reset_quota.py codex-1
+
+# After confirming the whole Codex pool reset early, preview and clear every
+# confirmed official/guard lock, including credentials without a codex-N alias.
+CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
+  python3 scripts/cliproxyapi_reset_quota.py --all --dry-run
+CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
+  python3 scripts/cliproxyapi_reset_quota.py --all
 ```
 
 The helper clears both CLIProxyAPI's official quota cooldown and any guard-owned
@@ -152,9 +159,10 @@ weight-zero lock, so it is also the early-reset path. The key file must be mode
 `0600`. An explicitly requested `--from-chrome`
 fallback can reuse the existing local management session without printing or
 persisting its key. The helper refuses remote management origins, ambiguous
-aliases, and credentials that are not currently in a confirmed quota
-cooldown; it calls `POST /v0/management/reset-quota` and never deletes `.cds`
-files directly.
+aliases, and credentials that are not currently in a confirmed quota cooldown.
+Batch mode prevalidates the complete guard inventory before changing anything,
+then calls `POST /v0/management/reset-quota` only for confirmed locks; it never
+deletes `.cds` files directly.
 
 The usage dashboard labels these states separately: `上游报告 0%`,
 `上游 0% · 实测可用` after the latest execution still returned 200, and
