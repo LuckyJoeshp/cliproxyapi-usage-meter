@@ -141,6 +141,24 @@ fail-closed，不会盲目覆盖。
 Cockpit 的 WAL/SHM 短暂切换不会触发版本拒收：脚本会优先用正常只读快照，只有在没有未提交
 日志时才使用 immutable 只读视图；检测到活动日志则 fail-closed，稍后重复运行即可。
 
+### 用 `codex-cockpit` 连接 Cockpit Tools API
+
+`scripts/codex-cockpit` 复用 `codex-cliproxyapi` 的 `cliproxy` 基础 profile，启动时只覆盖
+当前 Cockpit API Service 的 loopback base URL 和动态 auth command。相邻的
+`scripts/cockpit-tools-api` 从 `codex_local_access.json` 读取端口与 key，并在内存中探测
+`/v1/models`；key 不会写入仓库、profile 或日志。Cockpit 变更端口、轮换 key 或增加状态
+字段时，下一次启动会自动读取新能力，不按应用版本号拒收。
+
+```bash
+install -m 755 scripts/codex-cockpit scripts/cockpit-tools-api \
+  scripts/cockpit_tools_api.py /opt/homebrew/bin/
+codex-cockpit
+```
+
+默认读取 `~/.antigravity_cockpit`，可用 `COCKPIT_TOOLS_DATA_DIR` 覆盖；仅在排查服务启动
+竞态时使用 `COCKPIT_CODEX_SKIP_HEALTHCHECK=1`。helper 只接受 loopback host，避免把本地
+API key 发送到 LAN 或远程地址。
+
 ### 确认耗尽后的持久路由锁（可选）
 
 CLIProxyAPI 7.2.130 在 `usage_limit_reached` 没有携带 reset hint 时，会从 1 秒开始

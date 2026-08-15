@@ -1,0 +1,63 @@
+#!/bin/zsh
+set -euo pipefail
+
+# Start Codex through Cockpit Tools' local, authenticated API service while
+# retaining the verified CLIProxyAPI profile as the base configuration.  The
+# endpoint and auth command are supplied at launch time, so Cockpit port/key
+# changes do not require a checked-in or hand-edited Codex profile.
+SCRIPT_DIR="${0:A:h}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+COCKPIT_CODEX_PROFILE="${COCKPIT_CODEX_PROFILE:-cliproxy}"
+export CODEX_HOME
+
+if [[ -n "${CODEX_BIN:-}" && -x "$CODEX_BIN" ]]; then
+  :
+elif (( $+commands[codex] )); then
+  CODEX_BIN="$commands[codex]"
+else
+  print -u2 "codex-cockpit: cannot find the codex executable in PATH"
+  exit 127
+fi
+
+PROFILE_FILE="$CODEX_HOME/${COCKPIT_CODEX_PROFILE}.config.toml"
+if [[ ! -f "$PROFILE_FILE" ]]; then
+  print -u2 "codex-cockpit: missing $PROFILE_FILE"
+  print -u2 "Set COCKPIT_CODEX_PROFILE to a Codex profile based on codex-cliproxyapi."
+  exit 78
+fi
+
+API_HELPER="$SCRIPT_DIR/cockpit-tools-api"
+if [[ ! -x "$API_HELPER" ]]; then
+  print -u2 "codex-cockpit: missing executable $API_HELPER"
+  print -u2 "Install codex-cockpit together with cockpit-tools-api."
+  exit 78
+fi
+
+# Codex executes provider auth commands through the inherited PATH.  Keeping
+# the helper beside this launcher also makes a copied /opt/homebrew/bin pair
+# self-contained, without embedding a user-specific absolute path in config.
+export PATH="$SCRIPT_DIR:$PATH"
+
+if [[ "${COCKPIT_CODEX_SKIP_HEALTHCHECK:-0}" != "1" ]]; then
+  "$API_HELPER" --check
+fi
+
+# The verified base profile uses the cliproxyapi provider.  These overrides
+# leave its model/sandbox/retry settings intact while replacing only the
+# endpoint and runtime auth command.  The API helper reads Cockpit's current
+# key on every Codex auth refresh, including after key rotation.
+COCKPIT_BASE_URL="$($API_HELPER --endpoint)"
+COCKPIT_PROVIDER="${COCKPIT_CODEX_PROVIDER:-cliproxyapi}"
+if [[ ! "$COCKPIT_PROVIDER" =~ '^[A-Za-z0-9_-]+$' ]]; then
+  print -u2 "codex-cockpit: invalid provider name"
+  exit 78
+fi
+
+exec "$CODEX_BIN" \
+  --profile "$COCKPIT_CODEX_PROFILE" \
+  --strict-config \
+  --no-alt-screen \
+  -c "model_provider=\"$COCKPIT_PROVIDER\"" \
+  -c "model_providers.$COCKPIT_PROVIDER.base_url=\"$COCKPIT_BASE_URL\"" \
+  -c "model_providers.$COCKPIT_PROVIDER.auth.command=\"cockpit-tools-api --token\"" \
+  "$@"

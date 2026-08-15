@@ -161,6 +161,34 @@ The command uses the current directory as Codex's workspace. It does not embed
 `127.0.0.1:8317`; the existing `~/.codex/cliproxy.config.toml` profile supplies
 the endpoint and reads the bearer key at runtime.
 
+### Start Codex through Cockpit Tools API Service
+
+The repository also includes [`scripts/codex-cockpit`](scripts/codex-cockpit).
+It layers the same `cliproxy` profile used above, then replaces only the
+provider endpoint and auth command for the current Cockpit Tools API Service.
+At each launch it reads `codex_local_access.json`, probes the authenticated
+`/v1/models` endpoint with proxy bypass for loopback, and reads the current key
+again whenever Codex refreshes credentials. Port changes, API-key rotation,
+and additional Cockpit state fields therefore do not require editing a Codex
+profile or this repository; no application-version comparison is used.
+
+Install the launcher and its sibling helper together:
+
+```bash
+install -m 755 scripts/codex-cockpit scripts/cockpit-tools-api \
+  scripts/cockpit_tools_api.py /opt/homebrew/bin/
+cd /path/to/any/project
+codex-cockpit
+```
+
+Cockpit Tools' Codex API Service must be enabled and listening on its local
+loopback endpoint. The launcher keeps the caller's working directory and
+passes all arguments to Codex. `COCKPIT_TOOLS_DATA_DIR` selects a non-default
+Cockpit data directory, `COCKPIT_CODEX_PROFILE` selects another base profile,
+and `COCKPIT_CODEX_SKIP_HEALTHCHECK=1` is available for troubleshooting only.
+`COCKPIT_TOOLS_API_URL` can override the endpoint for a loopback-only test;
+the helper refuses LAN/remote URLs so the Cockpit key is not sent elsewhere.
+
 ### Avoid repeated probes of confirmed exhausted credentials
 
 Treat a provider-reported `0%` as telemetry, not a routing lock: Codex can
