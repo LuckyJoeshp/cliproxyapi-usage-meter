@@ -238,9 +238,20 @@ streaming 或 usage 缺失。队列事件的 `source` 为 `usage_queue`，显式
 
 ### ChatGPT App 直登 Codex 的本地监控
 
-个人 ChatGPT/Pro 直登模式不经过 8327/8317，因此代理无法从网络流量中看到请求；也没有面向个人订阅的公开 token 账单 API。当前版本会额外只读扫描 `CODEX_APP_HOME`（默认 `~/.codex`）下 Codex 会话 JSONL 的 `event_msg.token_count` 元数据，并要求其本地账号与 `CODEX_APP_USAGE_ALIAS`（默认 `codex-13`）的 `auth.json` workspace 一致。仅保存 input/cached/output/reasoning/total token、模型、时间和额度窗口；提示词、代码、工具输出、JWT/API key 永不写入数据库。只有 alias 能从结构化邮箱/JWT principal 形成 canonical 订阅身份时才写入对应额度卡；仅有 workspace/account ID 的稀疏旧 auth 会把 token 记为匿名 `unknown`，并跳过额度快照。导入事件的 `source` 为 `codex_app_local`，重复扫描是幂等的。
+个人 ChatGPT/Pro 直登模式不经过 8327/8317，因此代理无法从网络流量中看到请求；也没有面向个人订阅的公开 token 账单 API。当前版本会额外只读扫描 `CODEX_APP_HOME`（默认 `~/.codex`）下 Codex 会话 JSONL 的 `event_msg.token_count` 元数据，并默认从 `~/.antigravity_cockpit/codex_instances.json` 自动发现 Cockpit Codex 多开实例的 `userDataDir`。候选目录在解析符号链接后必须仍位于当前用户 home 内；重复目录会去重，一个实例无 auth、损坏或越界不会阻断其他实例。
 
-启动 sidecar 时默认开启：
+默认动态模式直接从每个 home 当前的 `auth.json` 解析 canonical 订阅身份。首次发现 home、首次发现此前没有游标的 JSONL，或检测到账号切换时，导入器先把对应现有 JSONL 推进到文件尾，建立安全边界而不回填；只有边界后新增的记录才归入当前账号。这样不会把切换前尚未扫描的旧会话、后来进入 500 文件扫描窗口的历史文件或外部复制进来的会话猜给当前账号。绑定时间线在 SQLite 中只保存 home 路径 HMAC、身份绑定 HMAC 和时间，不保存真实路径、邮箱、账号 ID 或 token。扫描期间若 auth 文件变化，本轮结果会丢弃并在下一轮重新建立边界。
+
+仅保存 input/cached/output/reasoning/total token、模型、时间和额度窗口；提示词、代码、工具输出、JWT/API key 永不写入数据库。能由结构化邮箱/JWT principal 形成 canonical 订阅身份时才写入对应额度卡；仅有 workspace/account ID 的稀疏旧 auth 会把 token 记为匿名 `unknown`，并跳过额度快照。导入事件的 `source` 为 `codex_app_local`，重复扫描是幂等的。
+
+启动 sidecar 时默认开启动态模式：
+
+```bash
+CODEX_APP_HOME="$HOME/.codex" \
+scripts/start_cliproxy_usage_meter.sh
+```
+
+只有需要旧版的固定账号严格匹配时才显式配置 alias；此模式只扫描指定的 `CODEX_APP_HOME`，并继续拒绝 workspace 或成员不一致的 auth：
 
 ```bash
 CODEX_APP_HOME="$HOME/.codex" \
@@ -250,7 +261,7 @@ scripts/start_cliproxy_usage_meter.sh
 
 为避免每次轮询重读很大的历史目录，默认只扫描最近修改的 500 个 JSONL，并持久化每个文件的读取 offset；未变化文件不会重读，增长中的活动会话只读取追加部分。可用 `CODEX_APP_USAGE_MAX_FILES` 或 `--codex-app-max-files` 调整范围。
 
-若需要关闭本地日志导入，可增加 `--no-codex-app-import`。跨设备或日志缺失时，`/usage` 页面中的“手动补录用量”折叠表单会写入 `manual_codex_app` 事件；它只接受已经形成 canonical 订阅身份的 alias，避免凭 workspace 或单一历史账号猜归属。页面中的美元数字是按已配置 OpenAI API 单价计算的 API 等价估算，不代表 Pro 订阅实际扣款或剩余额度；订阅额度仍以 ChatGPT/Codex 产品界面为准。
+若需要关闭本地日志导入，可增加 `--no-codex-app-import`。跨设备或日志缺失时，固定 alias 模式下 `/usage` 页面中的“手动补录用量”折叠表单会写入 `manual_codex_app` 事件；动态模式没有安全、可读的固定 alias 选择器，因此隐藏该表单。手动补录只接受已经形成 canonical 订阅身份的 alias，避免凭 workspace 或单一历史账号猜归属。页面中的美元数字是按已配置 OpenAI API 单价计算的 API 等价估算，不代表 Pro 订阅实际扣款或剩余额度；订阅额度仍以 ChatGPT/Codex 产品界面为准。
 
 - Responses：`input_tokens` / `output_tokens` / `cached_tokens` / `reasoning_tokens` / `total_tokens`
 - Chat Completions：`prompt_tokens` / `completion_tokens` 及对应 details

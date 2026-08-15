@@ -68,13 +68,14 @@ DEFAULT_QUOTA_POLL_SECONDS = 300.0
 DEFAULT_QUOTA_POLL_TIMEOUT = 20.0
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_CODEX_APP_HOME = Path.home() / ".codex"
-DEFAULT_CODEX_APP_ALIAS = "codex-13"
+DEFAULT_CODEX_APP_ALIAS: str | None = None
 DEFAULT_CODEX_APP_POLL_SECONDS = 15.0
 MAX_CODEX_APP_JSONL_BYTES = 128 * 1024 * 1024
 DEFAULT_CODEX_APP_MAX_FILES = 500
 DEFAULT_COCKPIT_TOOLS_DATA_DIR = Path.home() / ".antigravity_cockpit"
 COCKPIT_TOOLS_LOG_DB_NAME = "codex_local_access_logs.sqlite"
 COCKPIT_TOOLS_ACCOUNTS_INDEX_NAME = "codex_accounts.json"
+COCKPIT_TOOLS_CODEX_INSTANCES_NAME = "codex_instances.json"
 COCKPIT_TOOLS_ACCOUNT_CACHE_KEY = "agtools.codex.accounts.cache"
 DEFAULT_COCKPIT_TOOLS_POLL_SECONDS = 15.0
 MAX_COCKPIT_TOOLS_CACHE_BYTES = 16 * 1024 * 1024
@@ -2399,6 +2400,13 @@ class UsageRepository:
                   updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS local_import_bindings (
+                  home_key TEXT PRIMARY KEY,
+                  binding_key TEXT NOT NULL,
+                  bound_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS anonymous_usage_daily (
                   bucket_start TEXT NOT NULL,
                   model TEXT NOT NULL,
@@ -2536,6 +2544,8 @@ class UsageRepository:
                   ON local_import_records(source, imported_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_local_import_files_updated
                   ON local_import_files(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_local_import_bindings_updated
+                  ON local_import_bindings(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_anonymous_usage_daily_bucket
                   ON anonymous_usage_daily(bucket_start);
                 CREATE INDEX IF NOT EXISTS idx_active_subscription_registry_state
@@ -4576,6 +4586,27 @@ class UsageRepository:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def local_import_file_states(
+        self,
+        paths: Sequence[Path | str],
+    ) -> list[dict[str, Any] | None]:
+        """Load many opaque file cursors with bounded SQLite parameter batches."""
+
+        path_keys = [self._local_import_path_key(path) for path in paths]
+        rows_by_key: dict[str, dict[str, Any]] = {}
+        with self.connect() as conn:
+            for start in range(0, len(path_keys), 500):
+                batch = path_keys[start : start + 500]
+                if not batch:
+                    continue
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"SELECT * FROM local_import_files WHERE path IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                rows_by_key.update((str(row["path"]), dict(row)) for row in rows)
+        return [rows_by_key.get(path_key) for path_key in path_keys]
+
     def save_local_import_file_state(self, state: Mapping[str, Any]) -> None:
         raw_path = safe_text(state.get("path"), 4096)
         values = {
@@ -4609,6 +4640,42 @@ class UsageRepository:
                      model_provider=excluded.model_provider, model=excluded.model,
                      turn_id=excluded.turn_id, updated_at=excluded.updated_at""",
                 values,
+            )
+
+    def local_import_binding(self, home_key: str) -> dict[str, Any] | None:
+        """Return one opaque Codex-home/account binding timeline entry."""
+
+        if not re.fullmatch(r"home:[0-9a-f]{32}", home_key):
+            raise ValueError("invalid local import home key")
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM local_import_bindings WHERE home_key=?",
+                (home_key,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_local_import_binding(self, home_key: str, binding_key: str) -> None:
+        """Persist only keyed digests proving the currently observed binding."""
+
+        if not re.fullmatch(r"home:[0-9a-f]{32}", home_key):
+            raise ValueError("invalid local import home key")
+        if not re.fullmatch(r"binding:[0-9a-f]{32}", binding_key):
+            raise ValueError("invalid local import binding key")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO local_import_bindings
+                   (home_key, binding_key, bound_at, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(home_key) DO UPDATE SET
+                     binding_key=excluded.binding_key,
+                     bound_at=CASE
+                       WHEN local_import_bindings.binding_key=excluded.binding_key
+                       THEN local_import_bindings.bound_at
+                       ELSE excluded.bound_at
+                     END,
+                     updated_at=excluded.updated_at""",
+                (home_key, binding_key, now, now),
             )
 
     def record_quota_hit(
@@ -7043,14 +7110,33 @@ class CockpitToolsImporter:
         }
 
 
-class CodexAppLocalImporter:
-    """Incrementally import safe usage fields from ChatGPT Codex JSONL files.
+@dataclass
+class CodexAppFileScan:
+    ok: bool
+    state: dict[str, Any] | None
+    events: list[tuple[UsageEvent, str]]
+    quota_snapshots: list[dict[str, Any]]
 
-    Only ``session_meta``, ``turn_context``, ``task_started`` and
-    ``token_count`` metadata is inspected.  Message, reasoning and tool payloads
-    are ignored and never persisted.  Direct OpenAI sessions are selected by
-    ``model_provider=openai`` and matched to the configured alias by local
-    account id, preventing CLIProxyAPI sessions from being double counted.
+
+@dataclass(frozen=True)
+class CodexAppHomeContext:
+    identity: AccountIdentity
+    usage_alias: str | None
+    default_plan: str | None
+    active_until: str | None
+    binding_key: str
+    auth_signature: tuple[int, int, int, int]
+
+
+class CodexAppLocalImporter:
+    """Incrementally import safe usage fields from local Codex JSONL files.
+
+    Dynamic mode follows the current auth identity in the configured Codex
+    home and every Cockpit Codex instance. A keyed, opaque per-home binding is
+    persisted so an account switch first advances file cursors to a safe
+    boundary; records that predate that boundary are never guessed to belong
+    to the newly selected account. Supplying an explicit alias retains the
+    original strict single-home matching mode.
     """
 
     def __init__(
@@ -7058,14 +7144,14 @@ class CodexAppLocalImporter:
         repo: UsageRepository,
         resolver: AccountResolver,
         codex_home: Path | str = DEFAULT_CODEX_APP_HOME,
-        alias: str = DEFAULT_CODEX_APP_ALIAS,
+        alias: str | None = DEFAULT_CODEX_APP_ALIAS,
         poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
         max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
     ) -> None:
         self.repo = repo
         self.resolver = resolver
         self.codex_home = Path(codex_home).expanduser().resolve()
-        self.alias = safe_alias(alias) or DEFAULT_CODEX_APP_ALIAS
+        self.alias = safe_alias(alias)
         self.poll_seconds = max(5.0, float(poll_seconds))
         self.max_files = max(1, min(int(max_files), 10_000))
         self._stop = threading.Event()
@@ -7075,6 +7161,11 @@ class CodexAppLocalImporter:
         self._last_error_type: str | None = None
         self._last_imported = 0
         self._last_scanned_files = 0
+        self._last_baselined_files = 0
+        self._discovered_homes = 0
+        self._matched_homes = 0
+        self._failed_homes = 0
+        self._rejected_homes = 0
         self._account_match: bool | None = None
         self._member_match: bool | None = None
 
@@ -7097,26 +7188,54 @@ class CodexAppLocalImporter:
         return {
             "enabled": True,
             "codex_home_configured": True,
+            "account_mode": "fixed" if self.alias else "dynamic",
             "usage_alias": self.alias,
             "account_match": self._account_match,
             "member_match": self._member_match,
+            "discovered_homes": self._discovered_homes,
+            "matched_homes": self._matched_homes,
+            "failed_homes": self._failed_homes,
+            "rejected_homes": self._rejected_homes,
             "last_poll_at": self._last_poll_at,
             "last_success_at": self._last_success_at,
             "last_error_type": self._last_error_type,
             "last_imported": self._last_imported,
             "last_scanned_files": self._last_scanned_files,
+            "last_baselined_files": self._last_baselined_files,
             **persisted,
         }
+
+    def _remember_result(self, result: Mapping[str, Any]) -> None:
+        self._last_imported = as_nonnegative_int(result.get("imported")) or 0
+        self._last_scanned_files = (
+            as_nonnegative_int(result.get("scanned_files")) or 0
+        )
+        self._last_baselined_files = (
+            as_nonnegative_int(result.get("baselined_files")) or 0
+        )
+        self._discovered_homes = (
+            as_nonnegative_int(result.get("discovered_homes")) or 0
+        )
+        self._matched_homes = as_nonnegative_int(result.get("matched_homes")) or 0
+        self._failed_homes = as_nonnegative_int(result.get("failed_homes")) or 0
+        self._rejected_homes = as_nonnegative_int(result.get("rejected_homes")) or 0
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 result = self.import_once()
                 self._last_poll_at = utc_now()
-                self._last_success_at = self._last_poll_at
-                self._last_error_type = None
-                self._last_imported = result["imported"]
-                self._last_scanned_files = result["scanned_files"]
+                if self._matched_homes:
+                    self._last_success_at = self._last_poll_at
+                if self._failed_homes or self._rejected_homes:
+                    self._last_error_type = (
+                        "PartialHomeFailure"
+                        if self._matched_homes
+                        else "CodexHomeUnavailable"
+                    )
+                else:
+                    self._last_error_type = None
+                self._remember_result(result)
             except Exception as exc:
                 self._last_poll_at = utc_now()
                 self._last_error_type = type(exc).__name__
@@ -7186,7 +7305,153 @@ class CodexAppLocalImporter:
             total_tokens=as_nonnegative_int(raw.get("total_tokens")),
         )
 
+    @staticmethod
+    def _is_within(path: Path, root: Path) -> bool:
+        return path == root or root in path.parents
+
+    def _discover_homes(self) -> tuple[list[Path], int]:
+        candidates: list[Path | str] = [self.codex_home]
+        if self.alias is None:
+            store = AccountResolver._read_json(
+                self.resolver.cockpit_tools_data_dir
+                / COCKPIT_TOOLS_CODEX_INSTANCES_NAME
+            )
+            instances = store.get("instances") if isinstance(store, Mapping) else None
+            if isinstance(instances, list):
+                for item in instances[:1000]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    raw_home = safe_text(item.get("userDataDir"), 4096)
+                    if raw_home:
+                        candidates.append(raw_home)
+
+        try:
+            user_home = self.resolver.home.expanduser().resolve()
+        except OSError:
+            return [], len(candidates)
+        homes: list[Path] = []
+        seen: set[Path] = set()
+        rejected = 0
+        for candidate in candidates:
+            try:
+                raw = Path(candidate).expanduser()
+                if not raw.is_absolute():
+                    raise ValueError("Codex home must be absolute")
+                resolved = raw.resolve()
+            except (OSError, RuntimeError, ValueError):
+                rejected += 1
+                continue
+            if not self._is_within(resolved, user_home):
+                rejected += 1
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            homes.append(resolved)
+        return homes, rejected
+
+    @staticmethod
+    def _auth_signature(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            stat = path.stat()
+            if not path.is_file() or stat.st_size > 5 * 1024 * 1024:
+                return None
+        except OSError:
+            return None
+        return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _dynamic_home_context(self, home: Path) -> CodexAppHomeContext | None:
+        auth_path = home / "auth.json"
+        try:
+            if not self._is_within(auth_path.resolve(), home):
+                return None
+        except (OSError, RuntimeError):
+            return None
+        before = self._auth_signature(auth_path)
+        if before is None:
+            return None
+        (
+            account,
+            email,
+            principal_id,
+            provider_subscription_id,
+            plan,
+            active_until,
+        ) = self._read_auth_identity(auth_path)
+        after = self._auth_signature(auth_path)
+        if before != after or not account:
+            return None
+        identity = self.resolver.resolve_auth_file(
+            None,
+            account,
+            email,
+            principal_id,
+            provider_subscription_id,
+        )
+        normalized_email = normalize_email_identity(email)
+        if normalized_email:
+            binding_parts = ("email", account, normalized_email)
+        elif principal_id:
+            binding_parts = ("principal", account, principal_id)
+        elif provider_subscription_id:
+            binding_parts = ("provider", provider_subscription_id)
+        else:
+            binding_parts = ("workspace", account)
+        binding_key = "binding:" + self.resolver._private_hash(
+            "codex-app-home-binding-v1", *binding_parts
+        )
+        return CodexAppHomeContext(
+            identity=identity,
+            usage_alias=identity.usage_alias,
+            default_plan=plan,
+            active_until=active_until,
+            binding_key=binding_key,
+            auth_signature=after,
+        )
+
+    def _home_key(self, home: Path) -> str:
+        return "home:" + self.resolver._private_hash(
+            "codex-app-home-path-v1", str(home)
+        )
+
+    def _session_paths(self, home: Path) -> tuple[list[Path], bool]:
+        try:
+            sessions = (home / "sessions").resolve()
+            if not self._is_within(sessions, home):
+                return [], False
+            if not sessions.exists():
+                return [], True
+            if not sessions.is_dir():
+                return [], False
+            ranked: list[tuple[int, Path]] = []
+            for path in sessions.rglob("*.jsonl"):
+                if path.is_symlink():
+                    continue
+                stat = path.stat()
+                resolved = path.resolve()
+                if (
+                    not path.is_file()
+                    or not self._is_within(resolved, sessions)
+                    or stat.st_size > MAX_CODEX_APP_JSONL_BYTES
+                ):
+                    continue
+                ranked.append((int(stat.st_mtime_ns), resolved))
+        except OSError:
+            return [], False
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in ranked[: self.max_files]], True
+
     def import_once(self) -> dict[str, int]:
+        result = (
+            self._fixed_import_once()
+            if self.alias is not None
+            else self._dynamic_import_once()
+        )
+        self._remember_result(result)
+        return result
+
+    def _fixed_import_once(self) -> dict[str, int]:
+        assert self.alias is not None
         (
             app_account,
             app_email,
@@ -7218,8 +7483,6 @@ class CodexAppLocalImporter:
         if app_email_value and alias_email_value:
             member_match: bool | None = app_email_value == alias_email_value
         elif app_principal_id and alias_identity.principal_id_hash:
-            # A principal-only App auth file can still prove it is the same
-            # member as an alias that has since gained a structured email.
             member_match = (
                 short_hash(app_principal_id) == alias_identity.principal_id_hash
             )
@@ -7235,43 +7498,133 @@ class CodexAppLocalImporter:
             if member_match is True
             else AccountIdentity(None, None, None)
         )
-        sessions = self.codex_home / "sessions"
-        try:
-            paths = sorted(
-                sessions.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True
-            )[: self.max_files]
-        except OSError:
-            paths = []
-        imported = 0
-        quota_rows = 0
-        for path in paths:
-            try:
-                if not path.is_file() or path.stat().st_size > MAX_CODEX_APP_JSONL_BYTES:
-                    continue
-            except OSError:
-                continue
-            imported_delta, quota_delta = self._import_file(
-                path, import_identity, default_plan, active_until
+        paths, _sessions_available = self._session_paths(self.codex_home)
+        file_states = self.repo.local_import_file_states(paths)
+        scans = [
+            self._scan_file(
+                path,
+                import_identity,
+                self.alias,
+                default_plan,
+                active_until,
+                prior_state,
             )
-            imported += imported_delta
-            quota_rows += quota_delta
+            for path, prior_state in zip(paths, file_states)
+        ]
+        imported, quota_rows = self._commit_scans(
+            scan for scan in scans if scan.ok
+        )
         return {
             "imported": imported,
             "quota_rows": quota_rows,
             "scanned_files": len(paths),
+            "baselined_files": 0,
+            "discovered_homes": 1,
+            "matched_homes": 1,
+            "failed_homes": 0,
+            "rejected_homes": 0,
         }
 
-    def _import_file(
+    def _dynamic_import_once(self) -> dict[str, int]:
+        self._account_match = None
+        self._member_match = None
+        homes, rejected = self._discover_homes()
+        imported = 0
+        quota_rows = 0
+        scanned_files = 0
+        baselined_files = 0
+        matched_homes = 0
+        failed_homes = 0
+        for home in homes:
+            context = self._dynamic_home_context(home)
+            if context is None:
+                failed_homes += 1
+                continue
+            paths, sessions_available = self._session_paths(home)
+            if not sessions_available:
+                failed_homes += 1
+                continue
+            scanned_files += len(paths)
+            home_key = self._home_key(home)
+            binding = self.repo.local_import_binding(home_key)
+            binding_changed = (
+                binding is None
+                or binding.get("binding_key") != context.binding_key
+            )
+            file_states = self.repo.local_import_file_states(paths)
+            file_needs_baseline = [
+                binding_changed or prior_state is None
+                for prior_state in file_states
+            ]
+            scans = [
+                self._scan_file(
+                    path,
+                    context.identity,
+                    context.usage_alias,
+                    context.default_plan,
+                    context.active_until,
+                    prior_state,
+                    collect_usage=not needs_baseline,
+                )
+                for path, prior_state, needs_baseline in zip(
+                    paths, file_states, file_needs_baseline
+                )
+            ]
+            refreshed = self._dynamic_home_context(home)
+            stable_auth = bool(
+                refreshed
+                and refreshed.binding_key == context.binding_key
+                and refreshed.auth_signature == context.auth_signature
+            )
+            if not stable_auth or any(not scan.ok for scan in scans):
+                failed_homes += 1
+                continue
+            imported_delta, quota_delta = self._commit_scans(scans)
+            imported += imported_delta
+            quota_rows += quota_delta
+            if binding_changed:
+                self.repo.save_local_import_binding(home_key, context.binding_key)
+            baselined_files += sum(file_needs_baseline)
+            matched_homes += 1
+        return {
+            "imported": imported,
+            "quota_rows": quota_rows,
+            "scanned_files": scanned_files,
+            "baselined_files": baselined_files,
+            "discovered_homes": len(homes),
+            "matched_homes": matched_homes,
+            "failed_homes": failed_homes,
+            "rejected_homes": rejected,
+        }
+
+    def _commit_scans(self, scans: Iterable[CodexAppFileScan]) -> tuple[int, int]:
+        imported = 0
+        quota_rows = 0
+        for scan in scans:
+            for event, import_key in scan.events:
+                if self.repo.record_imported_event(
+                    event, import_key, "codex_app_local"
+                ):
+                    imported += 1
+            for snapshot in scan.quota_snapshots:
+                quota_rows += int(
+                    self.repo.insert_subscription_quota_snapshot(snapshot)
+                )
+            if scan.state is not None:
+                self.repo.save_local_import_file_state(scan.state)
+        return imported, quota_rows
+
+    def _scan_file(
         self,
         path: Path,
         identity: AccountIdentity,
+        usage_alias: str | None,
         default_plan: str | None,
         active_until: str | None,
-    ) -> tuple[int, int]:
-        # Account/workspace equality is sufficient to decide whether these
-        # local logs belong to the configured source, but it is not a safe
-        # member identity for Team workspaces. Sparse legacy auth therefore
-        # contributes only anonymous token statistics and no quota card.
+        prior_state: Mapping[str, Any] | None,
+        *,
+        collect_usage: bool = True,
+    ) -> CodexAppFileScan:
         canonical_identity = bool(identity.subscription_id_hash)
         identity_key_value = (
             f"subscription:{identity.subscription_id_hash}"
@@ -7280,20 +7633,20 @@ class CodexAppLocalImporter:
         )
         model_provider: str | None = None
         model: str | None = None
-        imported = 0
-        quota_rows = 0
+        events: list[tuple[UsageEvent, str]] = []
+        quota_snapshots: list[dict[str, Any]] = []
         record_index = 0
         resolved_path = path.resolve()
         try:
             stat = path.stat()
-            state = self.repo.local_import_file_state(resolved_path) or {}
+            state = dict(prior_state or {})
             unchanged = (
                 int(state.get("size") or -1) == int(stat.st_size)
                 and int(state.get("mtime_ns") or -1) == int(stat.st_mtime_ns)
                 and int(state.get("offset") or -1) == int(stat.st_size)
             )
             if unchanged:
-                return 0, 0
+                return CodexAppFileScan(True, None, events, quota_snapshots)
             can_resume = (
                 state
                 and int(state.get("offset") or 0) > 0
@@ -7308,7 +7661,7 @@ class CodexAppLocalImporter:
             if start_offset:
                 handle.seek(start_offset)
         except OSError:
-            return 0, 0
+            return CodexAppFileScan(False, None, events, quota_snapshots)
         with handle:
             for line in handle:
                 try:
@@ -7332,104 +7685,109 @@ class CodexAppLocalImporter:
                 if record_type != "event_msg" or payload.get("type") != "token_count":
                     continue
                 record_index += 1
-                if (model_provider or "").lower() != "openai":
+                if not collect_usage or (model_provider or "").lower() != "openai":
                     continue
                 usage = self._usage_from_token_count(payload)
                 if usage.missing:
                     continue
                 timestamp = normalize_timestamp(record.get("timestamp"))
-                key = identity_key_value
                 components = self.repo.price_components_for(model, usage)
-                # The ordinal is stable in Codex JSONL.  Include a bounded
-                # fallback index for older files that omit it.
                 ordinal = record.get("ordinal")
-                ordinal_key = str(ordinal) if ordinal is not None else f"line-{record_index}"
-                import_key = "codex-app:" + (short_hash(
-                    f"{resolved_path}\n{ordinal_key}\n{timestamp}"
-                ) or short_hash(f"{resolved_path}\n{record_index}") or "unknown")
-                event = UsageEvent(
-                    ts=timestamp,
-                    identity_key=key,
-                    endpoint="local://chatgpt-codex",
-                    method="LOCAL",
-                    model=model,
-                    status_code=200,
-                    ok=1,
-                    duration_ms=0,
-                    stream=0,
-                    session_id=None,
-                    thread_id=None,
-                    turn_id=None,
-                    installation_id=None,
-                    window_id=None,
-                    usage_alias=self.alias,
-                    usage_project=None,
-                    auth_fingerprint=None,
-                    account_id_hash=identity.account_id_hash,
-                    account_id_tail=identity.account_id_tail,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cached_tokens=usage.cached_tokens,
-                    cache_write_tokens=usage.cache_write_tokens,
-                    reasoning_tokens=usage.reasoning_tokens,
-                    total_tokens=usage.total_tokens,
-                    estimated_api_cost_usd=components.total_cost_usd if components else None,
-                    non_cached_input_cost_usd=(
-                        components.non_cached_input_cost_usd if components else None
-                    ),
-                    cached_input_cost_usd=(
-                        components.cached_input_cost_usd if components else None
-                    ),
-                    output_cost_usd=components.output_cost_usd if components else None,
-                    long_context_pricing_applied=int(
-                        components.long_context_pricing_applied if components else False
-                    ),
-                    subscription_amortized_cost_usd=None,
-                    api_equivalent_quota_usd=None,
-                    usage_missing=0,
-                    error_type=None,
-                    error_message_redacted=None,
-                    request_bytes=0,
-                    response_bytes=0,
-                    source="codex_app_local",
-                    request_id=None,
+                ordinal_key = (
+                    str(ordinal) if ordinal is not None else f"line-{record_index}"
                 )
-                if self.repo.record_imported_event(
-                    event, import_key, "codex_app_local"
-                ):
-                    imported += 1
+                import_key = "codex-app:" + (
+                    short_hash(f"{resolved_path}\n{ordinal_key}\n{timestamp}")
+                    or short_hash(f"{resolved_path}\n{record_index}")
+                    or "unknown"
+                )
+                events.append(
+                    (
+                        UsageEvent(
+                            ts=timestamp,
+                            identity_key=identity_key_value,
+                            endpoint="local://chatgpt-codex",
+                            method="LOCAL",
+                            model=model,
+                            status_code=200,
+                            ok=1,
+                            duration_ms=0,
+                            stream=0,
+                            session_id=None,
+                            thread_id=None,
+                            turn_id=None,
+                            installation_id=None,
+                            window_id=None,
+                            usage_alias=usage_alias,
+                            usage_project=None,
+                            auth_fingerprint=None,
+                            account_id_hash=identity.account_id_hash,
+                            account_id_tail=identity.account_id_tail,
+                            input_tokens=usage.input_tokens,
+                            output_tokens=usage.output_tokens,
+                            cached_tokens=usage.cached_tokens,
+                            cache_write_tokens=usage.cache_write_tokens,
+                            reasoning_tokens=usage.reasoning_tokens,
+                            total_tokens=usage.total_tokens,
+                            estimated_api_cost_usd=(
+                                components.total_cost_usd if components else None
+                            ),
+                            non_cached_input_cost_usd=(
+                                components.non_cached_input_cost_usd
+                                if components
+                                else None
+                            ),
+                            cached_input_cost_usd=(
+                                components.cached_input_cost_usd
+                                if components
+                                else None
+                            ),
+                            output_cost_usd=(
+                                components.output_cost_usd if components else None
+                            ),
+                            long_context_pricing_applied=int(
+                                components.long_context_pricing_applied
+                                if components
+                                else False
+                            ),
+                            subscription_amortized_cost_usd=None,
+                            api_equivalent_quota_usd=None,
+                            usage_missing=0,
+                            error_type=None,
+                            error_message_redacted=None,
+                            request_bytes=0,
+                            response_bytes=0,
+                            source="codex_app_local",
+                            request_id=None,
+                        ),
+                        import_key,
+                    )
+                )
                 rate_limits = payload.get("rate_limits")
                 plan = (
                     safe_plan_type(rate_limits.get("plan_type"))
                     if isinstance(rate_limits, Mapping)
                     else None
                 ) or default_plan
-                # Quota snapshots have their own uniqueness key.  Re-reading
-                # an unchanged JSONL line must not create a new snapshot row;
-                # ``insert_subscription_quota_snapshot`` intentionally uses
-                # INSERT OR IGNORE for this reason.
                 if not canonical_identity:
                     continue
                 for window in parse_codex_app_rate_windows(rate_limits, timestamp):
                     window.update(
                         {
-                            "identity_key": key,
-                            "account_id_hash": identity.account_id_hash,
-                            "account_id_tail": identity.account_id_tail,
-                            "usage_alias": self.alias,
+                            "identity_key": identity_key_value,
                             "plan_type": plan,
                             "subscription_active_until": active_until,
                             "source": "codex_app_local",
                         }
                     )
-                    self.repo.insert_subscription_quota_snapshot(window)
-                    quota_rows += 1
+                    quota_snapshots.append(window)
             final_offset = handle.tell()
         try:
             final_stat = path.stat()
         except OSError:
-            return imported, quota_rows
-        self.repo.save_local_import_file_state(
+            return CodexAppFileScan(False, None, [], [])
+        return CodexAppFileScan(
+            True,
             {
                 "path": resolved_path,
                 "size": final_stat.st_size,
@@ -7437,9 +7795,10 @@ class CodexAppLocalImporter:
                 "offset": min(final_offset, final_stat.st_size),
                 "model_provider": model_provider,
                 "model": model,
-            }
+            },
+            events,
+            quota_snapshots,
         )
-        return imported, quota_rows
 
 
 class CodexQuotaPoller:
@@ -8410,9 +8769,52 @@ def dashboard_html(
         else ""
     )
 
+    codex_dynamic = codex_app_status.get("account_mode", "dynamic") == "dynamic"
+    codex_discovered = as_nonnegative_int(
+        codex_app_status.get("discovered_homes")
+    ) or 0
+    codex_matched = as_nonnegative_int(codex_app_status.get("matched_homes")) or 0
+    codex_failed = (
+        as_nonnegative_int(codex_app_status.get("failed_homes")) or 0
+    ) + (as_nonnegative_int(codex_app_status.get("rejected_homes")) or 0)
+    codex_baselined = as_nonnegative_int(
+        codex_app_status.get("last_baselined_files")
+    ) or 0
+    codex_imported_now = as_nonnegative_int(
+        codex_app_status.get("last_imported")
+    ) or 0
+    if codex_dynamic:
+        codex_mode_text = "自动跟随当前账号"
+        binding_text = (
+            f"本轮为 {fmt_int(codex_baselined)} 个文件建立了安全边界；边界前无法证明归属的记录不会回填。"
+            if codex_baselined
+            else "账号切换时会先建立安全边界，避免把旧会话归到新账号。"
+        )
+    else:
+        codex_mode_text = html.escape(
+            str(codex_app_status.get("usage_alias") or "固定账号")
+        )
+        binding_text = "当前为显式 alias 严格匹配模式。"
+    codex_notice = (
+        f'<div class="notice {"app-import-notice" if codex_matched else ""}">'
+        '<b>ChatGPT Codex 本地监控</b>'
+        f'<span>{codex_mode_text}；已发现 {fmt_int(codex_discovered)} 个安全 CODEX_HOME，'
+        f'当前跟踪 {fmt_int(codex_matched)} 个，异常/拒绝 {fmt_int(codex_failed)} 个。'
+        f'本轮新增 {fmt_int(codex_imported_now)} 条，累计导入 '
+        f'{fmt_int(codex_app_status.get("imported_events"))} 条。{binding_text}'
+        '只读取 token_count / rate_limits 元数据；提示词、代码、推理、工具输出和凭据均不保存。'
+        '“API 等价成本”不是 Pro 订阅实际扣款。</span></div>'
+    )
+    manual_import = ""
+    if not codex_dynamic and codex_app_status.get("usage_alias"):
+        manual_alias = html.escape(str(codex_app_status["usage_alias"]), quote=True)
+        manual_import = f"""<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="{manual_alias}" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><button type="submit">导入并估价</button><p>只接收模型、时间、调用数和 token 统计，不接收备注、提示词或代码。输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。</p></form></details>"""
+
     collector_ok = queue_status.get("key_loaded") and queue_status.get("last_status") == 200
     quota_ok = quota_status.get("last_success_at") is not None or persisted_quota_accounts > 0
-    codex_app_ok = codex_app_status.get("last_success_at") is not None
+    codex_app_ok = (
+        codex_app_status.get("last_success_at") is not None and codex_matched > 0
+    )
     cockpit_ok = (
         cockpit_status.get("last_success_at") is not None
         or int(cockpit_status.get("imported_events") or 0) > 0
@@ -8445,9 +8847,9 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
-<div class="notice app-import-notice"><b>ChatGPT Codex 本地监控</b><span>{html.escape(str(codex_app_status.get('usage_alias') or '本地账号'))} 已完成内存映射；只读取本机会话中的 token_count / rate_limits 元数据，不读取或保存提示词、代码、推理、工具输出和凭据。已自动导入 {fmt_int(codex_app_status.get('imported_events'))} 条，最近扫描 {fmt_local_time(codex_app_status.get('last_import_at'))}。下方“API 等价成本”仅是按模型 API 单价估算，不是 Pro 订阅实际扣款。</span></div>
+{codex_notice}
 {cockpit_notice}
-<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="codex-13" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><button type="submit">导入并估价</button><p>只接收模型、时间、调用数和 token 统计，不接收备注、提示词或代码。输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。</p></form></details>
+{manual_import}
 {session_notice}
 <div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
@@ -8460,7 +8862,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
 
@@ -8489,7 +8891,7 @@ class MeterHTTPServer(ThreadingHTTPServer):
         quota_poll_seconds: float = DEFAULT_QUOTA_POLL_SECONDS,
         quota_poll_timeout: float = DEFAULT_QUOTA_POLL_TIMEOUT,
         codex_app_home: str | Path = DEFAULT_CODEX_APP_HOME,
-        codex_app_alias: str = DEFAULT_CODEX_APP_ALIAS,
+        codex_app_alias: str | None = DEFAULT_CODEX_APP_ALIAS,
         codex_app_poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
         codex_app_max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
         codex_app_import_enabled: bool = True,
@@ -9144,7 +9546,7 @@ def create_server(
     quota_poll_seconds: float = DEFAULT_QUOTA_POLL_SECONDS,
     quota_poll_timeout: float = DEFAULT_QUOTA_POLL_TIMEOUT,
     codex_app_home: str | Path = DEFAULT_CODEX_APP_HOME,
-    codex_app_alias: str = DEFAULT_CODEX_APP_ALIAS,
+    codex_app_alias: str | None = DEFAULT_CODEX_APP_ALIAS,
     codex_app_poll_seconds: float = DEFAULT_CODEX_APP_POLL_SECONDS,
     codex_app_max_files: int = DEFAULT_CODEX_APP_MAX_FILES,
     codex_app_import_enabled: bool = True,
@@ -9322,8 +9724,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--codex-app-alias",
-        default=os.environ.get("CODEX_APP_USAGE_ALIAS", DEFAULT_CODEX_APP_ALIAS),
-        help="Existing local alias that must match the ChatGPT app account",
+        default=os.environ.get("CODEX_APP_USAGE_ALIAS"),
+        help=(
+            "Optional existing alias for strict single-home matching; omitted by "
+            "default to follow current Cockpit/Codex accounts dynamically"
+        ),
     )
     parser.add_argument(
         "--codex-app-poll-seconds",

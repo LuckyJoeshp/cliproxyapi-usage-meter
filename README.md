@@ -66,14 +66,25 @@ repair existing SQLite, WAL, and SHM permissions to `0600` when opened
 directly. Runtime databases remain local data and are intentionally not part
 of the repository (Windows relies on ACLs).
 
-The dashboard also monitors direct ChatGPT App Codex sessions when the local
-Codex JSONL history is available. It imports only token-count and rate-limit
-metadata from the `CODEX_APP_HOME` (default `~/.codex`) and matches the local
-account to `codex-13`; it does not inspect prompts, code, tool output, or
-credentials. If that alias has no structured member identity, token totals are
-kept anonymous and no quota card is created. A manual usage form is available
-on `/usage` for canonically mapped sessions from another device. Dollar values
-are API-equivalent estimates, not Pro subscription billing.
+The dashboard also monitors direct ChatGPT App Codex sessions when local Codex
+JSONL history is available. By default it follows the current account in
+`CODEX_APP_HOME` (`~/.codex`) and auto-discovers Cockpit Codex instance homes
+from `~/.antigravity_cockpit/codex_instances.json`. Each home is resolved and
+must remain inside the current user's home directory. Only token-count and
+rate-limit metadata is read; prompts, code, tool output, and credentials are
+never persisted.
+
+The first dynamic scan of a home or newly discovered JSONL establishes an
+end-of-file safety boundary. An account change establishes a new boundary
+before collection resumes, so unread historical records cannot be guessed to
+belong to the newly selected account. New `token_count` records after that
+boundary are attributed to the canonical subscription when structured member
+evidence is available; sparse workspace-only auth remains anonymous and
+produces no quota card. Set
+`CODEX_APP_USAGE_ALIAS` or pass `--codex-app-alias` only when strict legacy
+single-home matching is desired. The `/usage` manual import form is exposed in
+that fixed-alias mode only. Dollar values are API-equivalent estimates, not Pro
+subscription billing.
 
 ### Migrate traffic to Cockpit Tools
 

@@ -283,6 +283,46 @@ class UsageMeterMVPTest(unittest.TestCase):
             conn.row_factory = sqlite3.Row
             return conn.execute(sql, params).fetchall()
 
+    @staticmethod
+    def codex_auth(account: str, email: str, principal: str) -> dict[str, object]:
+        return {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "account_id": account,
+                "id_token": fixture_jwt({"email": email, "sub": principal}),
+            },
+        }
+
+    @staticmethod
+    def codex_token_record(
+        timestamp: str,
+        ordinal: int,
+        input_tokens: int,
+    ) -> dict[str, object]:
+        return {
+            "timestamp": timestamp,
+            "ordinal": ordinal,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": input_tokens + 2,
+                    }
+                },
+                "rate_limits": {
+                    "plan_type": "pro",
+                    "primary": {
+                        "used_percent": 20,
+                        "window_minutes": 300,
+                    },
+                },
+            },
+        }
+
     def shared_workspace_fixture(self) -> dict[str, object]:
         """Create two user principals in one synthetic Team workspace."""
 
@@ -2011,6 +2051,256 @@ class UsageMeterMVPTest(unittest.TestCase):
             0,
         )
 
+    def test_dynamic_local_import_baselines_and_follows_account_switches(self) -> None:
+        app_home = self.temp_path / "dynamic-codex"
+        sessions = app_home / "sessions"
+        sessions.mkdir(parents=True)
+        auth_a = self.codex_auth(
+            "acct-dynamic-alpha-fixture",
+            "dynamic-alpha@example.test",
+            "dynamic-alpha-principal",
+        )
+        auth_b = self.codex_auth(
+            "acct-dynamic-beta-fixture",
+            "dynamic-beta@example.test",
+            "dynamic-beta-principal",
+        )
+        (app_home / "auth.json").write_text(json.dumps(auth_a), encoding="utf-8")
+        session = sessions / "rollout-dynamic.jsonl"
+        records = [
+            {
+                "timestamp": "2026-08-16T01:00:00Z",
+                "type": "session_meta",
+                "payload": {"model_provider": "openai"},
+            },
+            {
+                "timestamp": "2026-08-16T01:00:01Z",
+                "type": "turn_context",
+                "payload": {"model": "fake-responses"},
+            },
+            self.codex_token_record("2026-08-16T01:00:02Z", 1, 10),
+        ]
+        session.write_text(
+            "\n".join(json.dumps(item) for item in records) + "\n",
+            encoding="utf-8",
+        )
+        resolver = meter.AccountResolver(home=self.temp_path, refresh_seconds=0)
+        importer = meter.CodexAppLocalImporter(
+            self.sidecar.repo,
+            resolver,
+            app_home,
+            alias=None,
+        )
+
+        baseline = importer.import_once()
+
+        self.assertEqual(baseline["imported"], 0)
+        self.assertEqual(baseline["baselined_files"], 1)
+        self.assertEqual(baseline["matched_homes"], 1)
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    self.codex_token_record("2026-08-16T01:01:00Z", 2, 20)
+                )
+                + "\n"
+            )
+        alpha = importer.import_once()
+        self.assertEqual(alpha["imported"], 1)
+        self.assertEqual(alpha["baselined_files"], 0)
+
+        (app_home / "auth.json").write_text(json.dumps(auth_b), encoding="utf-8")
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    self.codex_token_record("2026-08-16T01:02:00Z", 3, 30)
+                )
+                + "\n"
+            )
+        switched = importer.import_once()
+        self.assertEqual(switched["imported"], 0)
+        self.assertEqual(switched["baselined_files"], 1)
+
+        with session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    self.codex_token_record("2026-08-16T01:03:00Z", 4, 40)
+                )
+                + "\n"
+            )
+        beta = importer.import_once()
+        self.assertEqual(beta["imported"], 1)
+        self.assertEqual(beta["baselined_files"], 0)
+
+        new_session = sessions / "rollout-dynamic-new.jsonl"
+        new_session.write_text(
+            "\n".join(
+                json.dumps(item)
+                for item in (
+                    {
+                        "timestamp": "2026-08-16T01:04:00Z",
+                        "type": "session_meta",
+                        "payload": {"model_provider": "openai"},
+                    },
+                    {
+                        "timestamp": "2026-08-16T01:04:01Z",
+                        "type": "turn_context",
+                        "payload": {"model": "fake-responses"},
+                    },
+                    self.codex_token_record("2026-08-16T01:04:02Z", 1, 50),
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        new_file_baseline = importer.import_once()
+        self.assertEqual(new_file_baseline["imported"], 0)
+        self.assertEqual(new_file_baseline["baselined_files"], 1)
+        with new_session.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    self.codex_token_record("2026-08-16T01:05:00Z", 2, 60)
+                )
+                + "\n"
+            )
+        new_file_delta = importer.import_once()
+        self.assertEqual(new_file_delta["imported"], 1)
+        self.assertEqual(new_file_delta["baselined_files"], 0)
+
+        rows = self.rows(
+            "SELECT identity_key, input_tokens FROM usage_events "
+            "WHERE source='codex_app_local' ORDER BY ts"
+        )
+        self.assertEqual([row["input_tokens"] for row in rows], [20, 40, 60])
+        self.assertEqual(len({row["identity_key"] for row in rows}), 2)
+        for row in rows:
+            self.assertRegex(row["identity_key"], r"^subscription:[0-9a-f]{32}$")
+        bindings = self.rows(
+            "SELECT home_key, binding_key FROM local_import_bindings"
+        )
+        self.assertEqual(len(bindings), 1)
+        self.assertRegex(bindings[0]["home_key"], r"^home:[0-9a-f]{32}$")
+        self.assertRegex(bindings[0]["binding_key"], r"^binding:[0-9a-f]{32}$")
+        persisted = self.db.read_bytes()
+        wal = Path(f"{self.db}-wal")
+        if wal.exists():
+            persisted += wal.read_bytes()
+        for marker in (
+            str(app_home),
+            "acct-dynamic-alpha-fixture",
+            "acct-dynamic-beta-fixture",
+            "dynamic-alpha@example.test",
+            "dynamic-beta@example.test",
+        ):
+            self.assertNotIn(marker.encode(), persisted)
+
+    def test_dynamic_local_import_discovers_cockpit_instances_independently(self) -> None:
+        cockpit_dir = self.temp_path / ".antigravity_cockpit"
+        cockpit_dir.mkdir()
+        primary = self.temp_path / ".codex"
+        instance = self.temp_path / "cockpit-instances" / "secondary"
+        broken = self.temp_path / "cockpit-instances" / "broken"
+        outside = self.temp_path.parent / "outside-codex-fixture"
+        sessions_by_home: dict[Path, Path] = {}
+        for index, home in enumerate((primary, instance), start=1):
+            sessions = home / "sessions"
+            sessions.mkdir(parents=True)
+            (home / "auth.json").write_text(
+                json.dumps(
+                    self.codex_auth(
+                        f"acct-instance-{index}-fixture",
+                        f"instance-{index}@example.test",
+                        f"instance-{index}-principal",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            session = sessions / f"rollout-instance-{index}.jsonl"
+            session.write_text(
+                "\n".join(
+                    json.dumps(item)
+                    for item in (
+                        {
+                            "timestamp": f"2026-08-16T02:0{index}:00Z",
+                            "type": "session_meta",
+                            "payload": {"model_provider": "openai"},
+                        },
+                        {
+                            "timestamp": f"2026-08-16T02:0{index}:01Z",
+                            "type": "turn_context",
+                            "payload": {"model": "fake-responses"},
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            sessions_by_home[home] = session
+        (broken / "sessions").mkdir(parents=True)
+        (cockpit_dir / "codex_instances.json").write_text(
+            json.dumps(
+                {
+                    "instances": [
+                        {"id": "secondary", "userDataDir": str(instance)},
+                        {"id": "duplicate", "userDataDir": str(primary)},
+                        {"id": "broken", "userDataDir": str(broken)},
+                        {"id": "unsafe", "userDataDir": str(outside)},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        resolver = meter.AccountResolver(
+            home=self.temp_path,
+            refresh_seconds=0,
+            cockpit_tools_data_dir=cockpit_dir,
+        )
+        importer = meter.CodexAppLocalImporter(
+            self.sidecar.repo,
+            resolver,
+            primary,
+            alias=None,
+        )
+
+        baseline = importer.import_once()
+
+        self.assertEqual(baseline["discovered_homes"], 3)
+        self.assertEqual(baseline["matched_homes"], 2)
+        self.assertEqual(baseline["failed_homes"], 1)
+        self.assertEqual(baseline["rejected_homes"], 1)
+        self.assertEqual(baseline["baselined_files"], 2)
+        for index, home in enumerate((primary, instance), start=1):
+            with sessions_by_home[home].open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        self.codex_token_record(
+                            f"2026-08-16T02:1{index}:00Z",
+                            index,
+                            index * 10,
+                        )
+                    )
+                    + "\n"
+                )
+
+        imported = importer.import_once()
+
+        self.assertEqual(imported["imported"], 2)
+        self.assertEqual(imported["matched_homes"], 2)
+        self.assertEqual(imported["failed_homes"], 1)
+        self.assertEqual(imported["rejected_homes"], 1)
+        self.assertEqual(
+            self.rows(
+                "SELECT COUNT(*) AS count FROM usage_events "
+                "WHERE source='codex_app_local'"
+            )[0]["count"],
+            2,
+        )
+        status = importer.status()
+        self.assertEqual(status["account_mode"], "dynamic")
+        self.assertEqual(status["discovered_homes"], 3)
+        self.assertEqual(status["matched_homes"], 2)
+        self.assertNotIn(str(primary), json.dumps(status))
+        self.assertNotIn(str(instance), json.dumps(status))
+
     def test_invalid_structured_email_does_not_mask_valid_jwt_email(self) -> None:
         account, _tokens, email, principal, _provider_id = (
             meter.AccountResolver._account_and_tokens(
@@ -2143,7 +2433,8 @@ class UsageMeterMVPTest(unittest.TestCase):
         )
         self.assertIn("1 个账号已刷新", page_after_restart_timeout)
         self.assertIn("Quota snapshot <b>正常", page_after_restart_timeout)
-        self.assertIn("codex-1", page)
+        self.assertIn("自动跟随当前账号", page)
+        self.assertNotIn('action="/usage/manual-import"', page)
 
     def test_latest_subscription_quota_uses_fetched_time_not_backfill_id(self) -> None:
         fixture_key = subscription_key("latest-quota-fixture")
