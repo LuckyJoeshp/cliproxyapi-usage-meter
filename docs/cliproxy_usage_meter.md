@@ -87,7 +87,7 @@ python3 \
 
 ### ChatGPT App 直登 Codex 的本地监控
 
-个人 ChatGPT/Pro 直登模式不经过 8327/8317，因此代理无法从网络流量中看到请求；也没有面向个人订阅的公开 token 账单 API。当前版本会额外只读扫描 `CODEX_APP_HOME`（默认 `~/.codex`）下 Codex 会话 JSONL 的 `event_msg.token_count` 元数据，并要求其本地账号与 `CODEX_APP_USAGE_ALIAS`（默认 `codex-13`）的 `auth.json` 账号一致。仅保存 input/cached/output/reasoning/total token、模型、时间和额度窗口；提示词、代码、工具输出、JWT/API key 永不写入数据库。导入事件的 `source` 为 `codex_app_local`，重复扫描是幂等的。
+个人 ChatGPT/Pro 直登模式不经过 8327/8317，因此代理无法从网络流量中看到请求；也没有面向个人订阅的公开 token 账单 API。当前版本会额外只读扫描 `CODEX_APP_HOME`（默认 `~/.codex`）下 Codex 会话 JSONL 的 `event_msg.token_count` 元数据，并要求其本地账号与 `CODEX_APP_USAGE_ALIAS`（默认 `codex-13`）的 `auth.json` workspace 一致。仅保存 input/cached/output/reasoning/total token、模型、时间和额度窗口；提示词、代码、工具输出、JWT/API key 永不写入数据库。只有 alias 能从结构化邮箱/JWT principal 形成 canonical 订阅身份时才写入对应额度卡；仅有 workspace/account ID 的稀疏旧 auth 会把 token 记为匿名 `unknown`，并跳过额度快照。导入事件的 `source` 为 `codex_app_local`，重复扫描是幂等的。
 
 启动 sidecar 时默认开启：
 
@@ -99,23 +99,34 @@ scripts/start_cliproxy_usage_meter.sh
 
 为避免每次轮询重读很大的历史目录，默认只扫描最近修改的 500 个 JSONL，并持久化每个文件的读取 offset；未变化文件不会重读，增长中的活动会话只读取追加部分。可用 `CODEX_APP_USAGE_MAX_FILES` 或 `--codex-app-max-files` 调整范围。
 
-若需要关闭本地日志导入，可增加 `--no-codex-app-import`。跨设备或日志缺失时，`/usage` 页面中的“手动补录用量”折叠表单会写入 `manual_codex_app` 事件。页面中的美元数字是按已配置 OpenAI API 单价计算的 API 等价估算，不代表 Pro 订阅实际扣款或剩余额度；订阅额度仍以 ChatGPT/Codex 产品界面为准。
+若需要关闭本地日志导入，可增加 `--no-codex-app-import`。跨设备或日志缺失时，`/usage` 页面中的“手动补录用量”折叠表单会写入 `manual_codex_app` 事件；它只接受已经形成 canonical 订阅身份的 alias，避免凭 workspace 或单一历史账号猜归属。页面中的美元数字是按已配置 OpenAI API 单价计算的 API 等价估算，不代表 Pro 订阅实际扣款或剩余额度；订阅额度仍以 ChatGPT/Codex 产品界面为准。
 
 - Responses：`input_tokens` / `output_tokens` / `cached_tokens` / `reasoning_tokens` / `total_tokens`
 - Chat Completions：`prompt_tokens` / `completion_tokens` 及对应 details
 - 非 streaming JSON，以及不改写字节的 SSE streaming（尽量读取最终 usage）
 - 其他 `/v1/...` 路径透明转发并计为一次调用
 
-身份解析优先级为显式 `X-Usage-Alias`，其次是本地 `~/.codex-*/auth.json` / `~/.cli-proxy-api/*.json`
-中 Codex 认证记录（包括 Team/工作区账号的自定义文件名）与 access token 的短 hash 匹配，最后退化为
-Authorization 短 hash、installation 或 session 标识。原始
-Authorization、access token、refresh token、id token 和 API key 永不打印或落库；数据库只保存
-`auth_fingerprint`、`account_id_hash`、`account_id_tail`。如果多个客户端共用同一个代理 key 且没有 alias header，
-meter 无法凭空知道它们对应哪个订阅账号，这是已知的 best-effort 限制。
+账号身份只从本地 `~/.codex-*/auth.json`、`~/.cli-proxy-api/*.json` 或 management 返回的结构化
+JSON/JWT 字段读取。邮箱是 loopback 页面唯一可读的账号标识；`.cpa.时间.json` 文件名里的文本
+绝不被猜成邮箱。邮箱 local-part（包括 `+tag` 和点）完整保留，只规范化 Unicode 与域名大小写。
 
-队列可能先于认证文件刷新完成，因此短暂写入的 `auth:<fingerprint>` 只是临时身份。sidecar 启动和
-`/usage` 渲染时会安全地重新扫描本地 auth 文件，并将可解析的临时记录回绑到 `codex-N` 或账号哈希；
-不会删除或改写任何认证 token。
+Team/工作区的 `chatgpt_account_id` 只标识 workspace，并不是成员级唯一键。持久身份使用本机随机
+0600 密钥计算 `HMAC(workspace + email)`，所以同一 Team 的不同成员不会串号，同邮箱加入不同
+workspace 也不会合并；同一 workspace + 邮箱发生 token 或时间戳文件轮换时则保持同一身份。
+只有结构化邮箱缺失时，才依次退化到 JWT user principal 或结构化 provider subscription ID，且仍
+只保存 keyed digest。management 的 `name`/`id`、`auth_index`、原始 workspace/user ID、邮箱、
+token、token digest 和认证文件名都只在必要的本机内存映射中使用。
+
+所有写入入口统一只保留订阅 keyed ID、时间、模型、状态、token、成本、streaming/usage-missing
+等统计字段；不持久化 alias、account hash/tail、Authorization fingerprint、endpoint、project、
+session/thread/turn/request ID、上游错误正文/自由文本错误类型、请求/响应大小或本地日志绝对路径。
+模型名也必须符合收窄的 model-ID 字符规则，邮箱、token、账号 ID 或路径样式不会借该列落库。usage queue 暂时无法
+解析到结构化订阅时记为匿名/unknown，不会把 token fingerprint 变成临时账号。不会删除或改写任何
+认证 token。
+
+keyed ID 使用的 owner-only 密钥默认位于 `~/.config/cliproxy-usage/identity.key`。备份数据库时必须
+同时安全备份该密钥；删除或轮换它会让所有新 identity key 改变，旧账号历史因无法证明归属只能匿名化，
+不能按邮箱猜回去。
 
 ### Token 与调用口径
 
@@ -137,7 +148,8 @@ meter 无法凭空知道它们对应哪个订阅账号，这是已知的 best-ef
 
 CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。因此调用数也分两层：
 
-- `logical_requests`：有 `request_id` 时按其去重；没有 request id 的旧/sidecar 记录每行算一次。
+- `logical_requests`：历史上有 request id 的行可按其去重；新写入为避免跨表关联，不持久化
+  request id，因此按实际调用/聚合 `call_count` 计数。
 - `account_attempts`：SQLite 的实际账号调用行数；`retry_attempts = attempts - logical_requests`，
   看板文案称为“额外调用”，不等同于失败数。
 
@@ -147,8 +159,8 @@ CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。�
 日志、额度快照或健康检查响应。额度快照可能由历史 JSONL 乱序回填，因此“当前额度”
 按 `fetched_at`（同时间再按数据库 id）选择，而不是把最后插入的历史行误认为最新。
 
-不会删除或覆盖失败/重试行，因为它们是账号池行为和故障审计的一部分。token/cost 仍按
-attempt 如实累计；逻辑请求去重仅用于调用次数展示，不能猜测哪次成功 token 可以代表整组。
+失败调用的状态与 token/cost 仍按 attempt 如实累计，但错误正文和请求关联 ID 不落库；系统不会
+猜测哪次成功 token 可以代表整组。
 
 ## 价格与 API 等价额度
 
@@ -224,7 +236,9 @@ http://127.0.0.1:8327/usage
 看板展示今日/近 7 日/SQLite 全量累计、成功/失败/streaming、各 token 与估算成本、全量按日历史、
 alias/account 与模型排行、quota 周期统计以及最近 50 条调用。页面顶部明确标出 SQLite 第一条和最后一条
 记录时间，并显示 direct-8317 collector 是 active、backoff 还是因缺少 key 而 idle；
-`/healthz` 也提供同样的脱敏状态。页面只读取 SQLite，不接入 cliproxyapi 本体。
+`/healthz` 也提供同样的脱敏状态。页面只读取 SQLite，不接入 cliproxyapi 本体。`/usage` 与
+`/healthz` 都是动态本机状态，响应带 `Cache-Control: no-store`，避免浏览器复用旧额度或身份映射。
+额度卡通过运行时 resolver 补回邮箱/alias；SQLite 中的额度快照本身不含这些可读身份信息。
 
 新版主视图额外提供：
 
@@ -264,14 +278,32 @@ cloud chats 共享五小时窗口，并可能有周限额：
 替换为 `$TOKEN$`；sidecar 不读取、打印或落盘 OAuth token。可用
 `CLIPROXY_QUOTA_POLL_SECONDS` 调整刷新周期（最小 60 秒）。
 
-SQLite 没有 7 天 retention 或自动删除。`7d` 只是看板排行的展示窗口；`all` 查询会读取全部已落库事件。
+额度轮询会把 management auth-file 的 `name`/`id` 与本地身份只在内存中关联；`auth_index`
+仅作为 `/v0/management/api-call` 的不透明选择器，不作为订阅身份，也不会持久化。
+
+额度轮询还把一次完整 auth-files 返回当作订阅 inventory。首次完整读取只建立基线；订阅缺失后立即
+标为 `suspect_missing` 并从页面隐藏，连续 3 次完整缺失且至少 10 分钟后才确认清理。若完整清单
+突然变空，或账号数降到上次基线的一半及以下，则提高到连续 5 次且至少 30 分钟；某订阅一旦在
+这类高风险缩减中进入 missing，即使其他账号随后部分恢复，它也会保持 5 次/30 分钟门槛，直到在
+权威清单中重新出现。HTTP/JSON 错误、缺少 `files`、未读完分页、任一 Codex 条目无法形成稳定
+keyed identity 都不会推进删除；disabled 条目仍视为存在。
+
+确认清理时，逐调用行按本地日期、模型、状态和 token/cost 维度合并到不含 identity/source/request
+字段的 `anonymous_usage_daily`，随后删除该订阅的 quota snapshot、计划、续期、周期、账号关联和
+逐调用身份明细。匿名统计继续计入 `today`/`7d`/`all` 总量，但不会再出现在账号卡、最近调用或
+quota summary 中。匿名桶保留 calls、成功/失败、streaming 总数、token 与成本总量，但舍弃逐调用
+时间、逐调用 streaming 标志和请求/重试关联。退休 tombstone 只含 keyed digest；迟到 queue、proxy
+或 import 记录仍可贡献匿名 token，却不能重建账号卡，只有后续完整 inventory 明确重新出现才解除。
+库存基线建立后，未出现在 active registry 的未知订阅 key 也按 fail-closed 处理。SQLite 连接启用
+`secure_delete=ON`，确认清理后执行 WAL truncate checkpoint。
+
+除上述订阅删除隐私生命周期外，SQLite 没有通用的 7 天 retention。`7d` 只是看板排行的展示窗口；
+`all` 查询会读取全部已落库 token 统计。
 但 collector 只能从启用时刻开始持久化：CLIProxyAPI 的 usage queue 是短期内存队列，collector 启用前已从
 队列消失的历史无法从 8317 反向补回；当前 v7.2.125 也没有另一份内建持久化 token 历史可供回填。
 
-当前 8317 usage queue 的 `client_request_metadata` 没有填充 `session_id`，因此 SQLite 不能把
-历史总量精确筛成某个 `codex_quant` 或其他 tmux session。页面会明确提示这是跨账号、跨 session
-的汇总；它只把 token 算法对齐 `/status`，不把统计范围冒充为单 session。若未来上游提供稳定
-session id，新记录会自动进入现有 `session_id` 字段，旧记录仍不可反推。
+为了最小化关联数据，即使 8317 usage queue 将来提供 `session_id`，当前版本也不会把它写入 SQLite。
+页面是跨 session 的 token 汇总，只把 token 算法对齐 `/status`，不把统计范围冒充为单 session。
 
 ## 临时接入 Codex（不改持久配置）
 

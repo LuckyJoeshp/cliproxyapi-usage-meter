@@ -3,8 +3,8 @@
 
 The proxy deliberately uses only Python's standard library. Request and response
 bodies are inspected in memory for metadata/usage, but are never persisted.
-Authorization values are forwarded upstream and immediately reduced to a short
-SHA-256 fingerprint for metering.
+Authorization values are forwarded upstream and used only for an in-memory
+subscription lookup.  Tokens and token fingerprints are never persisted.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import argparse
 import base64
 import fnmatch
 import hashlib
+import hmac
 import html
 from html.parser import HTMLParser
 import http.client
@@ -21,6 +22,8 @@ import logging
 import math
 import os
 import re
+import secrets
+import signal
 import sqlite3
 import ssl
 import sys
@@ -29,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +74,10 @@ QUOTA_ESTIMATE_STABLE_USED_PERCENT = 10.0
 QUOTA_ESTIMATE_CAP_CONFIDENCE_PERCENT = 100.0
 ALL_TIME_PERIODS = {"all", "all-time", "all_time", "ever", "total"}
 PERIOD_START_SENTINEL = "0001-01-01T00:00:00.000000Z"
+SUBSCRIPTION_RETIRE_MISSES = 3
+SUBSCRIPTION_RETIRE_GRACE_SECONDS = 600
+EMPTY_INVENTORY_RETIRE_MISSES = 5
+EMPTY_INVENTORY_RETIRE_GRACE_SECONDS = 1800
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -168,6 +176,72 @@ def safe_alias(value: Any) -> str | None:
     return None
 
 
+def safe_model_identifier(value: Any) -> str | None:
+    """Keep a useful model label without accepting arbitrary identity text."""
+
+    text = safe_text(value, 200)
+    if not text or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}", text):
+        return None
+    lowered = text.lower()
+    if ".." in text or lowered.startswith(
+        (
+            "sk-",
+            "bearer",
+            "eyj",
+            "acct-",
+            "account-",
+            "user-",
+            "org-",
+            "workspace-",
+            "session-",
+            "thread-",
+            "turn-",
+            "request-",
+        )
+    ):
+        return None
+    if "/" in text and any(
+        segment.lower() in {"users", "home", "private", "var", "tmp", "etc"}
+        for segment in text.split("/")
+    ):
+        return None
+    return text
+
+
+def safe_plan_type(value: Any) -> str | None:
+    """Normalize only known subscription plan labels, never arbitrary text."""
+
+    text = (safe_text(value, 64) or "").casefold().replace("-", "_")
+    aliases = {
+        "chatgpt_free": "free",
+        "chatgpt_plus": "plus",
+        "chatgpt_pro": "pro",
+        "chatgpt_team": "team",
+        "chatgpt_business": "business",
+        "chatgpt_enterprise": "enterprise",
+        "chatgpt_edu": "edu",
+    }
+    text = aliases.get(text, text)
+    return text if text in {
+        "free",
+        "go",
+        "plus",
+        "pro",
+        "team",
+        "business",
+        "enterprise",
+        "edu",
+    } else None
+
+
+def canonical_subscription_key(value: Any) -> str | None:
+    """Accept only the opaque HMAC identity format produced by this meter."""
+
+    if not isinstance(value, str):
+        return None
+    return value if re.fullmatch(r"subscription:[0-9a-f]{32}", value) else None
+
+
 def safe_email(value: Any) -> str | None:
     """Return a bounded local identity email suitable for escaped display."""
 
@@ -178,6 +252,22 @@ def safe_email(value: Any) -> str | None:
     if not local or not domain or "." not in domain:
         return None
     return text
+
+
+def normalize_email_identity(value: Any) -> str | None:
+    """Normalize a structured email without changing its mailbox identity.
+
+    The local part is deliberately not Gmail-normalized: ``+tag`` and dots
+    remain significant because CLIProxyAPI users commonly use tagged mailbox
+    aliases as distinct subscriptions.  Only Unicode representation and the
+    case-insensitive domain are normalized.
+    """
+
+    email = safe_email(value)
+    if not email:
+        return None
+    local, domain = email.rsplit("@", 1)
+    return f"{unicodedata.normalize('NFC', local)}@{unicodedata.normalize('NFC', domain).casefold()}"
 
 
 def is_auth_fallback_alias(value: Any) -> bool:
@@ -240,6 +330,19 @@ def first_present(mapping: Mapping[str, Any] | None, names: Sequence[str]) -> An
         if name in mapping and mapping[name] is not None:
             return mapping[name]
     return None
+
+
+def pagination_value_indicates_more(value: Any) -> bool:
+    """Conservatively interpret management pagination continuation flags."""
+
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().casefold() not in {"", "false", "0"}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    # Unknown objects/containers are not proof of a complete inventory.
+    return True
 
 
 def find_named_mapping(value: Any, key_name: str, depth: int = 0) -> Mapping[str, Any] | None:
@@ -462,15 +565,38 @@ class AccountIdentity:
     # display.  Email is deliberately never copied into SQLite usage/quota
     # rows, logs, queue payloads or health responses.
     account_email: str | None = None
+    # Email is the only human-readable identity retained, and remains in
+    # process memory.  The persisted subscription key is a keyed composite of
+    # the structured email and workspace.  A legacy principal hash exists only
+    # to migrate rows written by older builds and is never persisted anew.
+    principal_id_hash: str | None = None
+    subscription_id_hash: str | None = None
+    legacy_subscription_id_hash: str | None = None
 
 
 class AccountResolver:
-    """Best-effort, read-only mapping from local Codex homes to safe identities."""
+    """Best-effort, read-only mapping from local Codex homes to safe identities.
 
-    def __init__(self, home: Path | None = None, enabled: bool = True, refresh_seconds: float = 60.0):
+    Raw emails, workspace ids, JWT claims, filenames and token digests stay in
+    memory.  SQLite receives only a domain-separated HMAC subscription key.
+    """
+
+    def __init__(
+        self,
+        home: Path | None = None,
+        enabled: bool = True,
+        refresh_seconds: float = 60.0,
+        identity_key_file: Path | str | None = None,
+    ):
         self.home = home or Path.home()
         self.enabled = enabled
         self.refresh_seconds = refresh_seconds
+        self.identity_key_file = (
+            Path(identity_key_file).expanduser()
+            if identity_key_file is not None
+            else self.home / ".config" / "cliproxy-usage" / "identity.key"
+        )
+        self._identity_secret: bytes | None = None
         # ``0.0`` is a valid monotonic timestamp on fresh processes.  Use a
         # negative sentinel so the first resolve always performs a scan.
         self._last_refresh = -float("inf")
@@ -479,27 +605,29 @@ class AccountResolver:
         self._tokens: dict[str, AccountIdentity] = {}
         self._auth_indexes: dict[str, AccountIdentity] = {}
         self._accounts: dict[str, AccountIdentity] = {}
+        self._identity_keys: dict[str, AccountIdentity] = {}
+        self._legacy_identity_keys: dict[str, str] = {}
+        self._ambiguous_legacy_identity_keys: set[str] = set()
 
     def resolve(self, usage_alias: str | None, auth_fingerprint: str | None) -> AccountIdentity:
         self._refresh_if_needed()
-        if usage_alias and usage_alias in self._aliases:
-            return self._aliases[usage_alias]
         if auth_fingerprint and auth_fingerprint in self._tokens:
             matched = self._tokens[auth_fingerprint]
-            # ``auth:<fingerprint>`` is emitted as a temporary fallback when
-            # the queue wins a refresh/write race.  Prefer the now-known
-            # local alias so new events do not create a second account card.
-            resolved_alias = (
-                matched.usage_alias
-                if not usage_alias or is_auth_fallback_alias(usage_alias)
-                else usage_alias
-            )
+            # A locally matched token is stronger evidence than a caller-
+            # supplied alias.  In particular, never combine account B's token
+            # identity with account A's known alias when both are present.
+            resolved_alias = matched.usage_alias
             return AccountIdentity(
                 resolved_alias,
                 matched.account_id_hash,
                 matched.account_id_tail,
                 matched.account_email,
+                matched.principal_id_hash,
+                matched.subscription_id_hash,
+                matched.legacy_subscription_id_hash,
             )
+        if usage_alias and usage_alias in self._aliases:
+            return self._aliases[usage_alias]
         return AccountIdentity(usage_alias, None, None)
 
     def resolve_queue(
@@ -518,14 +646,26 @@ class AccountResolver:
         """
 
         self._refresh_if_needed()
+        digest = safe_text(access_token_sha256, 128)
         safe_index = safe_text(auth_index, 512)
+        valid_digest = bool(digest and re.fullmatch(r"[0-9a-fA-F]{64}", digest))
+        if valid_digest:
+            for force_refresh in (False, True):
+                if force_refresh:
+                    # A queue record can arrive while CLIProxyAPI is
+                    # atomically replacing an auth file.  Always retry one
+                    # fresh scan for a valid-but-currently-unknown digest,
+                    # even if the cache is less than a second old.
+                    self._refresh_if_needed(force=True)
+                identity = self._tokens.get(digest[:16].lower())
+                if identity is not None:
+                    return identity
+            # A cryptographic selector was supplied but did not match.  Never
+            # fall back to a reusable filename that may now belong to another
+            # Team member after credential rotation.
+            return AccountIdentity(None, None, None)
         if safe_index:
             identity = self._auth_indexes.get(Path(safe_index).name)
-            if identity is not None:
-                return identity
-        digest = safe_text(access_token_sha256, 128)
-        if digest and re.fullmatch(r"[0-9a-fA-F]{64}", digest):
-            identity = self._tokens.get(digest[:16].lower())
             if identity is not None:
                 return identity
         # The model alias is useful as a last-resort display label, but it is
@@ -533,37 +673,202 @@ class AccountResolver:
         # available.
         return AccountIdentity(None, None, None)
 
+    def resolve_auth_file(
+        self,
+        auth_name: str | None,
+        account_id: str | None = None,
+        account_email: str | None = None,
+        principal_id: str | None = None,
+        provider_subscription_id: str | None = None,
+    ) -> AccountIdentity:
+        """Resolve one management auth-file item to its local principal.
+
+        CLIProxyAPI's ``auth_index`` is an opaque call selector, while
+        ``name``/``id`` is the local JSON filename.  Matching by filename lets
+        us recover the stable JWT user principal without persisting the name,
+        email or raw claim.  Structured management fields are used only when
+        the local file has not become visible yet.  The filename itself is
+        never parsed as an email or identity.
+        """
+
+        self._refresh_if_needed()
+        safe_name = safe_text(auth_name, 512)
+        if safe_name:
+            identity = self._auth_indexes.get(Path(safe_name).name)
+            if identity is not None:
+                account = safe_text(account_id, 256)
+                incoming_email = normalize_email_identity(account_email)
+                local_email = normalize_email_identity(identity.account_email)
+                incoming_principal = safe_text(principal_id, 512)
+                incoming_provider_id = safe_text(provider_subscription_id, 512)
+                evidence_conflicts = bool(
+                    account
+                    and short_hash(account) != identity.account_id_hash
+                )
+                if incoming_email and local_email:
+                    # Email is the canonical member evidence.  A matching
+                    # structured email remains stable across JWT principal
+                    # rotation; a conflicting email is always fail-closed.
+                    if incoming_email != local_email:
+                        evidence_conflicts = True
+                elif (
+                    incoming_principal
+                    and identity.principal_id_hash
+                    and short_hash(incoming_principal) != identity.principal_id_hash
+                ):
+                    evidence_conflicts = True
+                # Provider ids are a fallback identity only.  Ignore their
+                # rotation when a stronger local email/principal exists, but
+                # compare them when both sides necessarily use that fallback.
+                if (
+                    incoming_provider_id
+                    and not local_email
+                    and not identity.principal_id_hash
+                    and identity.subscription_id_hash
+                    and self._private_hash(
+                        "codex-provider-subscription-v1", incoming_provider_id
+                    )
+                    != identity.subscription_id_hash
+                ):
+                    evidence_conflicts = True
+                if evidence_conflicts:
+                    # An exact local filename plus contradictory structured
+                    # claims is evidence of a stale/corrupt management item,
+                    # not permission to construct a second identity from the
+                    # incoming claims.
+                    return AccountIdentity(None, None, None)
+                return identity
+        account = safe_text(account_id, 256)
+        if not account:
+            return AccountIdentity(None, None, None)
+        if account_email or principal_id or provider_subscription_id:
+            return self._identity(
+                None,
+                account,
+                account_email,
+                principal_id,
+                provider_subscription_id,
+            )
+        return self._identity(None, account)
+
+    def auth_file_known(self, auth_name: str | None) -> bool:
+        """Return whether an exact local auth filename is currently indexed."""
+
+        safe_name = safe_text(auth_name, 512)
+        if not safe_name:
+            return False
+        self._refresh_if_needed()
+        return Path(safe_name).name in self._auth_indexes
+
     def resolve_account_id(self, account_id: str | None) -> AccountIdentity:
         account = safe_text(account_id, 256)
         if not account:
             return AccountIdentity(None, None, None)
         self._refresh_if_needed()
-        identity = self._accounts.get(account)
-        return identity if identity is not None else self._identity(None, account)
+        return self._identity(None, account)
 
     def resolve_account_hash(self, account_id_hash: str | None) -> AccountIdentity:
-        """Resolve a previously stored short account hash to a local alias."""
+        """Return only generic workspace metadata for a legacy account hash.
+
+        A currently unique workspace is not proof that its historical rows
+        belonged to the one member still visible today.  Account-only legacy
+        identities must never be promoted to a member subscription.
+        """
 
         target = safe_text(account_id_hash, 64)
         if not target:
             return AccountIdentity(None, None, None)
         self._refresh_if_needed()
-        for identity in self._accounts.values():
-            if identity.account_id_hash == target:
-                return identity
+        matches = [
+            identity
+            for identity in self._identity_keys.values()
+            if identity.account_id_hash == target
+        ]
+        if matches:
+            sample = matches[0]
+            return AccountIdentity(None, target, sample.account_id_tail)
         return AccountIdentity(None, None, None)
 
-    def _refresh_if_needed(self) -> None:
-        if not self.enabled or time.monotonic() - self._last_refresh < self.refresh_seconds:
+    def resolve_identity_key(self, value: str | None) -> AccountIdentity:
+        """Resolve a safe persisted identity key for dashboard-only metadata."""
+
+        key = safe_text(value, 300)
+        if not key:
+            return AccountIdentity(None, None, None)
+        self._refresh_if_needed()
+        canonical = self._legacy_identity_keys.get(key, key)
+        return self._identity_keys.get(canonical, AccountIdentity(None, None, None))
+
+    def subscription_account_hashes(self) -> set[str]:
+        """Return account hashes that have principal-scoped identities."""
+
+        self._refresh_if_needed()
+        return {
+            identity.account_id_hash
+            for identity in self._identity_keys.values()
+            if identity.account_id_hash and identity.subscription_id_hash
+        }
+
+    def active_subscription_keys(self, *, force_refresh: bool = False) -> set[str]:
+        """Return current local canonical keys without exposing their inputs."""
+
+        self._refresh_if_needed(force=force_refresh)
+        return {
+            key
+            for key in self._identity_keys
+            if canonical_subscription_key(key)
+        }
+
+    def identity_migrations(self) -> dict[str, str]:
+        """Return safe legacy-to-HMAC lineage proven by current auth files."""
+
+        self._refresh_if_needed()
+        return dict(self._legacy_identity_keys)
+
+    def ambiguous_legacy_account_keys(self) -> set[str]:
+        """Return workspace-only keys shared by multiple current members."""
+
+        self._refresh_if_needed()
+        counts: dict[str, set[str]] = {}
+        for key, identity in self._identity_keys.items():
+            if identity.account_id_hash and identity.subscription_id_hash:
+                counts.setdefault(identity.account_id_hash, set()).add(key)
+        return {
+            f"account:{account_hash}"
+            for account_hash, identities in counts.items()
+            if len(identities) > 1
+        }
+
+    def ambiguous_legacy_identity_keys(self) -> set[str]:
+        """Return old principal keys that map to multiple email identities."""
+
+        self._refresh_if_needed()
+        return set(self._ambiguous_legacy_identity_keys)
+
+    def _refresh_if_needed(self, *, force: bool = False) -> None:
+        if not self.enabled or (
+            not force and time.monotonic() - self._last_refresh < self.refresh_seconds
+        ):
             return
         with self._lock:
-            if time.monotonic() - self._last_refresh < self.refresh_seconds:
+            if not force and time.monotonic() - self._last_refresh < self.refresh_seconds:
                 return
-            aliases, tokens, auth_indexes, accounts = self._scan()
+            (
+                aliases,
+                tokens,
+                auth_indexes,
+                accounts,
+                identity_keys,
+                legacy_identity_keys,
+                ambiguous_legacy_identity_keys,
+            ) = self._scan()
             self._aliases = aliases
             self._tokens = tokens
             self._auth_indexes = auth_indexes
             self._accounts = accounts
+            self._identity_keys = identity_keys
+            self._legacy_identity_keys = legacy_identity_keys
+            self._ambiguous_legacy_identity_keys = ambiguous_legacy_identity_keys
             self._last_refresh = time.monotonic()
 
     def _scan(
@@ -573,11 +878,54 @@ class AccountResolver:
         dict[str, AccountIdentity],
         dict[str, AccountIdentity],
         dict[str, AccountIdentity],
+        dict[str, AccountIdentity],
+        dict[str, str],
+        set[str],
     ]:
         aliases: dict[str, AccountIdentity] = {}
         tokens: dict[str, AccountIdentity] = {}
         auth_indexes: dict[str, AccountIdentity] = {}
         accounts: dict[str, AccountIdentity] = {}
+        identity_keys: dict[str, AccountIdentity] = {}
+        legacy_identity_keys: dict[str, str] = {}
+        conflicted_legacy_keys: set[str] = set()
+
+        def remember_legacy_identity(old_key: str, new_key: str) -> None:
+            if old_key in conflicted_legacy_keys:
+                return
+            existing = legacy_identity_keys.get(old_key)
+            if existing is not None and existing != new_key:
+                # One old principal digest cannot prove which newer email
+                # identity owned its history.  Remove the mapping permanently
+                # for this scan instead of depending on filesystem order.
+                legacy_identity_keys.pop(old_key, None)
+                conflicted_legacy_keys.add(old_key)
+                return
+            legacy_identity_keys[old_key] = new_key
+
+        def remember_principal_fallback(
+            account_id: str,
+            account_email: str | None,
+            principal_id: str | None,
+            identity: AccountIdentity,
+        ) -> None:
+            principal = safe_text(principal_id, 512)
+            if (
+                not normalize_email_identity(account_email)
+                or not principal
+                or not identity.subscription_id_hash
+            ):
+                return
+            fallback = self._private_hash(
+                "codex-workspace-principal-v1", account_id, principal
+            )
+            canonical = f"subscription:{identity.subscription_id_hash}"
+            if fallback and f"subscription:{fallback}" != canonical:
+                # This keyed fallback was canonical before structured email
+                # became available.  Register it for every richer identity so
+                # two emails claiming the same principal become ambiguous
+                # instead of depending on filesystem order.
+                remember_legacy_identity(f"subscription:{fallback}", canonical)
         zshrc = self.home / ".zshrc"
         alias_homes: dict[str, Path] = {}
         try:
@@ -590,20 +938,129 @@ class AccountResolver:
         for match in pattern.finditer(text):
             alias_homes[match.group(1)] = self.home / match.group(2)
 
-        account_to_alias: dict[str, str] = {}
+        alias_records: list[dict[str, Any]] = []
         for alias, codex_home in alias_homes.items():
             data = self._read_json(codex_home / "auth.json")
-            account_id, access_tokens, account_email = self._account_and_tokens(data)
+            (
+                account_id,
+                access_tokens,
+                account_email,
+                principal_id,
+                provider_subscription_id,
+            ) = self._account_and_tokens(data)
             if not account_id:
                 continue
-            identity = self._identity(alias, account_id, account_email)
+            alias_records.append(
+                {
+                    "alias": alias,
+                    "account_id": account_id,
+                    "access_tokens": access_tokens,
+                    "account_email": account_email,
+                    "principal_id": principal_id,
+                    "provider_subscription_id": provider_subscription_id,
+                }
+            )
+
+        subscription_to_alias: dict[str, str] = {}
+        token_to_alias: dict[str, str] = {}
+        conflicted_token_fingerprints: set[str] = set()
+        account_identities: dict[str, dict[str, AccountIdentity]] = {}
+        alias_records_by_name = {
+            str(record["alias"]): record for record in alias_records
+        }
+
+        def alias_evidence_compatible(
+            identity: AccountIdentity,
+            account_id: str,
+            account_email: str | None,
+            principal_id: str | None,
+        ) -> bool:
+            if short_hash(account_id) != identity.account_id_hash:
+                return False
+            incoming_email = normalize_email_identity(account_email)
+            known_email = normalize_email_identity(identity.account_email)
+            principal = safe_text(principal_id, 512)
+            if incoming_email and known_email:
+                if incoming_email != known_email:
+                    return False
+            elif (
+                principal
+                and identity.principal_id_hash
+                and short_hash(principal) != identity.principal_id_hash
+            ):
+                return False
+            return True
+
+        def remember_token_identity(
+            fingerprint: str,
+            identity: AccountIdentity,
+            alias: str | None,
+        ) -> None:
+            if fingerprint in conflicted_token_fingerprints:
+                return
+            existing = tokens.get(fingerprint)
+            if existing is not None and (
+                resolved_identity_key(existing) != resolved_identity_key(identity)
+            ):
+                # A token claimed by conflicting structured principals is not
+                # safe identity evidence.  Auth filename matching can still
+                # resolve queue rows without letting filesystem order choose.
+                tokens.pop(fingerprint, None)
+                token_to_alias.pop(fingerprint, None)
+                conflicted_token_fingerprints.add(fingerprint)
+                return
+            tokens[fingerprint] = identity
+            if not alias:
+                return
+            existing_alias = token_to_alias.get(fingerprint)
+            if existing_alias and existing_alias != alias:
+                existing_identity = aliases.get(existing_alias)
+                if existing_identity is None or (
+                    resolved_identity_key(existing_identity)
+                    != resolved_identity_key(identity)
+                ):
+                    tokens.pop(fingerprint, None)
+                    token_to_alias.pop(fingerprint, None)
+                    conflicted_token_fingerprints.add(fingerprint)
+                    return
+                # Two local aliases for the same canonical subscription are
+                # harmless; retain the first stable display mapping.
+                return
+            token_to_alias[fingerprint] = alias
+
+        for record in alias_records:
+            alias = str(record["alias"])
+            account_id = str(record["account_id"])
+            access_tokens = record["access_tokens"]
+            identity = self._identity(
+                alias,
+                account_id,
+                record.get("account_email"),
+                record.get("principal_id"),
+                record.get("provider_subscription_id"),
+            )
             aliases[alias] = identity
-            account_to_alias[account_id] = alias
-            accounts[account_id] = identity
+            if identity.subscription_id_hash:
+                subscription_to_alias[identity.subscription_id_hash] = alias
+            identity_keys[resolved_identity_key(identity)] = identity
+            if identity.legacy_subscription_id_hash and identity.subscription_id_hash:
+                remember_legacy_identity(
+                    f"subscription:{identity.legacy_subscription_id_hash}",
+                    f"subscription:{identity.subscription_id_hash}",
+                )
+            remember_principal_fallback(
+                account_id,
+                record.get("account_email"),
+                record.get("principal_id"),
+                identity,
+            )
+            account_identities.setdefault(account_id, {})[
+                resolved_identity_key(identity)
+            ] = identity
             for token in access_tokens:
                 fingerprint = short_hash(token)
                 if fingerprint:
-                    tokens[fingerprint] = identity
+                    remember_token_identity(fingerprint, identity, alias)
 
         proxy_dir = self.home / ".cli-proxy-api"
         try:
@@ -624,23 +1081,99 @@ class AccountResolver:
             )
             if (provider or "").lower() != "codex" and not path.name.startswith("codex-"):
                 continue
-            account_id, access_tokens, account_email = self._account_and_tokens(data)
+            (
+                account_id,
+                access_tokens,
+                account_email,
+                principal_id,
+                provider_subscription_id,
+            ) = self._account_and_tokens(data)
             if not account_id:
                 continue
-            alias = account_to_alias.get(account_id)
-            known = accounts.get(account_id)
+            subscription_hash = self._subscription_hash(
+                account_id,
+                account_email,
+                principal_id,
+                provider_subscription_id,
+            )
+            alias = subscription_to_alias.get(subscription_hash or "")
+            if alias:
+                candidate = aliases.get(alias)
+                if candidate is None or not alias_evidence_compatible(
+                    candidate, account_id, account_email, principal_id
+                ):
+                    alias = None
+            if not alias:
+                for token in access_tokens:
+                    candidate_alias = token_to_alias.get(short_hash(token) or "")
+                    candidate = aliases.get(candidate_alias or "")
+                    if candidate_alias and candidate and alias_evidence_compatible(
+                        candidate, account_id, account_email, principal_id
+                    ):
+                        alias = candidate_alias
+                        break
+            known = aliases.get(alias or "")
+            known_record = alias_records_by_name.get(alias or "", {})
             identity = self._identity(
                 alias,
                 account_id,
                 account_email or (known.account_email if known else None),
+                principal_id or known_record.get("principal_id"),
+                provider_subscription_id
+                or known_record.get("provider_subscription_id"),
             )
-            accounts[account_id] = identity
             auth_indexes[path.name] = identity
+            key = resolved_identity_key(identity)
+            if alias and identity.subscription_id_hash:
+                existing_alias = aliases.get(alias)
+                if existing_alias:
+                    old_key = resolved_identity_key(existing_alias)
+                    aliases[alias] = identity
+                    subscription_to_alias[identity.subscription_id_hash] = alias
+                    if old_key != key:
+                        if old_key.startswith("subscription:") and key.startswith(
+                            "subscription:"
+                        ):
+                            remember_legacy_identity(old_key, key)
+                        identity_keys.pop(old_key, None)
+                        account_identities.get(account_id, {}).pop(old_key, None)
+                    for fingerprint, mapped_alias in token_to_alias.items():
+                        if mapped_alias == alias:
+                            tokens[fingerprint] = identity
+            identity_keys[key] = identity
+            if identity.legacy_subscription_id_hash and identity.subscription_id_hash:
+                remember_legacy_identity(
+                    f"subscription:{identity.legacy_subscription_id_hash}",
+                    f"subscription:{identity.subscription_id_hash}",
+                )
+            remember_principal_fallback(
+                account_id,
+                account_email or (known.account_email if known else None),
+                principal_id or known_record.get("principal_id"),
+                identity,
+            )
+            account_identities.setdefault(account_id, {})[key] = identity
             for token in access_tokens:
                 fingerprint = short_hash(token)
                 if fingerprint:
-                    tokens[fingerprint] = identity
-        return aliases, tokens, auth_indexes, accounts
+                    remember_token_identity(fingerprint, identity, alias)
+
+        for account_id, keyed in account_identities.items():
+            sample = next(iter(keyed.values()))
+            accounts[account_id] = AccountIdentity(
+                None,
+                sample.account_id_hash,
+                sample.account_id_tail,
+            )
+        return (
+            aliases,
+            tokens,
+            auth_indexes,
+            accounts,
+            identity_keys,
+            legacy_identity_keys,
+            conflicted_legacy_keys,
+        )
 
     @staticmethod
     def _read_json(path: Path) -> Any:
@@ -652,43 +1185,215 @@ class AccountResolver:
             return None
 
     @staticmethod
-    def _account_and_tokens(data: Any) -> tuple[str | None, list[str], str | None]:
+    def _account_and_tokens(
+        data: Any,
+    ) -> tuple[str | None, list[str], str | None, str | None, str | None]:
         if not isinstance(data, Mapping):
-            return None, [], None
+            return None, [], None, None, None
         nested = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
-        account_id = safe_text(first_present(nested, ("account_id",)) or data.get("account_id"), 256)
         raw_tokens = [nested.get("access_token"), data.get("access_token")]
-        claims = _decode_jwt_claims_unverified(
-            nested.get("id_token") or data.get("id_token")
-        )
-        auth_claims = claims.get("https://api.openai.com/auth")
-        auth_claims = auth_claims if isinstance(auth_claims, Mapping) else {}
-        profile_claims = claims.get("https://api.openai.com/profile")
-        profile_claims = profile_claims if isinstance(profile_claims, Mapping) else {}
-        account_email = safe_email(
-            data.get("email")
-            or nested.get("email")
-            or claims.get("email")
-            or auth_claims.get("email")
-            or profile_claims.get("email")
-        )
+
+        def decoded_claims(value: Any) -> Mapping[str, Any]:
+            return value if isinstance(value, Mapping) else _decode_jwt_claims_unverified(value)
+
+        claim_sets = [
+            decoded_claims(value)
+            for value in (
+                nested.get("id_token"),
+                data.get("id_token"),
+                nested.get("access_token"),
+                data.get("access_token"),
+            )
+            if value is not None
+        ]
+        structured_claims: list[
+            tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]
+        ] = []
+        for claims in claim_sets:
+            auth_claims = claims.get("https://api.openai.com/auth")
+            profile_claims = claims.get("https://api.openai.com/profile")
+            structured_claims.append(
+                (
+                    claims,
+                    auth_claims if isinstance(auth_claims, Mapping) else {},
+                    profile_claims if isinstance(profile_claims, Mapping) else {},
+                )
+            )
+
+        account_candidates = [nested.get("account_id"), data.get("account_id")]
+        account_candidates.append(data.get("chatgpt_account_id"))
+        for claims, auth_claims, _profile_claims in structured_claims:
+            account_candidates.extend(
+                (auth_claims.get("chatgpt_account_id"), claims.get("chatgpt_account_id"))
+            )
+        valid_accounts = [
+            account
+            for value in account_candidates
+            if (account := safe_text(value, 256)) is not None
+        ]
+        if len(set(valid_accounts)) > 1:
+            return None, [], None, None, None
+        account_id = valid_accounts[0] if valid_accounts else None
+
+        email_candidates: list[Any] = [data.get("email"), nested.get("email")]
+        for claims, auth_claims, profile_claims in structured_claims:
+            email_candidates.extend(
+                (claims.get("email"), auth_claims.get("email"), profile_claims.get("email"))
+            )
+        valid_emails = [
+            email
+            for value in email_candidates
+            if (email := safe_email(value)) is not None
+        ]
+        normalized_emails = {
+            normalized
+            for email in valid_emails
+            if (normalized := normalize_email_identity(email)) is not None
+        }
+        if len(normalized_emails) > 1:
+            # Contradictory structured claims are not a precedence question.
+            # Reject the complete auth record so neither a lower-priority
+            # principal nor a token can guess which member owns it.
+            return None, [], None, None, None
+        account_email = valid_emails[0] if valid_emails else None
+
+        explicit_principal_candidates: list[Any] = [data.get("chatgpt_user_id")]
+        subject_candidates: list[Any] = []
+        for claims, auth_claims, _profile_claims in structured_claims:
+            explicit_principal_candidates.extend(
+                (
+                    auth_claims.get("chatgpt_user_id"),
+                    auth_claims.get("user_id"),
+                    claims.get("chatgpt_user_id"),
+                )
+            )
+            subject_candidates.append(claims.get("sub"))
+        explicit_principals = [
+            principal
+            for value in explicit_principal_candidates
+            if (principal := safe_text(value, 512)) is not None
+        ]
+        subjects = [
+            subject
+            for value in subject_candidates
+            if (subject := safe_text(value, 512)) is not None
+        ]
+        principal_values = explicit_principals or subjects
+        if not account_email and len(set(principal_values)) > 1:
+            return None, [], None, None, None
+        principal_id = principal_values[0] if principal_values else None
+
+        provider_candidates: list[Any] = [
+            data.get("subscription_id"),
+            data.get("chatgpt_subscription_id"),
+            nested.get("subscription_id"),
+        ]
+        for claims, auth_claims, _profile_claims in structured_claims:
+            provider_candidates.extend(
+                (
+                    auth_claims.get("subscription_id"),
+                    auth_claims.get("chatgpt_subscription_id"),
+                    claims.get("subscription_id"),
+                    claims.get("chatgpt_subscription_id"),
+                )
+            )
+        provider_values = [
+            provider
+            for value in provider_candidates
+            if (provider := safe_text(value, 512)) is not None
+        ]
+        if not account_email and not principal_id and len(set(provider_values)) > 1:
+            return None, [], None, None, None
+        provider_subscription_id = provider_values[0] if provider_values else None
         return (
             account_id,
             [token for token in raw_tokens if isinstance(token, str) and token],
             account_email,
+            principal_id,
+            provider_subscription_id,
         )
 
-    @staticmethod
+    def _load_identity_secret(self) -> bytes:
+        if self._identity_secret is not None:
+            return self._identity_secret
+        path = self.identity_key_file
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise ValueError("identity key path must not be a symlink")
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            descriptor = None
+        if descriptor is not None:
+            try:
+                os.write(descriptor, secrets.token_hex(32).encode("ascii"))
+            finally:
+                os.close(descriptor)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("identity key must be a regular file")
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            raise PermissionError("identity key must be owner-only (mode 600)")
+        raw = path.read_bytes()
+        if len(raw) > 128:
+            raise ValueError("identity key is invalid")
+        try:
+            secret = bytes.fromhex(raw.decode("ascii").strip())
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("identity key is invalid") from exc
+        if len(secret) != 32:
+            raise ValueError("identity key is invalid")
+        self._identity_secret = secret
+        return secret
+
+    def _private_hash(self, domain: str, *parts: str) -> str:
+        payload = "\0".join((domain, *parts)).encode("utf-8", "strict")
+        return hmac.new(self._load_identity_secret(), payload, hashlib.sha256).hexdigest()[:32]
+
+    def _subscription_hash(
+        self,
+        account_id: str,
+        account_email: str | None,
+        principal_id: str | None = None,
+        provider_subscription_id: str | None = None,
+    ) -> str | None:
+        email = normalize_email_identity(account_email)
+        if email:
+            return self._private_hash("codex-workspace-email-v1", account_id, email)
+        principal = safe_text(principal_id, 512)
+        if principal:
+            return self._private_hash("codex-workspace-principal-v1", account_id, principal)
+        provider_id = safe_text(provider_subscription_id, 512)
+        if provider_id:
+            return self._private_hash("codex-provider-subscription-v1", provider_id)
+        return None
+
     def _identity(
+        self,
         alias: str | None,
         account_id: str,
         account_email: str | None = None,
+        principal_id: str | None = None,
+        provider_subscription_id: str | None = None,
     ) -> AccountIdentity:
+        principal = safe_text(principal_id, 512)
         return AccountIdentity(
             alias,
             short_hash(account_id),
             account_id[-8:] if account_id else None,
             safe_email(account_email),
+            short_hash(principal),
+            self._subscription_hash(
+                account_id,
+                account_email,
+                principal,
+                provider_subscription_id,
+            ),
+            short_hash(f"{account_id}\0{principal}") if principal else None,
         )
 
 
@@ -710,6 +1415,36 @@ def identity_key(
     if session_id:
         return f"session:{short_hash(session_id)}"
     return "unknown"
+
+
+def resolved_identity_key(
+    identity: AccountIdentity,
+    usage_alias: str | None = None,
+    auth_fingerprint: str | None = None,
+    installation_id: str | None = None,
+    session_id: str | None = None,
+) -> str:
+    """Return the principal-scoped key when a stable JWT user is known.
+
+    ``chatgpt_account_id`` identifies a workspace for Team subscriptions and
+    can therefore collide across users.  A composite subscription hash takes
+    precedence; old/sparse auth formats retain the established fallback key
+    order for backward compatibility.
+    """
+
+    if identity.subscription_id_hash:
+        canonical = canonical_subscription_key(
+            f"subscription:{identity.subscription_id_hash}"
+        )
+        if canonical:
+            return canonical
+    return identity_key(
+        identity.account_id_hash,
+        usage_alias if usage_alias is not None else identity.usage_alias,
+        auth_fingerprint,
+        installation_id,
+        session_id,
+    )
 
 
 @dataclass
@@ -740,27 +1475,10 @@ def request_info(
 ) -> RequestInfo:
     parsed = parse_json_bytes(body)
     payload = parsed if isinstance(parsed, Mapping) else {}
-    metadata = find_named_mapping(payload, "client_metadata") or {}
     usage_alias = safe_alias(headers.get("X-Usage-Alias"))
-    session_id = safe_text(
-        first_present(metadata, ("session_id", "sessionId")) or headers.get("X-Usage-Session"), 256
-    )
-    thread_id = safe_text(first_present(metadata, ("thread_id", "threadId")), 256)
-    turn_id = safe_text(first_present(metadata, ("turn_id", "turnId")), 256)
-    installation_id = safe_text(
-        first_present(metadata, ("x-codex-installation-id", "installation_id", "installationId"))
-        or headers.get("X-Codex-Installation-Id"),
-        256,
-    )
-    window_id = safe_text(
-        first_present(metadata, ("x-codex-window-id", "window_id", "windowId"))
-        or headers.get("X-Codex-Window-Id"),
-        256,
-    )
     model = safe_text(payload.get("model"), 200)
     stream_value = payload.get("stream")
     stream = int(stream_value is True or str(stream_value).lower() in {"1", "true", "yes"})
-    usage_project = redact_text(headers.get("X-Usage-Project"), 256)
 
     authorization = headers.get("Authorization", "")
     token: str | None = None
@@ -771,22 +1489,24 @@ def request_info(
     auth_fingerprint = short_hash(token)
     identity = resolver.resolve(usage_alias, auth_fingerprint)
     resolved_alias = usage_alias or identity.usage_alias
-    key = identity_key(
-        identity.account_id_hash, resolved_alias, auth_fingerprint, installation_id, session_id
+    key = (
+        f"subscription:{identity.subscription_id_hash}"
+        if identity.subscription_id_hash
+        else "unknown"
     )
     return RequestInfo(
         endpoint=endpoint,
         method=method,
         model=model,
         stream=stream,
-        session_id=session_id,
-        thread_id=thread_id,
-        turn_id=turn_id,
-        installation_id=installation_id,
-        window_id=window_id,
+        session_id=None,
+        thread_id=None,
+        turn_id=None,
+        installation_id=None,
+        window_id=None,
         usage_alias=resolved_alias,
-        usage_project=usage_project,
-        auth_fingerprint=auth_fingerprint,
+        usage_project=None,
+        auth_fingerprint=None,
         account_id_hash=identity.account_id_hash,
         account_id_tail=identity.account_id_tail,
         identity_key=key,
@@ -877,6 +1597,10 @@ def period_start(period: str, now: datetime | None = None) -> str:
 class UsageRepository:
     def __init__(self, path: Path | str):
         self.path = Path(path).expanduser().resolve()
+        # A WAL checkpoint can be temporarily blocked by a live reader.  Keep
+        # the retry state in process memory; startup privacy minimization also
+        # retries after a restart, so no identifiable pages are abandoned.
+        self._privacy_checkpoint_pending = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -885,6 +1609,7 @@ class UsageRepository:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA secure_delete=ON")
         return conn
 
     def initialize(self) -> None:
@@ -1046,6 +1771,61 @@ class UsageRepository:
                   turn_id TEXT,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS anonymous_usage_daily (
+                  bucket_start TEXT NOT NULL,
+                  model TEXT NOT NULL,
+                  status_code INTEGER NOT NULL,
+                  ok INTEGER NOT NULL,
+                  usage_missing INTEGER NOT NULL,
+                  long_context_pricing_applied INTEGER NOT NULL,
+                  split_priced INTEGER NOT NULL,
+                  total_priced INTEGER NOT NULL,
+                  calls INTEGER NOT NULL,
+                  streaming_calls INTEGER NOT NULL DEFAULT 0,
+                  non_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                  codex_status_tokens INTEGER NOT NULL DEFAULT 0,
+                  duration_ms INTEGER NOT NULL,
+                  input_tokens INTEGER,
+                  cached_tokens INTEGER,
+                  cache_write_tokens INTEGER,
+                  output_tokens INTEGER,
+                  reasoning_tokens INTEGER,
+                  total_tokens INTEGER,
+                  estimated_api_cost_usd REAL,
+                  non_cached_input_cost_usd REAL,
+                  cached_input_cost_usd REAL,
+                  output_cost_usd REAL,
+                  PRIMARY KEY (
+                    bucket_start, model, status_code, ok, usage_missing,
+                    long_context_pricing_applied, split_priced, total_priced
+                  )
+                );
+
+                CREATE TABLE IF NOT EXISTS active_subscription_registry (
+                  identity_key TEXT PRIMARY KEY,
+                  state TEXT NOT NULL CHECK (state IN ('active', 'suspect_missing')),
+                  first_seen_at TEXT NOT NULL,
+                  last_seen_at TEXT NOT NULL,
+                  missing_since TEXT,
+                  consecutive_misses INTEGER NOT NULL DEFAULT 0,
+                  last_scan_generation INTEGER NOT NULL,
+                  high_risk_missing INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS subscription_inventory_state (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  initialized INTEGER NOT NULL DEFAULT 0,
+                  generation INTEGER NOT NULL DEFAULT 0,
+                  last_complete_at TEXT,
+                  last_active_count INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS retired_subscription_tombstones (
+                  identity_key TEXT PRIMARY KEY,
+                  retired_at TEXT NOT NULL,
+                  last_scan_generation INTEGER NOT NULL
+                );
                 """
             )
             self._ensure_column(conn, "usage_events", "identity_key", "TEXT")
@@ -1071,6 +1851,50 @@ class UsageRepository:
             self._ensure_column(conn, "price_sync_metadata", "repriced_events", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "quota_events", "identity_key", "TEXT")
             self._ensure_column(conn, "account_quota_cycles", "identity_key", "TEXT")
+            self._ensure_column(
+                conn,
+                "anonymous_usage_daily",
+                "streaming_calls",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn,
+                "anonymous_usage_daily",
+                "non_cached_input_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn,
+                "anonymous_usage_daily",
+                "codex_status_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            # Older anonymous buckets predate the exact per-event derived
+            # counters.  Their original distribution cannot be recovered,
+            # but retain the best aggregate lower bound instead of leaving a
+            # misleading all-zero value.  Newly written exact zeroes cannot
+            # satisfy this predicate with a positive aggregate expression.
+            conn.execute(
+                """UPDATE anonymous_usage_daily
+                      SET non_cached_input_tokens=
+                            MAX(COALESCE(input_tokens, 0)
+                                - COALESCE(cached_tokens, 0), 0),
+                          codex_status_tokens=
+                            MAX(COALESCE(input_tokens, 0)
+                                - COALESCE(cached_tokens, 0), 0)
+                            + COALESCE(output_tokens, 0)
+                    WHERE non_cached_input_tokens=0
+                      AND codex_status_tokens=0
+                      AND (MAX(COALESCE(input_tokens, 0)
+                               - COALESCE(cached_tokens, 0), 0)
+                           + COALESCE(output_tokens, 0))>0"""
+            )
+            self._ensure_column(
+                conn,
+                "active_subscription_registry",
+                "high_risk_missing",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts);
@@ -1085,6 +1909,54 @@ class UsageRepository:
                   ON local_import_records(source, imported_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_local_import_files_updated
                   ON local_import_files(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_anonymous_usage_daily_bucket
+                  ON anonymous_usage_daily(bucket_start);
+                CREATE INDEX IF NOT EXISTS idx_active_subscription_registry_state
+                  ON active_subscription_registry(state, consecutive_misses);
+                CREATE INDEX IF NOT EXISTS idx_retired_subscription_tombstones_at
+                  ON retired_subscription_tombstones(retired_at);
+                """
+            )
+            conn.executescript(
+                """
+                DROP VIEW IF EXISTS usage_statistics;
+                CREATE VIEW usage_statistics AS
+                SELECT id, ts, identity_key, endpoint, method, model,
+                       status_code, ok, duration_ms, stream, session_id,
+                       thread_id, turn_id, installation_id, window_id,
+                       usage_alias, usage_project, auth_fingerprint,
+                       account_id_hash, account_id_tail, input_tokens,
+                       output_tokens, cached_tokens, cache_write_tokens,
+                       reasoning_tokens, total_tokens, estimated_api_cost_usd,
+                       non_cached_input_cost_usd, cached_input_cost_usd,
+                       output_cost_usd, long_context_pricing_applied,
+                       subscription_amortized_cost_usd,
+                       api_equivalent_quota_usd, usage_missing, error_type,
+                       error_message_redacted, request_bytes, response_bytes,
+                       call_count, source, request_id,
+                       CASE WHEN stream=1 THEN call_count ELSE 0 END
+                         AS streaming_call_count,
+                       MAX(COALESCE(input_tokens, 0)
+                           - COALESCE(cached_tokens, 0), 0)
+                         AS non_cached_input_token_count,
+                       MAX(COALESCE(input_tokens, 0)
+                           - COALESCE(cached_tokens, 0), 0)
+                         + COALESCE(output_tokens, 0)
+                         AS codex_status_token_count
+                  FROM usage_events
+                UNION ALL
+                SELECT -rowid, bucket_start, NULL, NULL, NULL,
+                       NULLIF(model, '(unknown)'), status_code, ok,
+                       duration_ms, 0, NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, NULL, NULL, input_tokens,
+                       output_tokens, cached_tokens, cache_write_tokens,
+                       reasoning_tokens, total_tokens, estimated_api_cost_usd,
+                       non_cached_input_cost_usd, cached_input_cost_usd,
+                       output_cost_usd, long_context_pricing_applied,
+                       NULL, NULL, usage_missing, NULL, NULL, 0, 0,
+                       calls, 'anonymous', NULL, streaming_calls,
+                       non_cached_input_tokens, codex_status_tokens
+                  FROM anonymous_usage_daily;
                 """
             )
             self._backfill_frozen_cost_components(conn)
@@ -1378,61 +2250,102 @@ class UsageRepository:
             return self._upgrade_long_context_costs(conn)
 
     def reconcile_auth_identities(self, resolver: AccountResolver) -> int:
-        """Re-bind provisional queue identities after auth files become visible.
+        """Re-bind provisional rows only when current member evidence proves them.
 
         CLIProxyAPI may publish a usage-queue item in the same moment that it
         refreshes an auth file.  If the resolver scans before that file is
         complete, the event is stored as ``alias:auth:<fingerprint>``.  That
         identity would otherwise remain a permanent, misleading ``UNKNOWN``
-        dashboard card even after the file is available.  Reconciliation is
-        deliberately narrow: it only considers rows carrying an auth
-        fingerprint and only rewrites provisional/partially-resolved fields.
-        Tokens themselves are never read from or written to SQLite.
+        dashboard card even after the file is available. Team members share a
+        workspace account id, so an account hash by itself never selects a
+        member. Only a still-resolvable provider-token fingerprint or explicit
+        Codex alias can prove the canonical subscription; ambiguous legacy rows
+        are later folded into anonymous token totals.
         """
 
         if not resolver.enabled:
             return 0
+        scoped_account_hashes = sorted(resolver.subscription_account_hashes())
+        privacy_rows_removed = False
         with self.connect() as conn:
-            rows = conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            for tombstone in conn.execute(
+                "SELECT identity_key FROM retired_subscription_tombstones"
+            ).fetchall():
+                removed = self._anonymize_subscription_conn(conn, tombstone[0])
+                privacy_rows_removed = privacy_rows_removed or any(removed.values())
+            for ambiguous_key in sorted(resolver.ambiguous_legacy_identity_keys()):
+                removed = self._anonymize_subscription_conn(conn, ambiguous_key)
+                privacy_rows_removed = privacy_rows_removed or any(removed.values())
+            collision_clause = ""
+            collision_params: tuple[str, ...] = ()
+            if scoped_account_hashes:
+                placeholders = ",".join("?" for _ in scoped_account_hashes)
+                collision_clause = f"""
+                    OR (
+                         identity_key NOT LIKE 'subscription:%'
+                         AND account_id_hash IN ({placeholders})
+                         AND (auth_fingerprint IS NOT NULL OR usage_alias IS NOT NULL)
+                       )
                 """
-                SELECT id, identity_key, usage_alias, auth_fingerprint,
+                collision_params = tuple(scoped_account_hashes)
+            rows = conn.execute(
+                f"""
+                SELECT id, identity_key, usage_alias, auth_fingerprint, source,
                        account_id_hash, account_id_tail
                  FROM usage_events
-                 WHERE auth_fingerprint IS NOT NULL
-                   AND (
+                 WHERE (
+                       auth_fingerprint IS NOT NULL
+                       AND (
                          usage_alias LIKE 'auth:%'
                          OR identity_key LIKE 'alias:auth:%'
                          OR account_id_hash IS NULL
                        )
-                """
+                      )
+                      {collision_clause}
+                """,
+                collision_params,
             ).fetchall()
             changed = 0
             related: dict[str, tuple[str, str | None, str | None, str | None]] = {}
             for row in rows:
                 fingerprint = safe_text(row["auth_fingerprint"], 64)
-                if not fingerprint:
-                    continue
                 current_alias = safe_text(row["usage_alias"], 128)
-                identity_is_provisional = (
-                    is_auth_fallback_alias(current_alias)
-                    or str(row["identity_key"] or "").startswith("alias:auth:")
-                    or row["account_id_hash"] is None
+                identity = resolver.resolve(
+                    None,
+                    fingerprint.lower()[:16] if fingerprint else None,
                 )
-                if not identity_is_provisional:
+                if (
+                    not identity.account_id_hash
+                    and not identity.usage_alias
+                    and current_alias
+                    and not is_auth_fallback_alias(current_alias)
+                    and row["source"] != "usage_queue"
+                ):
+                    identity = resolver.resolve(current_alias, None)
+                if not identity.subscription_id_hash:
                     continue
-                identity = resolver.resolve(None, fingerprint.lower()[:16])
-                if not identity.account_id_hash and not identity.usage_alias:
-                    identity = resolver.resolve_account_hash(row["account_id_hash"])
-                if not identity.account_id_hash and not identity.usage_alias:
+                if (
+                    row["account_id_hash"] in scoped_account_hashes
+                    and not identity.subscription_id_hash
+                ):
+                    # A legacy queue token can rotate out of the local auth
+                    # set.  Its old alias was account-derived and is not safe
+                    # evidence for choosing one Team member.
                     continue
                 resolved_alias = identity.usage_alias
-                resolved_key = identity_key(
-                    identity.account_id_hash,
+                resolved_key = resolved_identity_key(
+                    identity,
                     resolved_alias,
-                    fingerprint.lower()[:16],
-                    None,
-                    None,
+                    fingerprint.lower()[:16] if fingerprint else None,
                 )
+                if not self._subscription_detail_allowed_conn(conn, resolved_key):
+                    conn.execute(
+                        "UPDATE usage_events SET identity_key='unknown' WHERE id=?",
+                        (row["id"],),
+                    )
+                    changed += 1
+                    continue
                 if (
                     row["identity_key"] == resolved_key
                     and row["usage_alias"] == resolved_alias
@@ -1456,7 +2369,9 @@ class UsageRepository:
                 )
                 changed += max(int(cursor.rowcount), 0)
                 old_key = safe_text(row["identity_key"], 300)
-                if old_key:
+                if old_key and (
+                    old_key.startswith("alias:auth:") or old_key.startswith("auth:")
+                ):
                     related[old_key] = (
                         resolved_key,
                         resolved_alias,
@@ -1493,10 +2408,9 @@ class UsageRepository:
                 related_rows = conn.execute(
                     f"""
                     SELECT id, identity_key, usage_alias, account_id_hash, account_id_tail
-                      FROM {table}
+                     FROM {table}
                      WHERE usage_alias LIKE 'auth:%'
                         OR identity_key LIKE 'alias:auth:%'
-                        OR account_id_hash IS NULL
                     """
                 ).fetchall()
                 for row in related_rows:
@@ -1510,18 +2424,18 @@ class UsageRepository:
                         if match:
                             fingerprint = match.group(1)[5:]
                     identity = resolver.resolve(None, fingerprint.lower() if fingerprint else None)
-                    if not identity.account_id_hash and not identity.usage_alias:
-                        identity = resolver.resolve_account_hash(row["account_id_hash"])
-                    if not identity.account_id_hash and not identity.usage_alias:
+                    if not identity.subscription_id_hash:
                         continue
                     resolved_alias = identity.usage_alias
-                    resolved_key = identity_key(
-                        identity.account_id_hash,
+                    resolved_key = resolved_identity_key(
+                        identity,
                         resolved_alias,
                         fingerprint.lower() if fingerprint else None,
-                        None,
-                        None,
                     )
+                    if not self._subscription_detail_allowed_conn(conn, resolved_key):
+                        conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
+                        changed += 1
+                        continue
                     if (
                         row["identity_key"] == resolved_key
                         and row["usage_alias"] == resolved_alias
@@ -1544,7 +2458,817 @@ class UsageRepository:
                         ),
                     )
                     changed += 1
-            return changed
+            for old_key, new_key in resolver.identity_migrations().items():
+                if old_key == new_key:
+                    continue
+                if not self._prepare_proven_identity_migration_conn(
+                    conn, old_key, new_key
+                ):
+                    removed = self._anonymize_subscription_conn(conn, old_key)
+                    privacy_rows_removed = privacy_rows_removed or any(removed.values())
+                    changed += int(removed.get("usage_events") or 0)
+                    continue
+                changed += max(
+                    int(
+                        conn.execute(
+                            "UPDATE usage_events SET identity_key=? WHERE identity_key=?",
+                            (new_key, old_key),
+                        ).rowcount
+                    ),
+                    0,
+                )
+                for table in ("quota_events", "account_quota_cycles"):
+                    conn.execute(
+                        f"UPDATE {table} SET identity_key=? WHERE identity_key=?",
+                        (new_key, old_key),
+                    )
+                conn.execute(
+                    """UPDATE OR IGNORE subscription_quota_snapshots
+                          SET identity_key=? WHERE identity_key=?""",
+                    (new_key, old_key),
+                )
+                conn.execute(
+                    "DELETE FROM subscription_quota_snapshots WHERE identity_key=?",
+                    (old_key,),
+                )
+            conn.execute(
+                """UPDATE usage_events SET endpoint=NULL, method=NULL,
+                     session_id=NULL, thread_id=NULL, turn_id=NULL,
+                     installation_id=NULL, window_id=NULL, usage_alias=NULL,
+                     usage_project=NULL, auth_fingerprint=NULL,
+                     account_id_hash=NULL, account_id_tail=NULL,
+                     error_type=NULL, error_message_redacted=NULL, request_bytes=0,
+                     response_bytes=0, request_id=NULL
+                   WHERE endpoint IS NOT NULL OR method IS NOT NULL
+                      OR session_id IS NOT NULL OR thread_id IS NOT NULL
+                      OR turn_id IS NOT NULL OR installation_id IS NOT NULL
+                      OR window_id IS NOT NULL OR usage_alias IS NOT NULL
+                      OR usage_project IS NOT NULL OR auth_fingerprint IS NOT NULL
+                      OR account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR error_type IS NOT NULL OR error_message_redacted IS NOT NULL
+                      OR COALESCE(request_bytes, 0)!=0
+                      OR COALESCE(response_bytes, 0)!=0
+                      OR request_id IS NOT NULL"""
+            )
+            conn.execute(
+                """UPDATE quota_events SET account_id_hash=NULL,
+                     account_id_tail=NULL, usage_alias=NULL,
+                     raw_message_redacted=NULL
+                   WHERE account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR usage_alias IS NOT NULL OR raw_message_redacted IS NOT NULL"""
+            )
+            conn.execute(
+                """UPDATE account_quota_cycles SET account_id_hash=NULL,
+                     account_id_tail=NULL, usage_alias=NULL, notes=NULL
+                   WHERE account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR usage_alias IS NOT NULL OR notes IS NOT NULL"""
+            )
+            conn.execute(
+                """UPDATE subscription_quota_snapshots SET
+                     account_id_hash=NULL, account_id_tail=NULL,
+                     usage_alias=NULL
+                   WHERE account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR usage_alias IS NOT NULL"""
+            )
+        if privacy_rows_removed or self._privacy_checkpoint_pending:
+            self._checkpoint_privacy_wal("auth identity reconciliation")
+        return changed
+
+    @staticmethod
+    def _add_nullable(existing: str, incoming: str) -> str:
+        return (
+            f"CASE WHEN {existing} IS NULL AND {incoming} IS NULL THEN NULL "
+            f"ELSE COALESCE({existing}, 0) + COALESCE({incoming}, 0) END"
+        )
+
+    def _prepare_proven_identity_migration_conn(
+        self,
+        conn: sqlite3.Connection,
+        old_key: str,
+        new_key: str,
+    ) -> bool:
+        """Authorize a resolver-proven lineage without bypassing inventory.
+
+        Before an authoritative inventory exists, the resolver lineage is the
+        only local evidence available.  Once inventory is initialized, only a
+        currently active old registry key may transfer that authorization to
+        its proven successor.  Suspect or tombstoned identities never revive
+        through a local migration.
+        """
+
+        if old_key == new_key:
+            return True
+        if conn.execute(
+            """SELECT 1 FROM retired_subscription_tombstones
+                 WHERE identity_key IN (?, ?) LIMIT 1""",
+            (old_key, new_key),
+        ).fetchone():
+            return False
+        inventory = conn.execute(
+            "SELECT initialized FROM subscription_inventory_state WHERE id=1"
+        ).fetchone()
+        if not inventory or not inventory["initialized"]:
+            return True
+        old_row = conn.execute(
+            "SELECT * FROM active_subscription_registry WHERE identity_key=?",
+            (old_key,),
+        ).fetchone()
+        if old_row is None or old_row["state"] != "active":
+            return False
+        new_row = conn.execute(
+            "SELECT * FROM active_subscription_registry WHERE identity_key=?",
+            (new_key,),
+        ).fetchone()
+        if new_row is not None and new_row["state"] != "active":
+            return False
+        if new_row is None:
+            conn.execute(
+                """UPDATE active_subscription_registry
+                      SET identity_key=?
+                    WHERE identity_key=? AND state='active'""",
+                (new_key, old_key),
+            )
+        else:
+            conn.execute(
+                """UPDATE active_subscription_registry
+                      SET first_seen_at=MIN(first_seen_at, ?),
+                          last_seen_at=MAX(last_seen_at, ?),
+                          last_scan_generation=MAX(last_scan_generation, ?)
+                    WHERE identity_key=?""",
+                (
+                    old_row["first_seen_at"],
+                    old_row["last_seen_at"],
+                    old_row["last_scan_generation"],
+                    new_key,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM active_subscription_registry WHERE identity_key=?",
+                (old_key,),
+            )
+        return self._subscription_detail_allowed_conn(conn, new_key)
+
+    def _anonymize_subscription_conn(
+        self,
+        conn: sqlite3.Connection,
+        identity_key_value: Any,
+    ) -> dict[str, int]:
+        """Aggregate one retired identity and remove all linkable detail."""
+
+        unsafe_models = [
+            row[0]
+            for row in conn.execute(
+                """SELECT DISTINCT model FROM usage_events
+                     WHERE identity_key=? AND model IS NOT NULL""",
+                (identity_key_value,),
+            ).fetchall()
+            if safe_model_identifier(row[0]) is None
+        ]
+        for unsafe_model in unsafe_models:
+            conn.execute(
+                "UPDATE usage_events SET model=NULL WHERE identity_key=? AND model=?",
+                (identity_key_value, unsafe_model),
+            )
+        event_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM usage_events WHERE identity_key=?",
+                (identity_key_value,),
+            ).fetchone()[0]
+        )
+        nullable_columns = (
+            "input_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "estimated_api_cost_usd",
+            "non_cached_input_cost_usd",
+            "cached_input_cost_usd",
+            "output_cost_usd",
+        )
+        update_columns = ",\n".join(
+            f"{column}={self._add_nullable(f'anonymous_usage_daily.{column}', f'excluded.{column}')}"
+            for column in nullable_columns
+        )
+        conn.execute(
+            f"""
+            INSERT INTO anonymous_usage_daily (
+              bucket_start, model, status_code, ok, usage_missing,
+              long_context_pricing_applied, split_priced, total_priced,
+              calls, streaming_calls, non_cached_input_tokens,
+              codex_status_tokens, duration_ms, input_tokens, cached_tokens,
+              cache_write_tokens, output_tokens, reasoning_tokens,
+              total_tokens, estimated_api_cost_usd,
+              non_cached_input_cost_usd, cached_input_cost_usd,
+              output_cost_usd
+            )
+            SELECT
+              strftime('%Y-%m-%dT%H:%M:%fZ',
+                       datetime(date(ts, 'localtime') || ' 12:00:00', 'utc')),
+              COALESCE(model, '(unknown)'), COALESCE(status_code, 0),
+              COALESCE(ok, 0), COALESCE(usage_missing, 0),
+              COALESCE(long_context_pricing_applied, 0),
+              CASE WHEN non_cached_input_cost_usd IS NOT NULL
+                         AND cached_input_cost_usd IS NOT NULL
+                         AND output_cost_usd IS NOT NULL THEN 1 ELSE 0 END,
+              CASE WHEN estimated_api_cost_usd IS NOT NULL THEN 1 ELSE 0 END,
+              COALESCE(SUM(call_count), 0),
+              COALESCE(SUM(CASE WHEN stream=1 THEN call_count ELSE 0 END), 0),
+              COALESCE(SUM(MAX(COALESCE(input_tokens, 0)
+                                   - COALESCE(cached_tokens, 0), 0)), 0),
+              COALESCE(SUM(MAX(COALESCE(input_tokens, 0)
+                                   - COALESCE(cached_tokens, 0), 0)
+                               + COALESCE(output_tokens, 0)), 0),
+              COALESCE(SUM(COALESCE(duration_ms, 0) * COALESCE(call_count, 1)), 0),
+              CASE WHEN COUNT(input_tokens)>0 THEN SUM(input_tokens) END,
+              CASE WHEN COUNT(cached_tokens)>0 THEN SUM(cached_tokens) END,
+              CASE WHEN COUNT(cache_write_tokens)>0 THEN SUM(cache_write_tokens) END,
+              CASE WHEN COUNT(output_tokens)>0 THEN SUM(output_tokens) END,
+              CASE WHEN COUNT(reasoning_tokens)>0 THEN SUM(reasoning_tokens) END,
+              CASE WHEN COUNT(total_tokens)>0 THEN SUM(total_tokens) END,
+              CASE WHEN COUNT(estimated_api_cost_usd)>0 THEN SUM(estimated_api_cost_usd) END,
+              CASE WHEN COUNT(non_cached_input_cost_usd)>0 THEN SUM(non_cached_input_cost_usd) END,
+              CASE WHEN COUNT(cached_input_cost_usd)>0 THEN SUM(cached_input_cost_usd) END,
+              CASE WHEN COUNT(output_cost_usd)>0 THEN SUM(output_cost_usd) END
+              FROM usage_events
+             WHERE identity_key=?
+             GROUP BY date(ts, 'localtime'), COALESCE(model, '(unknown)'),
+                      COALESCE(status_code, 0), COALESCE(ok, 0),
+                      COALESCE(usage_missing, 0),
+                      COALESCE(long_context_pricing_applied, 0),
+                      CASE WHEN non_cached_input_cost_usd IS NOT NULL
+                                AND cached_input_cost_usd IS NOT NULL
+                                AND output_cost_usd IS NOT NULL THEN 1 ELSE 0 END,
+                      CASE WHEN estimated_api_cost_usd IS NOT NULL THEN 1 ELSE 0 END
+            ON CONFLICT (
+              bucket_start, model, status_code, ok, usage_missing,
+              long_context_pricing_applied, split_priced, total_priced
+            ) DO UPDATE SET
+              calls=anonymous_usage_daily.calls + excluded.calls,
+              streaming_calls=anonymous_usage_daily.streaming_calls
+                              + excluded.streaming_calls,
+              non_cached_input_tokens=
+                anonymous_usage_daily.non_cached_input_tokens
+                + excluded.non_cached_input_tokens,
+              codex_status_tokens=anonymous_usage_daily.codex_status_tokens
+                                  + excluded.codex_status_tokens,
+              duration_ms=anonymous_usage_daily.duration_ms + excluded.duration_ms,
+              {update_columns}
+            """,
+            (identity_key_value,),
+        )
+        conn.execute(
+            """UPDATE local_import_records
+                  SET usage_event_id=NULL
+                WHERE usage_event_id IN (
+                      SELECT id FROM usage_events WHERE identity_key=?
+                )""",
+            (identity_key_value,),
+        )
+        deleted: dict[str, int] = {"usage_events": event_count}
+        for table in (
+            "usage_events",
+            "quota_events",
+            "account_quota_cycles",
+            "subscription_quota_snapshots",
+        ):
+            cursor = conn.execute(
+                f"DELETE FROM {table} WHERE identity_key=?",
+                (identity_key_value,),
+            )
+            deleted[table] = max(int(cursor.rowcount), 0)
+        return deleted
+
+    def _merge_unsafe_anonymous_models_conn(self, conn: sqlite3.Connection) -> int:
+        """Fold unsafe historical model labels into the anonymous sentinel.
+
+        Updating the model column in place can violate the composite primary
+        key when an ``(unknown)`` bucket already exists.  Upsert every unsafe
+        row instead, preserving nullable-token and cost semantics exactly.
+        """
+
+        unsafe_models = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT model FROM anonymous_usage_daily"
+            ).fetchall()
+            if row[0] != "(unknown)" and safe_model_identifier(row[0]) is None
+        ]
+        nullable_columns = (
+            "input_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "estimated_api_cost_usd",
+            "non_cached_input_cost_usd",
+            "cached_input_cost_usd",
+            "output_cost_usd",
+        )
+        update_columns = ",\n".join(
+            f"{column}={self._add_nullable(f'anonymous_usage_daily.{column}', f'excluded.{column}')}"
+            for column in nullable_columns
+        )
+        for unsafe_model in unsafe_models:
+            conn.execute(
+                f"""
+                INSERT INTO anonymous_usage_daily (
+                  bucket_start, model, status_code, ok, usage_missing,
+                  long_context_pricing_applied, split_priced, total_priced,
+                  calls, streaming_calls, non_cached_input_tokens,
+                  codex_status_tokens, duration_ms, input_tokens, cached_tokens,
+                  cache_write_tokens, output_tokens, reasoning_tokens,
+                  total_tokens, estimated_api_cost_usd,
+                  non_cached_input_cost_usd, cached_input_cost_usd,
+                  output_cost_usd
+                )
+                SELECT bucket_start, '(unknown)', status_code, ok, usage_missing,
+                       long_context_pricing_applied, split_priced, total_priced,
+                       calls, streaming_calls, non_cached_input_tokens,
+                       codex_status_tokens, duration_ms, input_tokens,
+                       cached_tokens, cache_write_tokens, output_tokens,
+                       reasoning_tokens, total_tokens, estimated_api_cost_usd,
+                       non_cached_input_cost_usd, cached_input_cost_usd,
+                       output_cost_usd
+                  FROM anonymous_usage_daily
+                 WHERE model=?
+                ON CONFLICT (
+                  bucket_start, model, status_code, ok, usage_missing,
+                  long_context_pricing_applied, split_priced, total_priced
+                ) DO UPDATE SET
+                  calls=anonymous_usage_daily.calls + excluded.calls,
+                  streaming_calls=anonymous_usage_daily.streaming_calls
+                                  + excluded.streaming_calls,
+                  non_cached_input_tokens=
+                    anonymous_usage_daily.non_cached_input_tokens
+                    + excluded.non_cached_input_tokens,
+                  codex_status_tokens=anonymous_usage_daily.codex_status_tokens
+                                      + excluded.codex_status_tokens,
+                  duration_ms=anonymous_usage_daily.duration_ms
+                              + excluded.duration_ms,
+                  {update_columns}
+                """,
+                (unsafe_model,),
+            )
+            conn.execute(
+                "DELETE FROM anonymous_usage_daily WHERE model=?", (unsafe_model,)
+            )
+        return len(unsafe_models)
+
+    def _checkpoint_privacy_wal(self, reason: str) -> bool:
+        """Truncate scrubbed WAL pages, remembering a blocked retry."""
+
+        try:
+            with self.connect() as conn:
+                result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            busy = bool(result and int(result[0]))
+            self._privacy_checkpoint_pending = busy
+            if busy:
+                LOG.warning("%s WAL checkpoint is busy; retry pending", reason)
+            return not busy
+        except sqlite3.Error:
+            self._privacy_checkpoint_pending = True
+            LOG.warning("%s WAL checkpoint failed; retry pending", reason)
+            return False
+
+    def reconcile_subscription_inventory(
+        self,
+        active_identity_keys: Iterable[str],
+        observed_at: str | None = None,
+        authoritative: bool = True,
+    ) -> dict[str, Any]:
+        """Track a complete management inventory and scrub confirmed removals.
+
+        One incomplete or transiently empty response can never destroy data.
+        A missing subscription is hidden immediately but is anonymized only
+        after multiple complete inventories and a time grace period.
+        """
+
+        if self._privacy_checkpoint_pending:
+            self._checkpoint_privacy_wal("subscription inventory retry")
+        observed = normalize_timestamp(observed_at) if observed_at else utc_now()
+        active = {
+            key
+            for value in active_identity_keys
+            if (key := canonical_subscription_key(value))
+        }
+        result: dict[str, Any] = {
+            "authoritative": bool(authoritative),
+            "initialized": False,
+            "active": len(active),
+            "suspect": 0,
+            "retired": 0,
+            "retired_keys": [],
+        }
+        if not authoritative:
+            return result
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = conn.execute(
+                "SELECT * FROM subscription_inventory_state WHERE id=1"
+            ).fetchone()
+            initialized = bool(state and state["initialized"])
+            generation = int(state["generation"] if state else 0) + 1
+            for key in sorted(active):
+                # A later complete inventory is the only event allowed to
+                # reactivate a previously retired subscription.  Remove its
+                # tombstone in the same write transaction as the active row.
+                conn.execute(
+                    "DELETE FROM retired_subscription_tombstones WHERE identity_key=?",
+                    (key,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO active_subscription_registry (
+                      identity_key, state, first_seen_at, last_seen_at,
+                      missing_since, consecutive_misses, last_scan_generation,
+                      high_risk_missing
+                    ) VALUES (?, 'active', ?, ?, NULL, 0, ?, 0)
+                    ON CONFLICT(identity_key) DO UPDATE SET
+                      state='active', last_seen_at=excluded.last_seen_at,
+                      missing_since=NULL, consecutive_misses=0,
+                      last_scan_generation=excluded.last_scan_generation,
+                      high_risk_missing=0
+                    """,
+                    (key, observed, observed, generation),
+                )
+            if not initialized:
+                historical_keys = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """
+                        SELECT identity_key FROM usage_events
+                         WHERE identity_key LIKE 'subscription:%'
+                           AND COALESCE(source, 'sidecar') IN ('sidecar', 'usage_queue')
+                        UNION
+                        SELECT identity_key FROM subscription_quota_snapshots
+                         WHERE identity_key LIKE 'subscription:%'
+                           AND source='cliproxy_wham_usage'
+                        """
+                    ).fetchall()
+                    if canonical_subscription_key(row[0])
+                }
+                historical_missing = historical_keys - active
+                initial_baseline_count = len(historical_keys | active)
+                initial_large_drop = (
+                    initial_baseline_count >= 4
+                    and len(historical_missing) * 2 >= initial_baseline_count
+                )
+                initial_high_risk = bool(historical_missing) and (
+                    not active or initial_large_drop
+                )
+                for key in sorted(historical_missing):
+                    conn.execute(
+                        """INSERT OR IGNORE INTO active_subscription_registry (
+                             identity_key, state, first_seen_at, last_seen_at,
+                             missing_since, consecutive_misses,
+                             last_scan_generation, high_risk_missing
+                           ) VALUES (?, 'suspect_missing', ?, ?, ?, 1, ?, ?)""",
+                        (
+                            key,
+                            observed,
+                            observed,
+                            observed,
+                            generation,
+                            int(initial_high_risk),
+                        ),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO subscription_inventory_state (
+                      id, initialized, generation, last_complete_at,
+                      last_active_count
+                    ) VALUES (1, 1, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET initialized=1,
+                      generation=excluded.generation,
+                      last_complete_at=excluded.last_complete_at,
+                      last_active_count=excluded.last_active_count
+                    """,
+                    (
+                        generation,
+                        observed,
+                        initial_baseline_count
+                        if initial_high_risk
+                        else len(active),
+                    ),
+                )
+                result["initialized"] = True
+                result["suspect"] = len(historical_missing)
+                return result
+
+            missing_rows = [
+                row
+                for row in conn.execute(
+                    "SELECT * FROM active_subscription_registry"
+                ).fetchall()
+                if row["identity_key"] not in active
+            ]
+            empty_inventory = not active and bool(missing_rows)
+            previous_active_count = int(state["last_active_count"] or 0) if state else 0
+            large_inventory_drop = (
+                previous_active_count >= 4
+                and (
+                    len(active) * 2 <= previous_active_count
+                    or len(missing_rows) * 2 >= previous_active_count
+                )
+            )
+            high_risk_inventory = empty_inventory or large_inventory_drop
+            observed_dt = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+            retired: list[str] = []
+            for row in missing_rows:
+                missing_since = row["missing_since"] or observed
+                misses = int(row["consecutive_misses"] or 0) + 1
+                # Once a key becomes suspect during an empty or sharply
+                # reduced inventory, retain the longer confirmation policy
+                # for that key.  A partial inventory recovery must not
+                # silently downgrade the remaining suspect rows; only an
+                # authoritative reappearance clears this flag above.
+                persistent_high_risk = bool(row["high_risk_missing"]) or high_risk_inventory
+                required_misses = (
+                    EMPTY_INVENTORY_RETIRE_MISSES
+                    if persistent_high_risk
+                    else SUBSCRIPTION_RETIRE_MISSES
+                )
+                grace_seconds = (
+                    EMPTY_INVENTORY_RETIRE_GRACE_SECONDS
+                    if persistent_high_risk
+                    else SUBSCRIPTION_RETIRE_GRACE_SECONDS
+                )
+                conn.execute(
+                    """UPDATE active_subscription_registry
+                          SET state='suspect_missing', missing_since=?,
+                              consecutive_misses=?, last_scan_generation=?,
+                              high_risk_missing=?
+                        WHERE identity_key=?""",
+                    (
+                        missing_since,
+                        misses,
+                        generation,
+                        int(persistent_high_risk),
+                        row["identity_key"],
+                    ),
+                )
+                missing_dt = datetime.fromisoformat(
+                    str(missing_since).replace("Z", "+00:00")
+                )
+                if misses >= required_misses and (
+                    observed_dt - missing_dt
+                ).total_seconds() >= grace_seconds:
+                    self._anonymize_subscription_conn(conn, row["identity_key"])
+                    conn.execute(
+                        """INSERT INTO retired_subscription_tombstones (
+                             identity_key, retired_at, last_scan_generation
+                           ) VALUES (?, ?, ?)
+                           ON CONFLICT(identity_key) DO UPDATE SET
+                             retired_at=excluded.retired_at,
+                             last_scan_generation=excluded.last_scan_generation""",
+                        (row["identity_key"], observed, generation),
+                    )
+                    conn.execute(
+                        "DELETE FROM active_subscription_registry WHERE identity_key=?",
+                        (row["identity_key"],),
+                    )
+                    retired.append(str(row["identity_key"]))
+            conn.execute(
+                """
+                INSERT INTO subscription_inventory_state (
+                  id, initialized, generation, last_complete_at,
+                  last_active_count
+                ) VALUES (1, 1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  generation=excluded.generation,
+                  last_complete_at=excluded.last_complete_at,
+                  last_active_count=excluded.last_active_count
+                """,
+                (
+                    generation,
+                    observed,
+                    previous_active_count
+                    if large_inventory_drop and missing_rows
+                    else len(active),
+                ),
+            )
+            result["suspect"] = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM active_subscription_registry
+                         WHERE state='suspect_missing'"""
+                ).fetchone()[0]
+            )
+            result["retired"] = len(retired)
+            result["retired_keys"] = retired
+        if result["retired"] or self._privacy_checkpoint_pending:
+            self._checkpoint_privacy_wal("retired subscription")
+        return result
+
+    def apply_privacy_minimization(self, resolver: AccountResolver) -> int:
+        """Migrate proven identities, then remove unnecessary identity detail."""
+
+        migrations = resolver.identity_migrations() if resolver.enabled else {}
+        ambiguous_accounts = (
+            resolver.ambiguous_legacy_account_keys() if resolver.enabled else set()
+        )
+        ambiguous_legacy_identities = (
+            resolver.ambiguous_legacy_identity_keys() if resolver.enabled else set()
+        )
+        changed = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Scrub free-form labels before any row can be copied into an
+            # anonymous bucket.  Existing unsafe anonymous labels are merged,
+            # not updated in place, so collisions preserve every counter.
+            unsafe_models = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT model FROM usage_events WHERE model IS NOT NULL"
+                ).fetchall()
+                if safe_model_identifier(row[0]) is None
+            ]
+            for unsafe_model in unsafe_models:
+                conn.execute(
+                    "UPDATE usage_events SET model=NULL WHERE model=?",
+                    (unsafe_model,),
+                )
+            self._merge_unsafe_anonymous_models_conn(conn)
+            for tombstone in conn.execute(
+                "SELECT identity_key FROM retired_subscription_tombstones"
+            ).fetchall():
+                removed = self._anonymize_subscription_conn(conn, tombstone[0])
+                changed += int(removed.get("usage_events") or 0)
+            for old_key, new_key in migrations.items():
+                if old_key == new_key:
+                    continue
+                if not canonical_subscription_key(new_key):
+                    removed = self._anonymize_subscription_conn(conn, old_key)
+                    changed += int(removed.get("usage_events") or 0)
+                    continue
+                if not self._prepare_proven_identity_migration_conn(
+                    conn, old_key, new_key
+                ):
+                    removed = self._anonymize_subscription_conn(conn, old_key)
+                    changed += int(removed.get("usage_events") or 0)
+                    continue
+                changed += max(
+                    int(
+                        conn.execute(
+                            "UPDATE usage_events SET identity_key=? WHERE identity_key=?",
+                            (new_key, old_key),
+                        ).rowcount
+                    ),
+                    0,
+                )
+                for table in ("quota_events", "account_quota_cycles"):
+                    conn.execute(
+                        f"UPDATE {table} SET identity_key=? WHERE identity_key=?",
+                        (new_key, old_key),
+                    )
+                conn.execute(
+                    """UPDATE OR IGNORE subscription_quota_snapshots
+                          SET identity_key=? WHERE identity_key=?""",
+                    (new_key, old_key),
+                )
+                conn.execute(
+                    "DELETE FROM subscription_quota_snapshots WHERE identity_key=?",
+                    (old_key,),
+                )
+            # Any remaining non-subscription identity is legacy data whose
+            # lineage cannot be proved without guessing.  Preserve its token
+            # totals in the anonymous daily aggregate and remove account-,
+            # alias-, installation-, session- and token-derived linkages.
+            persisted_identity_keys = {
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT identity_key FROM usage_events
+                     WHERE identity_key IS NOT NULL
+                    UNION
+                    SELECT identity_key FROM quota_events
+                     WHERE identity_key IS NOT NULL
+                    UNION
+                    SELECT identity_key FROM account_quota_cycles
+                     WHERE identity_key IS NOT NULL
+                    UNION
+                    SELECT identity_key FROM subscription_quota_snapshots
+                     WHERE identity_key IS NOT NULL
+                    """
+                ).fetchall()
+                if row[0]
+            }
+            legacy_keys = {
+                key
+                for key in persisted_identity_keys
+                if canonical_subscription_key(key) is None
+            }
+            for obsolete_key in sorted(
+                ambiguous_accounts | ambiguous_legacy_identities | legacy_keys,
+                key=repr,
+            ):
+                self._anonymize_subscription_conn(conn, obsolete_key)
+            # Registry and tombstone rows are intentionally opaque but must use
+            # the exact current keyed format.  Old 16-hex keys have already had
+            # their one chance to migrate through resolver-proven lineage.
+            for table in (
+                "active_subscription_registry",
+                "retired_subscription_tombstones",
+            ):
+                invalid_keys = [
+                    row[0]
+                    for row in conn.execute(
+                        f"SELECT identity_key FROM {table}"
+                    ).fetchall()
+                    if canonical_subscription_key(row[0]) is None
+                ]
+                conn.executemany(
+                    f"DELETE FROM {table} WHERE identity_key=?",
+                    ((key,) for key in invalid_keys),
+                )
+            historical_plans = conn.execute(
+                "SELECT DISTINCT plan_type FROM subscription_quota_snapshots "
+                "WHERE plan_type IS NOT NULL"
+            ).fetchall()
+            for row in historical_plans:
+                normalized_plan = safe_plan_type(row[0])
+                if normalized_plan == row[0]:
+                    continue
+                conn.execute(
+                    "UPDATE subscription_quota_snapshots SET plan_type=? "
+                    "WHERE plan_type=?",
+                    (normalized_plan, row[0]),
+                )
+            conn.execute(
+                """
+                UPDATE usage_events SET
+                  endpoint=NULL, method=NULL, session_id=NULL, thread_id=NULL,
+                  turn_id=NULL, installation_id=NULL, window_id=NULL,
+                  usage_alias=NULL, usage_project=NULL, auth_fingerprint=NULL,
+                  account_id_hash=NULL, account_id_tail=NULL,
+                  error_type=NULL, error_message_redacted=NULL, request_bytes=0,
+                  response_bytes=0, request_id=NULL
+                WHERE endpoint IS NOT NULL OR method IS NOT NULL
+                   OR session_id IS NOT NULL OR thread_id IS NOT NULL
+                   OR turn_id IS NOT NULL OR installation_id IS NOT NULL
+                   OR window_id IS NOT NULL OR usage_alias IS NOT NULL
+                   OR usage_project IS NOT NULL OR auth_fingerprint IS NOT NULL
+                   OR account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                   OR error_type IS NOT NULL OR error_message_redacted IS NOT NULL
+                   OR COALESCE(request_bytes, 0)!=0
+                   OR COALESCE(response_bytes, 0)!=0
+                   OR request_id IS NOT NULL
+                """
+            )
+            conn.execute(
+                """UPDATE quota_events SET account_id_hash=NULL,
+                     account_id_tail=NULL, usage_alias=NULL,
+                     raw_message_redacted=NULL
+                   WHERE account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR usage_alias IS NOT NULL OR raw_message_redacted IS NOT NULL"""
+            )
+            conn.execute(
+                """UPDATE account_quota_cycles SET account_id_hash=NULL,
+                     account_id_tail=NULL, usage_alias=NULL, notes=NULL
+                   WHERE account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR usage_alias IS NOT NULL OR notes IS NOT NULL"""
+            )
+            conn.execute(
+                """UPDATE subscription_quota_snapshots SET
+                     account_id_hash=NULL, account_id_tail=NULL,
+                     usage_alias=NULL
+                   WHERE account_id_hash IS NOT NULL OR account_id_tail IS NOT NULL
+                      OR usage_alias IS NOT NULL"""
+            )
+            import_files = conn.execute("SELECT * FROM local_import_files").fetchall()
+            if import_files:
+                conn.execute("DELETE FROM local_import_files")
+                for row in import_files:
+                    stored_path = str(row["path"] or "")
+                    path_key = (
+                        stored_path
+                        if re.fullmatch(r"file:[0-9a-f]{16}", stored_path)
+                        else "file:" + (short_hash(stored_path) or "unknown")
+                    )
+                    conn.execute(
+                        """INSERT OR REPLACE INTO local_import_files
+                           (path, size, mtime_ns, offset, session_id,
+                            model_provider, model, turn_id, updated_at)
+                           VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, ?)""",
+                        (
+                            path_key,
+                            row["size"],
+                            row["mtime_ns"],
+                            row["offset"],
+                            (
+                                "openai"
+                                if (safe_text(row["model_provider"], 64) or "").lower()
+                                == "openai"
+                                else None
+                            ),
+                            safe_model_identifier(row["model"]),
+                            row["updated_at"],
+                        ),
+                    )
+        self._checkpoint_privacy_wal("privacy minimization")
+        return changed
 
     def set_price(
         self,
@@ -1791,6 +3515,9 @@ class UsageRepository:
 
     def maybe_auto_reset(self, info: RequestInfo, ts: str) -> bool:
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._subscription_detail_allowed_conn(conn, info.identity_key):
+                return False
             last_quota = conn.execute(
                 f"SELECT ts FROM quota_events WHERE identity_key=? AND event_type IN ({','.join('?' for _ in QUOTA_EVENT_TYPES)}) ORDER BY ts DESC, id DESC LIMIT 1",
                 (info.identity_key, *sorted(QUOTA_EVENT_TYPES)),
@@ -1802,17 +3529,29 @@ class UsageRepository:
             # account's Codex weekly/monthly window is still exhausted.  The
             # read-only WHAM snapshot is stronger evidence.  Do not split a
             # cycle while the latest subscription window still reports 100%.
-            snapshot = conn.execute(
+            snapshots = conn.execute(
                 """
-                SELECT used_percent, reset_at
-                  FROM subscription_quota_snapshots
-                 WHERE identity_key=?
-                   AND window_kind IN ('weekly', 'monthly')
-                 ORDER BY id DESC LIMIT 1
+                SELECT q.window_kind, q.used_percent, q.reset_at
+                  FROM subscription_quota_snapshots q
+                 WHERE q.identity_key=?
+                   AND q.window_kind IN ('weekly', 'monthly')
+                   AND NOT EXISTS (
+                         SELECT 1
+                           FROM subscription_quota_snapshots newer
+                          WHERE newer.identity_key=q.identity_key
+                            AND newer.window_kind=q.window_kind
+                            AND (
+                                  newer.fetched_at > q.fetched_at
+                                  OR (newer.fetched_at=q.fetched_at
+                                      AND newer.id > q.id)
+                                )
+                       )
                 """,
                 (info.identity_key,),
-            ).fetchone()
-            if snapshot and snapshot["used_percent"] is not None:
+            ).fetchall()
+            for snapshot in snapshots:
+                if snapshot["used_percent"] is None:
+                    continue
                 try:
                     reset_at = normalize_optional_timestamp(snapshot["reset_at"])
                     if float(snapshot["used_percent"]) >= QUOTA_ESTIMATE_CAP_CONFIDENCE_PERCENT and (
@@ -1820,7 +3559,7 @@ class UsageRepository:
                     ):
                         return False
                 except (TypeError, ValueError):
-                    pass
+                    continue
             last_reset = conn.execute(
                 f"SELECT ts FROM quota_events WHERE identity_key=? AND event_type IN ({','.join('?' for _ in RESET_EVENT_TYPES)}) ORDER BY ts DESC, id DESC LIMIT 1",
                 (info.identity_key, *sorted(RESET_EVENT_TYPES)),
@@ -1832,11 +3571,15 @@ class UsageRepository:
                 (ts, identity_key, account_id_hash, account_id_tail, usage_alias,
                  event_type, source, raw_message_redacted)
                 VALUES (?, ?, ?, ?, ?, 'reset_detected', 'success_after_quota', NULL)""",
-                (ts, info.identity_key, info.account_id_hash, info.account_id_tail, info.usage_alias),
+                (ts, info.identity_key, None, None, None),
             )
             return True
 
     def insert_event(self, event: UsageEvent) -> int:
+        event_id, _identity_allowed = self._insert_event_with_status(event)
+        return event_id
+
+    def _insert_event_with_status(self, event: UsageEvent) -> tuple[int, bool]:
         component_values = (
             event.non_cached_input_cost_usd,
             event.cached_input_cost_usd,
@@ -1856,24 +3599,105 @@ class UsageRepository:
                 abs_tol=1e-12,
             ):
                 raise ValueError("event cost components do not equal total cost")
-        values = asdict(event)
+        values = self._minimized_event_values(event)
         columns = list(values)
         placeholders = ",".join("?" for _ in columns)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            canonical_key = canonical_subscription_key(event.identity_key)
+            identity_allowed = bool(
+                canonical_key
+                and self._subscription_detail_allowed_conn(conn, canonical_key)
+            )
+            if not identity_allowed:
+                values["identity_key"] = "unknown"
             cursor = conn.execute(
                 f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
             )
-            return int(cursor.lastrowid)
+            return int(cursor.lastrowid), identity_allowed
+
+    @staticmethod
+    def _minimized_event_values(event: UsageEvent) -> dict[str, Any]:
+        """Return the durable token/statistics subset for every event source."""
+
+        values = asdict(event)
+        values["identity_key"] = (
+            canonical_subscription_key(event.identity_key) or "unknown"
+        )
+        # The resolver already reduced an active account to an opaque HMAC
+        # key. Request metadata and token/account fingerprints have no durable
+        # statistical use and can make a deleted account re-identifiable.
+        for field in (
+            "endpoint",
+            "method",
+            "session_id",
+            "thread_id",
+            "turn_id",
+            "installation_id",
+            "window_id",
+            "usage_alias",
+            "usage_project",
+            "auth_fingerprint",
+            "account_id_hash",
+            "account_id_tail",
+            "error_message_redacted",
+            "error_type",
+            "request_id",
+        ):
+            values[field] = None
+        values["model"] = safe_model_identifier(event.model)
+        values["source"] = safe_alias(event.source) or "unknown"
+        values["request_bytes"] = 0
+        values["response_bytes"] = 0
+        return values
+
+    @staticmethod
+    def _subscription_detail_allowed_conn(
+        conn: sqlite3.Connection,
+        identity_key_value: str | None,
+    ) -> bool:
+        """Reject identifiable writes while an inventory deletion is pending."""
+
+        key = canonical_subscription_key(identity_key_value)
+        if not key:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM retired_subscription_tombstones WHERE identity_key=?",
+            (key,),
+        ).fetchone():
+            return False
+        row = conn.execute(
+            "SELECT state FROM active_subscription_registry WHERE identity_key=?",
+            (key,),
+        ).fetchone()
+        if row is not None:
+            return row["state"] == "active"
+        inventory = conn.execute(
+            "SELECT initialized FROM subscription_inventory_state WHERE id=1"
+        ).fetchone()
+        # Before the first complete management inventory, keep collection
+        # available for installations that have not enabled quota polling.
+        # Afterwards, the authoritative active registry is the allow-list:
+        # an unknown late key cannot create a permanent phantom subscription.
+        return not bool(inventory and inventory["initialized"])
 
     def record_event(self, event: UsageEvent, info: RequestInfo, source: str | None = None) -> int:
         """Persist one event and derive quota transitions in one best-effort path."""
 
         if source:
-            event.source = safe_text(source, 64) or "sidecar"
+            event.source = safe_alias(source) or "sidecar"
+        event_id, identity_allowed = self._insert_event_with_status(event)
+        event_key = canonical_subscription_key(event.identity_key)
+        info_key = canonical_subscription_key(info.identity_key)
+        if not identity_allowed or not event_key or event_key != info_key:
+            # A removed auth file disappears from the dashboard immediately.
+            # Late queue/proxy records retain their token totals but cannot
+            # recreate the retired subscription linkage during the grace
+            # period before the historical rows are aggregated.
+            return event_id
         if event.ok:
             self.maybe_auto_reset(info, event.ts)
-        event_id = self.insert_event(event)
         # HTTP handlers can finish out of order.  A quota error may close a
         # cycle before an earlier-timestamped successful response has finished
         # its SQLite insert.  Reconcile any already-complete cycle after every
@@ -1988,18 +3812,24 @@ class UsageRepository:
         """Insert one idempotent local/manual import in a single transaction."""
 
         safe_key = safe_text(import_key, 300)
-        safe_source = safe_text(source, 64)
+        safe_source = safe_alias(source)
         if not safe_key or not safe_source:
             raise ValueError("invalid import identity")
         event.source = safe_source
-        values = asdict(event)
+        values = self._minimized_event_values(event)
         columns = list(values)
         placeholders = ",".join("?" for _ in columns)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             if conn.execute(
                 "SELECT 1 FROM local_import_records WHERE import_key=?", (safe_key,)
             ).fetchone():
                 return False
+            canonical_key = canonical_subscription_key(event.identity_key)
+            if canonical_key and not self._subscription_detail_allowed_conn(
+                conn, canonical_key
+            ):
+                values["identity_key"] = "unknown"
             cursor = conn.execute(
                 f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
@@ -2021,26 +3851,40 @@ class UsageRepository:
             ).fetchone()
         return dict(row)
 
+    @staticmethod
+    def _local_import_path_key(path: Path | str) -> str:
+        value = str(path)
+        if re.fullmatch(r"file:[0-9a-f]{16}", value):
+            return value
+        return "file:" + (short_hash(value) or "unknown")
+
     def local_import_file_state(self, path: Path | str) -> dict[str, Any] | None:
+        path_key = self._local_import_path_key(path)
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM local_import_files WHERE path=?", (str(path),)
+                "SELECT * FROM local_import_files WHERE path=?", (path_key,)
             ).fetchone()
         return dict(row) if row is not None else None
 
     def save_local_import_file_state(self, state: Mapping[str, Any]) -> None:
+        raw_path = safe_text(state.get("path"), 4096)
         values = {
-            "path": safe_text(state.get("path"), 4096),
+            "path": self._local_import_path_key(raw_path or ""),
             "size": as_nonnegative_int(state.get("size")) or 0,
             "mtime_ns": as_nonnegative_int(state.get("mtime_ns")) or 0,
             "offset": as_nonnegative_int(state.get("offset")) or 0,
-            "session_id": safe_text(state.get("session_id"), 256),
-            "model_provider": safe_text(state.get("model_provider"), 64),
-            "model": safe_text(state.get("model"), 200),
-            "turn_id": safe_text(state.get("turn_id"), 256),
+            "session_id": None,
+            "model_provider": (
+                "openai"
+                if (safe_text(state.get("model_provider"), 64) or "").lower()
+                == "openai"
+                else None
+            ),
+            "model": safe_model_identifier(state.get("model")),
+            "turn_id": None,
             "updated_at": utc_now(),
         }
-        if not values["path"]:
+        if not raw_path:
             raise ValueError("invalid local import path")
         with self.connect() as conn:
             conn.execute(
@@ -2067,6 +3911,9 @@ class UsageRepository:
         usage_event_id: int | None = None,
     ) -> None:
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._subscription_detail_allowed_conn(conn, info.identity_key):
+                return
             last_reset = self._latest_event_ts(conn, info.identity_key, RESET_EVENT_TYPES)
             last_quota = self._latest_event_ts(conn, info.identity_key, QUOTA_EVENT_TYPES)
             first_for_cycle = not last_quota or (last_reset is not None and last_reset > last_quota)
@@ -2078,12 +3925,12 @@ class UsageRepository:
                 (
                     ts,
                     info.identity_key,
-                    info.account_id_hash,
-                    info.account_id_tail,
-                    info.usage_alias,
+                    None,
+                    None,
+                    None,
                     event_type,
                     source,
-                    redact_text(message),
+                    None,
                 ),
             )
             if first_for_cycle:
@@ -2105,6 +3952,9 @@ class UsageRepository:
         ts = utc_now()
         info = self._info_for_alias(alias, resolver)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._subscription_detail_allowed_conn(conn, info.identity_key):
+                return info.identity_key
             last_reset = self._latest_event_ts(conn, info.identity_key, RESET_EVENT_TYPES)
             last_quota = self._latest_event_ts(conn, info.identity_key, QUOTA_EVENT_TYPES)
             cycle_is_already_closed = bool(last_quota and (not last_reset or last_quota > last_reset))
@@ -2115,7 +3965,7 @@ class UsageRepository:
                 (ts, identity_key, account_id_hash, account_id_tail, usage_alias,
                  event_type, source, raw_message_redacted)
                 VALUES (?, ?, ?, ?, ?, 'manual_reset', 'cli', NULL)""",
-                (ts, info.identity_key, info.account_id_hash, info.account_id_tail, info.usage_alias),
+                (ts, info.identity_key, None, None, None),
             )
         return info.identity_key
 
@@ -2129,19 +3979,27 @@ class UsageRepository:
         if not alias:
             raise ValueError("alias is empty")
         identity = resolver.resolve(alias, None)
-        key = identity_key(identity.account_id_hash, alias, None, None, None)
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM usage_events WHERE usage_alias=? ORDER BY ts DESC, id DESC LIMIT 1", (alias,)
-            ).fetchone()
-        if row:
-            key = row["identity_key"] or key
-            account_hash = row["account_id_hash"] or identity.account_id_hash
-            account_tail = row["account_id_tail"] or identity.account_id_tail
-        else:
-            account_hash = identity.account_id_hash
-            account_tail = identity.account_id_tail
-        return RequestInfo("manual", "CLI", None, 0, None, None, None, None, None, alias, None, None, account_hash, account_tail, key)
+        key = resolved_identity_key(identity, alias)
+        key = canonical_subscription_key(key)
+        if not key:
+            raise ValueError("alias is not mapped to a canonical subscription")
+        return RequestInfo(
+            "manual",
+            "CLI",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            alias,
+            None,
+            None,
+            identity.account_id_hash,
+            identity.account_id_tail,
+            key,
+        )
 
     @staticmethod
     def _latest_event_ts(conn: sqlite3.Connection, key: str, event_types: set[str]) -> str | None:
@@ -2218,9 +4076,9 @@ class UsageRepository:
             """,
             (
                 key,
-                info.account_id_hash,
-                info.account_id_tail,
-                info.usage_alias,
+                None,
+                None,
+                None,
                 start_ts,
                 end_ts,
                 reset_source_row["source"] if reset_source_row else "first_observed_request",
@@ -2238,7 +4096,7 @@ class UsageRepository:
                 cost,
                 cost if complete else None,
                 int(complete),
-                None if complete else "cycle ended by reset before a quota-hit was observed",
+                None,
             ),
         )
         return cost if complete else None
@@ -2249,7 +4107,7 @@ class UsageRepository:
             row = conn.execute(
                 """
                 WITH filtered AS (
-                  SELECT * FROM usage_events WHERE ts>=?
+                  SELECT * FROM usage_statistics WHERE ts>=?
                 ), identified_requests AS (
                   SELECT request_id,
                          MAX(CASE WHEN ok=1 THEN 1 ELSE 0 END) logical_ok,
@@ -2263,7 +4121,7 @@ class UsageRepository:
                   COALESCE(SUM(call_count), 0) account_attempts,
                   COALESCE(SUM(CASE WHEN ok=1 THEN call_count ELSE 0 END), 0) successful_calls,
                   COALESCE(SUM(CASE WHEN ok=0 THEN call_count ELSE 0 END), 0) failed_calls,
-                  COALESCE(SUM(CASE WHEN stream=1 THEN call_count ELSE 0 END), 0) streaming_calls,
+                  COALESCE(SUM(streaming_call_count), 0) streaming_calls,
                   (SELECT COUNT(*) FROM identified_requests)
                     + COALESCE(SUM(CASE WHEN request_id IS NULL THEN call_count ELSE 0 END), 0)
                     logical_requests,
@@ -2275,7 +4133,8 @@ class UsageRepository:
                     + COALESCE(SUM(CASE WHEN request_id IS NULL AND ok=0 THEN call_count ELSE 0 END), 0)
                     failed_logical_requests,
                   COALESCE((SELECT SUM(logical_stream) FROM identified_requests), 0)
-                    + COALESCE(SUM(CASE WHEN request_id IS NULL AND stream=1 THEN call_count ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN request_id IS NULL
+                                       THEN streaming_call_count ELSE 0 END), 0)
                     streaming_logical_requests,
                   COALESCE(SUM(input_tokens), 0) input_tokens,
                   COALESCE(SUM(output_tokens), 0) output_tokens,
@@ -2284,10 +4143,9 @@ class UsageRepository:
                   COALESCE(SUM(total_tokens), 0) total_tokens,
                   COALESCE(SUM(CASE WHEN long_context_pricing_applied=1 THEN call_count ELSE 0 END), 0)
                     long_context_priced_calls,
-                  COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)), 0)
+                  COALESCE(SUM(non_cached_input_token_count), 0)
                     non_cached_input_tokens,
-                  COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)
-                               + COALESCE(output_tokens, 0)), 0)
+                  COALESCE(SUM(codex_status_token_count), 0)
                     codex_status_tokens,
                   COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0)
                     api_processed_tokens,
@@ -2432,7 +4290,7 @@ class UsageRepository:
                           AND cached_input_cost_usd IS NOT NULL
                           AND output_cost_usd IS NOT NULL
                          THEN call_count ELSE 0 END), 0) split_priced_events
-                  FROM usage_events
+                  FROM usage_statistics
                  WHERE ts>=?
                 """,
                 (start,),
@@ -2468,7 +4326,7 @@ class UsageRepository:
                          AS request_id_identified_attempts,
                        MIN(ts) AS first_event_ts,
                        MAX(ts) AS last_event_ts
-                FROM usage_events
+                FROM usage_statistics
                 """
             ).fetchone()
         return dict(row)
@@ -2526,10 +4384,9 @@ class UsageRepository:
                        COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
                        COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
-                       COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)), 0)
+                       COALESCE(SUM(non_cached_input_token_count), 0)
                          AS non_cached_input_tokens,
-                       COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)
-                                    + COALESCE(output_tokens, 0)), 0)
+                       COALESCE(SUM(codex_status_token_count), 0)
                          AS codex_status_tokens,
                        COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0)
                          AS api_processed_tokens,
@@ -2537,7 +4394,7 @@ class UsageRepository:
                        SUM(non_cached_input_cost_usd) AS non_cached_input_cost_usd,
                        SUM(cached_input_cost_usd) AS cached_input_cost_usd,
                        SUM(output_cost_usd) AS output_cost_usd
-                  FROM usage_events
+                  FROM usage_statistics
                  WHERE ts>=?
                  GROUP BY date(ts, 'localtime')
                 """,
@@ -2583,11 +4440,11 @@ class UsageRepository:
         remaining_value = min(max(float(remaining), 0.0), 100.0) if remaining is not None else None
         values = {
             "fetched_at": normalize_timestamp(snapshot.get("fetched_at")),
-            "identity_key": safe_text(snapshot.get("identity_key"), 300) or "unknown",
-            "account_id_hash": safe_text(snapshot.get("account_id_hash"), 64),
-            "account_id_tail": safe_text(snapshot.get("account_id_tail"), 16),
-            "usage_alias": safe_alias(snapshot.get("usage_alias")),
-            "plan_type": safe_text(snapshot.get("plan_type"), 64),
+            "identity_key": canonical_subscription_key(snapshot.get("identity_key")),
+            "account_id_hash": None,
+            "account_id_tail": None,
+            "usage_alias": None,
+            "plan_type": safe_plan_type(snapshot.get("plan_type")),
             "subscription_active_until": normalize_optional_timestamp(
                 snapshot.get("subscription_active_until")
             ),
@@ -2598,10 +4455,33 @@ class UsageRepository:
             "reset_at": normalize_optional_timestamp(snapshot.get("reset_at")),
             "estimated_full_quota_usd": snapshot.get("estimated_full_quota_usd"),
             "estimated_remaining_quota_usd": snapshot.get("estimated_remaining_quota_usd"),
-            "estimate_method": safe_text(snapshot.get("estimate_method"), 120),
-            "source": safe_text(snapshot.get("source"), 64) or "cliproxy_wham_usage",
+            "estimate_method": safe_alias(snapshot.get("estimate_method")),
+            "source": safe_alias(snapshot.get("source")) or "cliproxy_wham_usage",
         }
+        if not values["identity_key"]:
+            raise ValueError("invalid subscription identity")
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._subscription_detail_allowed_conn(
+                conn, values["identity_key"]
+            ):
+                return
+            # Sparse management/JWT responses can omit either field
+            # independently.  Look up each value independently as well: a
+            # newer plan-only row must not hide an older, still valid renewal
+            # timestamp (and vice versa).
+            for field in ("plan_type", "subscription_active_until"):
+                if values[field] is not None:
+                    continue
+                previous = conn.execute(
+                    f"""SELECT {field}
+                          FROM subscription_quota_snapshots
+                         WHERE identity_key=? AND {field} IS NOT NULL
+                         ORDER BY fetched_at DESC, id DESC LIMIT 1""",
+                    (values["identity_key"],),
+                ).fetchone()
+                if previous is not None:
+                    values[field] = previous[field]
             conn.execute(
                 """
                 INSERT OR IGNORE INTO subscription_quota_snapshots (
@@ -2629,6 +4509,16 @@ class UsageRepository:
                   FROM subscription_quota_snapshots q
                  WHERE NOT EXISTS (
                        SELECT 1
+                         FROM active_subscription_registry retired
+                        WHERE retired.identity_key=q.identity_key
+                          AND retired.state='suspect_missing'
+                       )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM retired_subscription_tombstones tombstone
+                        WHERE tombstone.identity_key=q.identity_key
+                       )
+                   AND NOT EXISTS (
+                       SELECT 1
                          FROM subscription_quota_snapshots newer
                         WHERE newer.identity_key=q.identity_key
                           AND newer.window_kind=q.window_kind
@@ -2636,7 +4526,17 @@ class UsageRepository:
                                 newer.fetched_at > q.fetched_at
                                 OR (newer.fetched_at=q.fetched_at AND newer.id > q.id)
                               )
-                 )
+                       )
+                   AND NOT (
+                       q.identity_key LIKE 'account:%'
+                       AND EXISTS (
+                           SELECT 1
+                             FROM subscription_quota_snapshots scoped
+                            WHERE scoped.account_id_hash=q.account_id_hash
+                              AND scoped.identity_key LIKE 'subscription:%'
+                              AND scoped.fetched_at>=q.fetched_at
+                       )
+                   )
                  ORDER BY COALESCE(q.usage_alias, q.account_id_tail, q.identity_key),
                           CASE q.window_kind
                             WHEN 'five_hour' THEN 0
@@ -2659,13 +4559,25 @@ class UsageRepository:
                     "usage_alias": quota.get("usage_alias"),
                     "account_id_tail": quota.get("account_id_tail"),
                     "account_id_hash": quota.get("account_id_hash"),
-                    "plan_type": quota.get("plan_type"),
-                    "subscription_active_until": quota.get("subscription_active_until"),
+                    "plan_type": None,
+                    "subscription_active_until": None,
                     "fetched_at": quota.get("fetched_at"),
                     "windows": {},
                 },
             )
             entry["windows"][quota["window_kind"]] = quota
+            metadata_rank = (
+                str(quota.get("fetched_at") or ""),
+                int(quota.get("id") or 0),
+            )
+            for field in ("plan_type", "subscription_active_until"):
+                value = quota.get(field)
+                rank_key = f"_{field}_rank"
+                if value is not None and metadata_rank > entry.get(
+                    rank_key, ("", -1)
+                ):
+                    entry[field] = value
+                    entry[rank_key] = metadata_rank
             if (quota.get("fetched_at") or "") > (entry.get("fetched_at") or ""):
                 entry["fetched_at"] = quota.get("fetched_at")
 
@@ -2724,6 +4636,19 @@ class UsageRepository:
             )
             if entry.get("current_window_full_quota_usd") is None and not entry.get("windows"):
                 entry["current_window_full_quota_usd"] = entry["historical_complete_cycle_usd"]
+        scoped_account_hashes = {
+            entry.get("account_id_hash")
+            for entry in by_key.values()
+            if str(entry.get("identity_key") or "").startswith("subscription:")
+            and entry.get("account_id_hash")
+        }
+        for entry in by_key.values():
+            entry.pop("_plan_type_rank", None)
+            entry.pop("_subscription_active_until_rank", None)
+            entry["legacy_ambiguous"] = bool(
+                str(entry.get("identity_key") or "").startswith("account:")
+                and entry.get("account_id_hash") in scoped_account_hashes
+            )
         result = list(by_key.values())
         result.sort(
             key=lambda row: (
@@ -2766,7 +4691,10 @@ class UsageRepository:
                 ).isoformat(timespec="microseconds").replace("+00:00", "Z")
             except (TypeError, ValueError, OverflowError):
                 start_text = None
-        if account_hash:
+        if identity_key_value and identity_key_value.startswith("subscription:"):
+            scope_sql = "identity_key=?"
+            scope_value = identity_key_value
+        elif account_hash:
             scope_sql = "account_id_hash=?"
             scope_value = account_hash
         else:
@@ -2853,7 +4781,10 @@ class UsageRepository:
             return None
         account_hash = safe_text(entry.get("account_id_hash"), 64)
         identity_key_value = safe_text(entry.get("identity_key"), 300)
-        if account_hash:
+        if identity_key_value and identity_key_value.startswith("subscription:"):
+            scope_sql = "identity_key=?"
+            scope_value = identity_key_value
+        elif account_hash:
             scope_sql = "account_id_hash=?"
             scope_value = account_hash
         else:
@@ -2938,6 +4869,34 @@ class UsageRepository:
         if dimension not in dimensions:
             raise ValueError(f"unknown dimension: {dimension}")
         group_expression, select_expression = dimensions[dimension]
+        source_table = (
+            "usage_statistics" if dimension in {"model", "date"} else "usage_events"
+        )
+        if source_table == "usage_statistics":
+            non_cached_input_expression = "non_cached_input_token_count"
+            codex_status_expression = "codex_status_token_count"
+        else:
+            non_cached_input_expression = (
+                "MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)"
+            )
+            codex_status_expression = (
+                "MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0) "
+                "+ COALESCE(output_tokens, 0)"
+            )
+        extra_filter = ""
+        if dimension == "account":
+            extra_filter = """
+              AND identity_key IS NOT NULL AND identity_key!='unknown'
+              AND NOT EXISTS (
+                    SELECT 1 FROM active_subscription_registry registry
+                     WHERE registry.identity_key=usage_events.identity_key
+                       AND registry.state='suspect_missing'
+                  )
+              AND NOT EXISTS (
+                    SELECT 1 FROM retired_subscription_tombstones tombstone
+                     WHERE tombstone.identity_key=usage_events.identity_key
+                  )
+            """
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -2956,10 +4915,9 @@ class UsageRepository:
                   COALESCE(SUM(total_tokens), 0) total_tokens,
                   COALESCE(SUM(CASE WHEN long_context_pricing_applied=1 THEN call_count ELSE 0 END), 0)
                     long_context_priced_calls,
-                  COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)), 0)
+                  COALESCE(SUM({non_cached_input_expression}), 0)
                     non_cached_input_tokens,
-                  COALESCE(SUM(MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)
-                               + COALESCE(output_tokens, 0)), 0)
+                  COALESCE(SUM({codex_status_expression}), 0)
                     codex_status_tokens,
                   COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0)
                     api_processed_tokens,
@@ -2968,7 +4926,7 @@ class UsageRepository:
                   SUM(cached_input_cost_usd) cached_input_cost_usd,
                   SUM(output_cost_usd) output_cost_usd,
                   COALESCE(SUM(CASE WHEN usage_missing=1 THEN call_count ELSE 0 END), 0) usage_missing_calls
-                FROM usage_events WHERE ts>=?
+                FROM {source_table} WHERE ts>=? {extra_filter}
                 GROUP BY {group_expression}
                 ORDER BY calls DESC, total_tokens DESC
                 """,
@@ -2991,7 +4949,7 @@ class UsageRepository:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ts, usage_alias, account_id_tail, account_id_hash,
+                SELECT ts, identity_key, usage_alias, account_id_tail, account_id_hash,
                   auth_fingerprint, session_id, model, endpoint, method,
                   status_code, ok, duration_ms, stream, input_tokens,
                   cached_tokens, cache_write_tokens, output_tokens, reasoning_tokens, total_tokens,
@@ -2999,7 +4957,17 @@ class UsageRepository:
                   cached_input_cost_usd, output_cost_usd, long_context_pricing_applied,
                   usage_missing, error_type,
                   error_message_redacted, source, request_id
-                FROM usage_events ORDER BY ts DESC, id DESC LIMIT ?
+                FROM usage_events
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM active_subscription_registry registry
+                       WHERE registry.identity_key=usage_events.identity_key
+                         AND registry.state='suspect_missing'
+                    )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM retired_subscription_tombstones tombstone
+                       WHERE tombstone.identity_key=usage_events.identity_key
+                    )
+                ORDER BY ts DESC, id DESC LIMIT ?
                 """,
                 (count,),
             ).fetchall()
@@ -3037,6 +5005,13 @@ class UsageRepository:
                   SELECT identity_key, usage_alias, account_id_tail, account_id_hash, NULL, cycle_end_ts AS ts
                     FROM account_quota_cycles WHERE identity_key IS NOT NULL
                 )
+                WHERE identity_key NOT IN (
+                      SELECT identity_key FROM active_subscription_registry
+                       WHERE state='suspect_missing'
+                    )
+                  AND identity_key NOT IN (
+                      SELECT identity_key FROM retired_subscription_tombstones
+                    )
                 GROUP BY identity_key ORDER BY MAX(ts) DESC
                 """
             ).fetchall()
@@ -3651,36 +5626,30 @@ def queue_record_event(
         total_tokens=as_nonnegative_int(token_block.get("total_tokens")),
     )
     model = safe_text(record.get("model") or record.get("alias"), 200)
-    endpoint = safe_text(record.get("endpoint"), 300) or "/v1/unknown"
-    if not endpoint.startswith("/"):
-        endpoint = "/v1/unknown"
+    endpoint = "/v1/usage"
     auth_index = safe_text(record.get("auth_index"), 512)
     digest_raw = safe_text(record.get("access_token_sha256"), 128)
     digest = digest_raw.lower() if digest_raw and re.fullmatch(r"[0-9a-f]{64}", digest_raw.lower()) else None
-    auth_fingerprint = digest[:16] if digest else None
     identity = resolver.resolve_queue(auth_index, digest, safe_text(record.get("alias"), 200))
-    usage_alias = identity.usage_alias or (f"auth:{auth_fingerprint}" if auth_fingerprint else None)
-    key = identity_key(identity.account_id_hash, usage_alias, auth_fingerprint, None, None)
-    metadata = record.get("client_request_metadata")
-    metadata = metadata if isinstance(metadata, Mapping) else {}
-    session_id = safe_text(metadata.get("session_id"), 256)
-    thread_id = safe_text(metadata.get("thread_id"), 256)
-    turn_id = safe_text(metadata.get("turn_id"), 256)
-    installation_id = safe_text(metadata.get("installation_id"), 256)
-    window_id = safe_text(metadata.get("window_id"), 256)
+    usage_alias = identity.usage_alias
+    key = (
+        f"subscription:{identity.subscription_id_hash}"
+        if identity.subscription_id_hash
+        else "unknown"
+    )
     info = RequestInfo(
         endpoint=endpoint,
         method="POST",
         model=model,
         stream=int(_queue_headers_are_streaming(record.get("response_headers"))),
-        session_id=session_id,
-        thread_id=thread_id,
-        turn_id=turn_id,
-        installation_id=installation_id,
-        window_id=window_id,
+        session_id=None,
+        thread_id=None,
+        turn_id=None,
+        installation_id=None,
+        window_id=None,
         usage_alias=usage_alias,
         usage_project=None,
-        auth_fingerprint=auth_fingerprint,
+        auth_fingerprint=None,
         account_id_hash=identity.account_id_hash,
         account_id_tail=identity.account_id_tail,
         identity_key=key,
@@ -3701,14 +5670,14 @@ def queue_record_event(
         ok=int(not failed and 200 <= status_code < 300),
         duration_ms=as_nonnegative_int(record.get("latency_ms")) or 0,
         stream=info.stream,
-        session_id=session_id,
-        thread_id=thread_id,
-        turn_id=turn_id,
-        installation_id=installation_id,
-        window_id=window_id,
+        session_id=None,
+        thread_id=None,
+        turn_id=None,
+        installation_id=None,
+        window_id=None,
         usage_alias=usage_alias,
         usage_project=None,
-        auth_fingerprint=auth_fingerprint,
+        auth_fingerprint=None,
         account_id_hash=identity.account_id_hash,
         account_id_tail=identity.account_id_tail,
         input_tokens=usage.input_tokens,
@@ -3734,7 +5703,7 @@ def queue_record_event(
         request_bytes=0,
         response_bytes=0,
         source="usage_queue",
-        request_id=short_hash(safe_text(record.get("request_id"), 256)),
+        request_id=None,
     )
     return event, info
 
@@ -3883,6 +5852,7 @@ class CodexAppLocalImporter:
         self._last_imported = 0
         self._last_scanned_files = 0
         self._account_match: bool | None = None
+        self._member_match: bool | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -3902,9 +5872,10 @@ class CodexAppLocalImporter:
         persisted = self.repo.import_status("codex_app_local")
         return {
             "enabled": True,
-            "codex_home": str(self.codex_home),
+            "codex_home_configured": True,
             "usage_alias": self.alias,
             "account_match": self._account_match,
+            "member_match": self._member_match,
             "last_poll_at": self._last_poll_at,
             "last_success_at": self._last_success_at,
             "last_error_type": self._last_error_type,
@@ -3929,28 +5900,52 @@ class CodexAppLocalImporter:
             self._stop.wait(self.poll_seconds)
 
     @staticmethod
-    def _read_auth_identity(path: Path) -> tuple[str | None, str | None, str | None]:
+    def _read_auth_identity(
+        path: Path,
+    ) -> tuple[
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ]:
         data = AccountResolver._read_json(path)
         if not isinstance(data, Mapping):
-            return None, None, None
+            return None, None, None, None, None, None
+        (
+            account,
+            _access_tokens,
+            email,
+            principal_id,
+            provider_subscription_id,
+        ) = AccountResolver._account_and_tokens(data)
         nested = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
-        account = safe_text(nested.get("account_id") or data.get("account_id"), 256)
-        claims = _decode_jwt_claims_unverified(
-            nested.get("id_token") or data.get("id_token")
+        raw_id_token = nested.get("id_token") or data.get("id_token")
+        claims = (
+            raw_id_token
+            if isinstance(raw_id_token, Mapping)
+            else _decode_jwt_claims_unverified(raw_id_token)
         )
         auth_claims = claims.get("https://api.openai.com/auth")
         auth_claims = auth_claims if isinstance(auth_claims, Mapping) else {}
-        plan = safe_text(
+        plan = safe_plan_type(
             auth_claims.get("chatgpt_plan_type")
             or claims.get("chatgpt_plan_type")
-            or claims.get("plan_type"),
-            64,
+            or claims.get("plan_type")
         )
         active_until = normalize_optional_timestamp(
             auth_claims.get("chatgpt_subscription_active_until")
             or claims.get("chatgpt_subscription_active_until")
         )
-        return account, plan, active_until
+        return (
+            account,
+            email,
+            principal_id,
+            provider_subscription_id,
+            plan,
+            active_until,
+        )
 
     @staticmethod
     def _usage_from_token_count(payload: Mapping[str, Any]) -> NormalizedUsage:
@@ -3968,9 +5963,14 @@ class CodexAppLocalImporter:
         )
 
     def import_once(self) -> dict[str, int]:
-        app_account, default_plan, active_until = self._read_auth_identity(
-            self.codex_home / "auth.json"
-        )
+        (
+            app_account,
+            app_email,
+            app_principal_id,
+            app_provider_subscription_id,
+            default_plan,
+            active_until,
+        ) = self._read_auth_identity(self.codex_home / "auth.json")
         alias_identity = self.resolver.resolve(self.alias, None)
         alias_account_hash = alias_identity.account_id_hash
         self._account_match = bool(
@@ -3980,6 +5980,37 @@ class CodexAppLocalImporter:
         )
         if not self._account_match:
             raise ValueError("codex app account does not match configured alias")
+        app_identity = self.resolver.resolve_auth_file(
+            None,
+            app_account,
+            app_email,
+            app_principal_id,
+            app_provider_subscription_id,
+        )
+        app_key = app_identity.subscription_id_hash
+        alias_key = alias_identity.subscription_id_hash
+        app_email_value = normalize_email_identity(app_email)
+        alias_email_value = normalize_email_identity(alias_identity.account_email)
+        if app_email_value and alias_email_value:
+            member_match: bool | None = app_email_value == alias_email_value
+        elif app_principal_id and alias_identity.principal_id_hash:
+            # A principal-only App auth file can still prove it is the same
+            # member as an alias that has since gained a structured email.
+            member_match = (
+                short_hash(app_principal_id) == alias_identity.principal_id_hash
+            )
+        elif app_key and alias_key and app_key == alias_key:
+            member_match = True
+        else:
+            member_match = None
+        self._member_match = member_match
+        if member_match is False:
+            raise ValueError("codex app member does not match configured alias")
+        import_identity = (
+            alias_identity
+            if member_match is True
+            else AccountIdentity(None, None, None)
+        )
         sessions = self.codex_home / "sessions"
         try:
             paths = sorted(
@@ -3996,7 +6027,7 @@ class CodexAppLocalImporter:
             except OSError:
                 continue
             imported_delta, quota_delta = self._import_file(
-                path, alias_identity, default_plan, active_until
+                path, import_identity, default_plan, active_until
             )
             imported += imported_delta
             quota_rows += quota_delta
@@ -4013,10 +6044,18 @@ class CodexAppLocalImporter:
         default_plan: str | None,
         active_until: str | None,
     ) -> tuple[int, int]:
-        session_id: str | None = None
+        # Account/workspace equality is sufficient to decide whether these
+        # local logs belong to the configured source, but it is not a safe
+        # member identity for Team workspaces. Sparse legacy auth therefore
+        # contributes only anonymous token statistics and no quota card.
+        canonical_identity = bool(identity.subscription_id_hash)
+        identity_key_value = (
+            f"subscription:{identity.subscription_id_hash}"
+            if canonical_identity
+            else "unknown"
+        )
         model_provider: str | None = None
         model: str | None = None
-        turn_id: str | None = None
         imported = 0
         quota_rows = 0
         record_index = 0
@@ -4039,10 +6078,8 @@ class CodexAppLocalImporter:
             )
             start_offset = int(state.get("offset") or 0) if can_resume else 0
             if can_resume:
-                session_id = safe_text(state.get("session_id"), 256)
                 model_provider = safe_text(state.get("model_provider"), 64)
                 model = safe_text(state.get("model"), 200)
-                turn_id = safe_text(state.get("turn_id"), 256)
             handle = path.open("r", encoding="utf-8", errors="replace")
             if start_offset:
                 handle.seek(start_offset)
@@ -4061,17 +6098,12 @@ class CodexAppLocalImporter:
                 if not isinstance(payload, Mapping):
                     continue
                 if record_type == "session_meta":
-                    session_id = safe_text(
-                        payload.get("session_id") or payload.get("id"), 256
-                    )
                     model_provider = safe_text(payload.get("model_provider"), 64)
                     continue
                 if record_type == "turn_context":
-                    model = safe_text(payload.get("model"), 200) or model
-                    turn_id = safe_text(payload.get("turn_id"), 256) or turn_id
+                    model = safe_model_identifier(payload.get("model")) or model
                     continue
                 if record_type == "event_msg" and payload.get("type") == "task_started":
-                    turn_id = safe_text(payload.get("turn_id"), 256) or turn_id
                     continue
                 if record_type != "event_msg" or payload.get("type") != "token_count":
                     continue
@@ -4082,9 +6114,7 @@ class CodexAppLocalImporter:
                 if usage.missing:
                     continue
                 timestamp = normalize_timestamp(record.get("timestamp"))
-                key = identity_key(
-                    identity.account_id_hash, self.alias, None, None, session_id
-                )
+                key = identity_key_value
                 components = self.repo.price_components_for(model, usage)
                 # The ordinal is stable in Codex JSONL.  Include a bounded
                 # fallback index for older files that omit it.
@@ -4103,13 +6133,13 @@ class CodexAppLocalImporter:
                     ok=1,
                     duration_ms=0,
                     stream=0,
-                    session_id=session_id,
-                    thread_id=session_id,
-                    turn_id=turn_id,
+                    session_id=None,
+                    thread_id=None,
+                    turn_id=None,
                     installation_id=None,
                     window_id=None,
                     usage_alias=self.alias,
-                    usage_project="ChatGPT Codex",
+                    usage_project=None,
                     auth_fingerprint=None,
                     account_id_hash=identity.account_id_hash,
                     account_id_tail=identity.account_id_tail,
@@ -4138,7 +6168,7 @@ class CodexAppLocalImporter:
                     request_bytes=0,
                     response_bytes=0,
                     source="codex_app_local",
-                    request_id=import_key,
+                    request_id=None,
                 )
                 if self.repo.record_imported_event(
                     event, import_key, "codex_app_local"
@@ -4146,7 +6176,7 @@ class CodexAppLocalImporter:
                     imported += 1
                 rate_limits = payload.get("rate_limits")
                 plan = (
-                    safe_text(rate_limits.get("plan_type"), 64)
+                    safe_plan_type(rate_limits.get("plan_type"))
                     if isinstance(rate_limits, Mapping)
                     else None
                 ) or default_plan
@@ -4154,6 +6184,8 @@ class CodexAppLocalImporter:
                 # an unchanged JSONL line must not create a new snapshot row;
                 # ``insert_subscription_quota_snapshot`` intentionally uses
                 # INSERT OR IGNORE for this reason.
+                if not canonical_identity:
+                    continue
                 for window in parse_codex_app_rate_windows(rate_limits, timestamp):
                     window.update(
                         {
@@ -4179,10 +6211,8 @@ class CodexAppLocalImporter:
                 "size": final_stat.st_size,
                 "mtime_ns": final_stat.st_mtime_ns,
                 "offset": min(final_offset, final_stat.st_size),
-                "session_id": session_id,
                 "model_provider": model_provider,
                 "model": model,
-                "turn_id": turn_id,
             }
         )
         return imported, quota_rows
@@ -4214,6 +6244,12 @@ class CodexQuotaPoller:
         self._last_error_type: str | None = None
         self._account_count = 0
         self._window_count = 0
+        self._inventory_result: dict[str, Any] = {
+            "authoritative": False,
+            "active": 0,
+            "suspect": 0,
+            "retired": 0,
+        }
 
     def start(self) -> None:
         if self._thread is not None:
@@ -4235,6 +6271,11 @@ class CodexQuotaPoller:
             "last_error_type": self._last_error_type,
             "account_count": self._account_count,
             "window_count": self._window_count,
+            "inventory": {
+                key: value
+                for key, value in self._inventory_result.items()
+                if key != "retired_keys"
+            },
             "poll_seconds": self.poll_seconds,
         }
 
@@ -4300,27 +6341,155 @@ class CodexQuotaPoller:
         status, auth_payload = self._management_request(key, "GET", "/v0/management/auth-files")
         if status != 200 or not isinstance(auth_payload, Mapping):
             raise RuntimeError(f"auth_files_http_{status}")
-        raw_files = auth_payload.get("files")
-        files = raw_files if isinstance(raw_files, list) else []
+        if "files" not in auth_payload or not isinstance(auth_payload.get("files"), list):
+            raise ValueError("auth_files_inventory_incomplete")
+        files = auth_payload["files"]
+        # Deletion decisions require the complete inventory.  Be conservative
+        # with management builds that expose pagination metadata even though
+        # the common endpoint currently returns one list.
+        next_page = first_present(
+            auth_payload,
+            ("next", "next_page", "nextPage", "next_cursor", "nextCursor"),
+        )
+        total_items = as_nonnegative_int(
+            first_present(auth_payload, ("total", "total_count", "totalCount"))
+        )
+        pagination_incomplete = next_page not in (None, "", False, 0)
+        if pagination_value_indicates_more(
+            auth_payload.get("has_more")
+        ) or pagination_value_indicates_more(auth_payload.get("hasMore")):
+            pagination_incomplete = True
+        if total_items is not None and total_items > len(files):
+            pagination_incomplete = True
         fetched_at = utc_now()
         account_count = 0
         window_count = 0
-        seen_accounts: set[str] = set()
+        authoritative = not pagination_incomplete
+        present_keys: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        # A forced scan prevents a just-deleted or just-written local auth file
+        # from being hidden behind the resolver's normal 60-second cache.
+        self.resolver.active_subscription_keys(force_refresh=True)
         for item in files:
             if not isinstance(item, Mapping):
+                authoritative = False
                 continue
             provider = safe_text(item.get("provider") or item.get("type"), 64)
-            if not provider or provider.lower() != "codex" or item.get("disabled") is True:
+            if not provider:
+                authoritative = False
                 continue
+            if provider.lower() != "codex":
+                continue
+            auth_names = [
+                value
+                for raw in (
+                    item.get("name"),
+                    item.get("id"),
+                    item.get("filename"),
+                    item.get("file_name"),
+                )
+                if (value := safe_text(raw, 512))
+            ]
             auth_index = safe_text(item.get("auth_index") or item.get("authIndex"), 512)
-            claims = item.get("id_token") if isinstance(item.get("id_token"), Mapping) else {}
-            account_id = safe_text(
-                claims.get("chatgpt_account_id") or item.get("account"), 256
+            parsed_item = dict(item)
+            # Older management responses used ``account`` for an id, while
+            # current OAuth responses use it for an email.  Never send an
+            # email as Chatgpt-Account-Id.
+            legacy_account = safe_text(item.get("account"), 256)
+            if legacy_account and "@" in legacy_account:
+                if not parsed_item.get("email"):
+                    parsed_item["email"] = legacy_account
+            elif legacy_account and not parsed_item.get("account_id"):
+                parsed_item["account_id"] = legacy_account
+            (
+                account_id,
+                _access_tokens,
+                account_email,
+                principal_id,
+                provider_subscription_id,
+            ) = self.resolver._account_and_tokens(parsed_item)
+            identity = AccountIdentity(None, None, None)
+            known_auth_names = list(
+                dict.fromkeys(
+                    name
+                    for name in auth_names
+                    if self.resolver.auth_file_known(name)
+                )
             )
-            if not auth_index or not account_id or account_id in seen_accounts:
+            if known_auth_names:
+                resolved_known: list[AccountIdentity] = []
+                exact_conflict = False
+                for auth_name in known_auth_names:
+                    resolved = self.resolver.resolve_auth_file(
+                        auth_name,
+                        account_id,
+                        account_email,
+                        principal_id,
+                        provider_subscription_id,
+                    )
+                    if not resolved.subscription_id_hash:
+                        exact_conflict = True
+                        break
+                    resolved_known.append(resolved)
+                resolved_keys = {
+                    resolved.subscription_id_hash for resolved in resolved_known
+                }
+                if exact_conflict or len(resolved_keys) != 1:
+                    authoritative = False
+                    continue
+                identity = resolved_known[0]
+            else:
+                # A management-only structured identity is an acceptable
+                # fallback only when none of its advertised filenames exists
+                # locally.  Exact local conflicts above are fail-closed.
+                identity = self.resolver.resolve_auth_file(
+                    None,
+                    account_id,
+                    account_email,
+                    principal_id,
+                    provider_subscription_id,
+                )
+            if not identity.subscription_id_hash:
+                authoritative = False
                 continue
-            seen_accounts.add(account_id)
-            identity = self.resolver.resolve_account_id(account_id)
+            persisted_key = f"subscription:{identity.subscription_id_hash}"
+            present_keys.add(persisted_key)
+            if item.get("disabled") is True:
+                continue
+            if not auth_index or not account_id:
+                authoritative = False
+                continue
+            raw_claims = item.get("id_token")
+            claims = (
+                raw_claims
+                if isinstance(raw_claims, Mapping)
+                else _decode_jwt_claims_unverified(raw_claims)
+            )
+            candidates.append(
+                {
+                    "auth_index": auth_index,
+                    "account_id": account_id,
+                    "claims": claims,
+                    "identity": identity,
+                    "persisted_key": persisted_key,
+                }
+            )
+
+        self._inventory_result = self.repo.reconcile_subscription_inventory(
+            present_keys,
+            fetched_at,
+            authoritative=authoritative,
+        )
+        seen_subscriptions: set[str] = set()
+        for candidate in candidates:
+            auth_index = candidate["auth_index"]
+            account_id = candidate["account_id"]
+            claims = candidate["claims"]
+            identity = candidate["identity"]
+            persisted_key = candidate["persisted_key"]
+            if persisted_key in seen_subscriptions:
+                continue
+            usage_alias = identity.usage_alias
             headers = {
                 "Authorization": "Bearer $TOKEN$",
                 "Content-Type": "application/json",
@@ -4348,30 +6517,31 @@ class CodexQuotaPoller:
                 continue
             if not isinstance(usage_payload, Mapping):
                 continue
+            auth_claims = claims.get("https://api.openai.com/auth")
+            auth_claims = auth_claims if isinstance(auth_claims, Mapping) else {}
             plan = safe_text(
                 usage_payload.get("plan_type")
                 or usage_payload.get("planType")
-                or claims.get("plan_type"),
+                or claims.get("plan_type")
+                or auth_claims.get("plan_type"),
                 64,
             )
-            active_until = claims.get("chatgpt_subscription_active_until")
+            active_until = (
+                claims.get("chatgpt_subscription_active_until")
+                or auth_claims.get("chatgpt_subscription_active_until")
+            )
             windows = parse_codex_quota_windows(usage_payload, fetched_at)
             if not windows:
                 continue
+            seen_subscriptions.add(persisted_key)
             account_count += 1
             for window in windows:
                 window.update(
                     {
-                        "identity_key": identity_key(
-                            identity.account_id_hash,
-                            identity.usage_alias,
-                            None,
-                            None,
-                            None,
-                        ),
+                        "identity_key": persisted_key,
                         "account_id_hash": identity.account_id_hash,
                         "account_id_tail": identity.account_id_tail,
-                        "usage_alias": identity.usage_alias,
+                        "usage_alias": usage_alias,
                         "plan_type": plan,
                         "subscription_active_until": active_until,
                         "source": "cliproxy_wham_usage",
@@ -4580,15 +6750,15 @@ class UsageQueuePoller:
 
 
 def display_identity(row: Mapping[str, Any]) -> str:
+    if row.get("legacy_ambiguous"):
+        return "legacy workspace"
     if row.get("usage_alias"):
         return str(row["usage_alias"])
-    if row.get("account_id_tail"):
-        return f"account …{row['account_id_tail']}"
-    if row.get("account_id_hash"):
-        return f"account {row['account_id_hash']}"
-    if row.get("auth_fingerprint"):
-        return f"auth {row['auth_fingerprint']}"
-    return str(row.get("identity_key") or "unknown")
+    if row.get("account_email"):
+        return str(row["account_email"])
+    if str(row.get("identity_key") or "").startswith("subscription:"):
+        return "订阅账号"
+    return "unknown"
 
 
 def identity_badge(row: Mapping[str, Any]) -> tuple[str, str]:
@@ -4599,6 +6769,8 @@ def identity_badge(row: Mapping[str, Any]) -> tuple[str, str]:
     fallback or queue-derived identity), so it has no stable local alias.
     """
 
+    if row.get("legacy_ambiguous"):
+        return "L", "L = Legacy ambiguous（历史记录无法安全拆分）"
     alias = safe_text(row.get("usage_alias"), 128) or ""
     if re.fullmatch(r"codex-\d+", alias, re.IGNORECASE):
         return "C", "C = Codex alias（已映射本机 CODEX_HOME）"
@@ -4716,8 +6888,7 @@ def period_card_html(label: str, data: Mapping[str, Any]) -> str:
         f'{fmt_money(data.get("cached_input_cost_usd"))}</span>'
         f'<span>API 原始处理：{fmt_int(data.get("api_processed_tokens"))}</span>'
         f'<span>缓存命中率：{fmt_percent(data.get("cache_hit_rate_percent"))}</span>'
-        f'<span>逻辑请求/账号调用：{fmt_int(data.get("logical_requests"))}/'
-        f'{fmt_int(data.get("account_attempts"))}</span>'
+        f'<span>调用记录：{fmt_int(data.get("account_attempts"))}</span>'
         f'<span>失败调用：{fmt_int(data.get("failed_attempts"))}</span>'
         '</div>'
         f'{token_mix_html(data)}'
@@ -4768,6 +6939,13 @@ def dashboard_html(
     persisted_quota_accounts = sum(1 for row in subscriptions if row.get("windows"))
     models = repo.grouped("7d", "model")
     recent = repo.recent(50)
+    if account_resolver is not None:
+        for row in [*subscriptions, *recent]:
+            identity = account_resolver.resolve_identity_key(row.get("identity_key"))
+            if identity.usage_alias:
+                row["usage_alias"] = identity.usage_alias
+            if identity.account_email:
+                row["account_email"] = identity.account_email
     coverage = repo.coverage()
     price_sync = repo.price_sync_status()
     queue_status = queue_status or {}
@@ -4815,9 +6993,10 @@ def dashboard_html(
                 "violet-card",
             ),
             (
-                "逻辑请求",
-                fmt_int(all_time["logical_requests"]),
-                f"账号调用 {fmt_int(all_time['account_attempts'])} · 额外调用 {fmt_int(all_time['retry_attempts'])}",
+                "调用统计",
+                fmt_int(all_time["account_attempts"]),
+                f"成功 {fmt_int(all_time['successful_attempts'])} · "
+                f"失败 {fmt_int(all_time['failed_attempts'])} · 请求关联不落库",
                 "amber-card",
             ),
         )
@@ -4843,6 +7022,7 @@ def dashboard_html(
 
     subscription_cards: list[str] = []
     for row in subscriptions:
+        legacy_ambiguous = bool(row.get("legacy_ambiguous"))
         windows = row.get("windows") or {}
         weekly = windows.get("weekly") or windows.get("monthly")
         five_hour = windows.get("five_hour")
@@ -4859,14 +7039,13 @@ def dashboard_html(
             if full_quota is not None else f"当前已观测 ≥ {fmt_money(floor)} · 低置信度"
         )
         alias = display_identity(row)
-        plan = str(row.get("plan_type") or "unknown").upper()
-        status_text = "实时额度" if row.get("fetched_at") else "等待额度快照"
-        account_email: str | None = None
-        if account_resolver is not None:
-            identity = account_resolver.resolve_account_hash(row.get("account_id_hash"))
-            if not identity.account_email and row.get("usage_alias"):
-                identity = account_resolver.resolve(str(row["usage_alias"]), None)
-            account_email = identity.account_email
+        plan = "LEGACY" if legacy_ambiguous else str(row.get("plan_type") or "unknown").upper()
+        status_text = (
+            "历史归属不确定"
+            if legacy_ambiguous
+            else ("实时额度" if row.get("fetched_at") else "等待额度快照")
+        )
+        account_email = safe_email(row.get("account_email"))
         account_email_html = (
             f'<span class="account-email">{html.escape(account_email)}</span>'
             if account_email else '<span class="account-email unavailable">邮箱未获取</span>'
@@ -4877,10 +7056,14 @@ def dashboard_html(
             and float(row.get("quota_used_percent") or 0.0) == 0.0
             else "API 等价额度估算"
         )
+        if legacy_ambiguous:
+            quota_label = "历史记录"
+            quota_text = "不参与额度"
+            quota_note = "无法安全拆分 · 已保留调用统计"
         subscription_cards.append(
             f'<article class="subscription-card"><div class="account-head"><div class="avatar" title="{html.escape(badge_title)}">{badge}</div>'
             f'<div class="account-copy"><h3>{html.escape(alias)}</h3>{account_email_html}'
-            f'<span class="account-meta">{html.escape(plan)} · …{html.escape(str(row.get("account_id_tail") or "未知"))} · {html.escape(badge_title)}</span></div>'
+            f'<span class="account-meta">{html.escape(plan)} · {html.escape(badge_title)}</span></div>'
             f'<i>{html.escape(status_text)}</i></div>'
             f'{window_meter_html(five_hour, "5 小时额度")}{window_meter_html(weekly, "周额度" if not windows.get("monthly") else "月额度")}'
             f'<div class="account-usage"><span>总调用 <b>{fmt_int(row.get("all_time_account_attempts"))}</b></span>'
@@ -4888,7 +7071,7 @@ def dashboard_html(
             f'<span class="account-failure">失败 <b>{fmt_int(row.get("all_time_failed_calls"))}</b></span>'
             f'<span>非缓存输入 <b>{fmt_compact(row.get("all_time_non_cached_input_tokens"))}</b></span>'
             f'<span>输出 <b>{fmt_compact(row.get("all_time_output_tokens"))}</b></span>'
-            f'<span>额外调用 <b>{fmt_int(row.get("all_time_extra_calls"))}</b></span></div>'
+            f'<span>缓存输入 <b>{fmt_compact(row.get("all_time_cached_tokens"))}</b></span></div>'
             f'<div class="quota-value"><div><span>{html.escape(quota_label)}</span><strong>{quota_text}</strong></div>'
             f'<small>{html.escape(quota_note)}<br>累计消费 {fmt_money(row.get("all_time_cost_usd"))}</small></div></article>'
         )
@@ -4937,12 +7120,10 @@ def dashboard_html(
     ) or '<tr><td colspan="12" class="empty">暂无数据</td></tr>'
 
     session_notice = (
-        '<div class="notice warning-notice"><b>当前不能按 Codex session 精确拆分</b>'
-        f'<span>8317 queue 的 session_id 覆盖 {fmt_ratio(coverage.get("session_identified_attempts"), coverage.get("account_attempts"))}。'
-        '本页是全部账号与全部 session 的采集总计，不能直接与某个 tmux /status 做同范围比较；'
-        '“实际消耗”只统一了 token 算法（非缓存输入 + 输出）。</span></div>'
-        if int(coverage.get("session_identified_attempts") or 0) < int(coverage.get("account_attempts") or 0)
-        else ""
+        '<div class="notice warning-notice"><b>会话关联已按隐私策略关闭</b>'
+        '<span>session/thread/turn/request ID 不写入 SQLite；本页是跨 session 的 token 汇总，'
+        '不能直接与某个 tmux /status 做同范围比较。“实际消耗”只统一了 token 算法'
+        '（非缓存输入 + 输出）。</span></div>'
     )
 
     collector_ok = queue_status.get("key_loaded") and queue_status.get("last_status") == 200
@@ -4971,8 +7152,8 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
-<div class="notice app-import-notice"><b>ChatGPT Codex 本地监控</b><span>codex-13 · …fa79c563 已映射到默认 CODEX_HOME；只读取本机会话中的 token_count / rate_limits 元数据，不读取或保存提示词、代码、推理、工具输出和凭据。已自动导入 {fmt_int(codex_app_status.get('imported_events'))} 条，最近扫描 {fmt_local_time(codex_app_status.get('last_import_at'))}。下方“API 等价成本”仅是按模型 API 单价估算，不是 Pro 订阅实际扣款。</span></div>
-<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="codex-13" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><label class="note-label">备注（不填写提示词或代码）<input name="note" maxlength="120" placeholder="例如：另一台设备的 Codex 用量"></label><button type="submit">导入并估价</button><p>输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。重复提交不会自动去重，请按汇总区间录入一次。</p></form></details>
+<div class="notice app-import-notice"><b>ChatGPT Codex 本地监控</b><span>{html.escape(str(codex_app_status.get('usage_alias') or '本地账号'))} 已完成内存映射；只读取本机会话中的 token_count / rate_limits 元数据，不读取或保存提示词、代码、推理、工具输出和凭据。已自动导入 {fmt_int(codex_app_status.get('imported_events'))} 条，最近扫描 {fmt_local_time(codex_app_status.get('last_import_at'))}。下方“API 等价成本”仅是按模型 API 单价估算，不是 Pro 订阅实际扣款。</span></div>
+<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="codex-13" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><button type="submit">导入并估价</button><p>只接收模型、时间、调用数和 token 统计，不接收备注、提示词或代码。输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。</p></form></details>
 {session_notice}
 <div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
@@ -4982,10 +7163,10 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex 真实 5 小时/周窗口；美元额度优先按 provider 当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
 <section class="subscription-grid">{subscriptions_html}</section>
 <div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近调用。</p></div></div>
-  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
+  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
-  <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>逻辑请求</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>逻辑请求/尝试 <b>{fmt_int(all_time['logical_requests'])}/{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+  <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
+<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；输入、缓存输入和输出成本分别按对应模型的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
 
@@ -5129,7 +7310,15 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 LOG.error("dashboard rendering failed: %s", type(exc).__name__)
                 self._plain_response(500, b"dashboard unavailable\n")
                 return
-            self._send_bytes(200, "OK", [("Content-Type", "text/html; charset=utf-8")], body)
+            self._send_bytes(
+                200,
+                "OK",
+                [
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                ],
+                body,
+            )
             return
         if path == "/usage/manual-import":
             if self.command != "POST":
@@ -5147,7 +7336,12 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     "codex_app_local": self.meter_server.codex_app_importer.status(),
                 }
             ).encode()
-            self._send_bytes(200, "OK", [("Content-Type", "application/json")], body)
+            self._send_bytes(
+                200,
+                "OK",
+                [("Content-Type", "application/json"), ("Cache-Control", "no-store")],
+                body,
+            )
             return
         if path == "/v1" or path.startswith("/v1/"):
             self._proxy(path)
@@ -5166,7 +7360,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             alias = safe_alias(value("usage_alias"))
             if alias != self.meter_server.codex_app_importer.alias:
                 raise ValueError("unsupported alias")
-            model = safe_text(value("model"), 200)
+            model = safe_model_identifier(value("model"))
             if not model:
                 raise ValueError("model is required")
             input_tokens = as_nonnegative_int(value("input_tokens"))
@@ -5183,8 +7377,8 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             raw_ts = safe_text(value("ts"), 64)
             ts = normalize_timestamp(raw_ts) if raw_ts else utc_now()
             identity = self.meter_server.resolver.resolve(alias, None)
-            if not identity.account_id_hash:
-                raise ValueError("alias is not mapped to a local account")
+            if not identity.subscription_id_hash:
+                raise ValueError("alias is not mapped to a canonical subscription")
             usage = NormalizedUsage(
                 input_tokens=input_tokens,
                 cached_tokens=cached_tokens,
@@ -5198,9 +7392,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             )
             event = UsageEvent(
                 ts=ts,
-                identity_key=identity_key(
-                    identity.account_id_hash, alias, None, None, None
-                ),
+                identity_key=resolved_identity_key(identity, alias),
                 endpoint="manual://chatgpt-codex",
                 method="MANUAL",
                 model=model,
@@ -5214,7 +7406,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 installation_id=None,
                 window_id=None,
                 usage_alias=alias,
-                usage_project=safe_text(value("note"), 120) or "ChatGPT Codex 手动补录",
+                usage_project=None,
                 auth_fingerprint=None,
                 account_id_hash=identity.account_id_hash,
                 account_id_tail=identity.account_id_tail,
@@ -5244,7 +7436,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 response_bytes=0,
                 call_count=call_count,
                 source="manual_codex_app",
-                request_id=import_key,
+                request_id=None,
             )
             self.meter_server.repo.record_imported_event(
                 event, import_key, "manual_codex_app"
@@ -5608,6 +7800,8 @@ def create_server(
     resolver = account_resolver or AccountResolver(
         enabled=os.environ.get("CLIPROXY_USAGE_ACCOUNT_SCAN", "1").lower() not in {"0", "false", "no"}
     )
+    repo.reconcile_auth_identities(resolver)
+    repo.apply_privacy_minimization(resolver)
     return MeterHTTPServer(
         (host, port),
         repo,
@@ -5808,6 +8002,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     rebound = repo.reconcile_auth_identities(resolver)
     if rebound:
         LOG.info("reconciled %d provisional auth identity event(s)", rebound)
+    minimized = repo.apply_privacy_minimization(resolver)
+    if minimized:
+        LOG.info("migrated %d usage event(s) to private subscription identities", minimized)
     if args.serve:
         server = MeterHTTPServer(
             (args.host, args.port),
@@ -5840,12 +8037,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             server.start_queue_poller()
         else:
             server.start_local_importer()
+        shutdown_started = threading.Event()
+
+        def request_shutdown(_signum: int, _frame: Any) -> None:
+            if shutdown_started.is_set():
+                return
+            shutdown_started.set()
+            threading.Thread(
+                target=server.shutdown,
+                name="cliproxy-usage-shutdown",
+                daemon=True,
+            ).start()
+
+        previous_handlers: dict[int, Any] = {}
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, request_shutdown)
         try:
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:
             pass
         finally:
             server.server_close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
         return 0
     if args.summary:
         result = repo.summary(args.summary)
@@ -5874,11 +8090,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_rows(repo.quota_summary(args.quota_summary or "30d"), args.json)
         return 0
     if args.mark_reset:
-        key = repo.mark_reset(args.mark_reset, resolver)
+        try:
+            key = repo.mark_reset(args.mark_reset, resolver)
+        except ValueError as exc:
+            print(f"mark reset failed: {exc}", file=sys.stderr)
+            return 1
         print(f"marked reset: alias={args.mark_reset} identity={key}")
         return 0
     if args.mark_quota_hit:
-        key = repo.mark_quota_hit(args.mark_quota_hit, resolver)
+        try:
+            key = repo.mark_quota_hit(args.mark_quota_hit, resolver)
+        except ValueError as exc:
+            print(f"mark quota hit failed: {exc}", file=sys.stderr)
+            return 1
         print(f"marked quota hit: alias={args.mark_quota_hit} identity={key}")
         return 0
     if args.set_price:

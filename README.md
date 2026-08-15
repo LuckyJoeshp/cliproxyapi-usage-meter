@@ -42,11 +42,11 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | --- | --- |
 | Token accounting | Non-cached input, cached input, output, reasoning subset, and raw API processing |
 | Cost estimation | Official OpenAI short/long-context price sync or reviewed local prices, split by token type |
-| Account behavior | Logical requests, account attempts, retries, aliases, models, sessions, and dates |
+| Account behavior | Per-subscription calls, success/failure, models, dates, and token totals |
 | Quota visibility | Read-only 5-hour/week/month snapshots, reset times, cooldowns, and observed floors |
 | Collection paths | Transparent `8327` proxy plus optional destructive-read `8317` usage queue |
 | Dashboard | Inline, dependency-free `/usage` HTML with trend, account, model, and recent-call views |
-| Privacy boundary | Loopback by default; credentials discarded; only short fingerprints are stored |
+| Privacy boundary | Loopback by default; credentials and request metadata discarded; email is memory-only |
 
 ## Quick start
 
@@ -65,9 +65,10 @@ The dashboard also monitors direct ChatGPT App Codex sessions when the local
 Codex JSONL history is available. It imports only token-count and rate-limit
 metadata from the `CODEX_APP_HOME` (default `~/.codex`) and matches the local
 account to `codex-13`; it does not inspect prompts, code, tool output, or
-credentials. A manual usage form is available on `/usage` for sessions from
-another device. Dollar values are API-equivalent estimates, not Pro
-subscription billing.
+credentials. If that alias has no structured member identity, token totals are
+kept anonymous and no quota card is created. A manual usage form is available
+on `/usage` for canonically mapped sessions from another device. Dollar values
+are API-equivalent estimates, not Pro subscription billing.
 
 ### Start Codex through CLIProxyAPI from any folder
 
@@ -101,6 +102,45 @@ If Chrome already has the local CLIProxyAPI management page open,
 `scripts/start_cliproxy_usage_meter_from_chrome.py` can pass its key in memory
 without writing or printing it.
 
+### Team/workspace identity
+
+A Team workspace's `chatgpt_account_id` identifies the workspace, not a unique
+member. The meter reads the email only from structured auth JSON or JWT claims;
+text embedded in a timestamped `.cpa...json` filename is never treated as an
+email. At runtime it derives a keyed identity from workspace + email, using a
+random owner-only local key. Tagged mailbox names are preserved. A structured
+provider subscription ID or JWT principal is used only when email is absent.
+This keeps Team members separate while treating token/file rotation for the
+same mailbox as one subscription.
+
+Email and optional `codex-N` aliases exist only in memory for the loopback
+dashboard. SQLite stores the keyed subscription ID plus token/model/status/cost
+statistics; it does not store email, auth filenames, tokens or token digests,
+workspace/user IDs or tails, request/session/thread/turn IDs, project names,
+endpoints, error bodies, or local source paths. Quota polling uses management
+`name`/`id` only for the in-memory match and `auth_index` only as the opaque
+selector for that call. Free-form upstream error types are discarded, and
+model labels must match a narrow model-ID grammar before they are stored.
+
+The owner-only identity key defaults to
+`~/.config/cliproxy-usage/identity.key`. Back it up together with the SQLite
+database and keep both private. Deleting or rotating that key changes every
+derived subscription ID, so existing per-account history can no longer be
+safely reattached; the meter will preserve uncertain history only anonymously.
+
+The first complete auth inventory establishes a baseline. A missing
+subscription is hidden immediately; after three complete misses spanning at
+least ten minutes, its call rows are folded into identity-free daily token
+statistics and its quota/plan/renewal/account details are deleted. A suddenly
+empty inventory, or a drop to half the previous account count or less, requires
+five confirmations spanning at least thirty minutes. That stricter policy stays
+attached to each missing subscription until it authoritatively reappears.
+Malformed, partial, paginated or failed inventories never advance deletion,
+and disabled auth files still count as present. A keyed tombstone blocks late
+queue/import rows from recreating a retired account; only a later complete
+inventory can reactivate it. Dynamic `/usage` and `/healthz` responses use
+`Cache-Control: no-store`.
+
 ## Safety boundary
 
 - It does not modify, restart or replace CLIProxyAPI, port `8317`, Codex
@@ -108,10 +148,10 @@ without writing or printing it.
 - It listens on loopback by default. Do not expose it publicly without adding
   an authentication boundary of your own.
 - Authorization, API keys, OAuth tokens and management keys are never printed
-  or persisted. Only short hashes, account hashes and account-ID tails are
-  stored. The loopback dashboard may display each mapped subscription email
-  from its local Codex `auth.json` identity claim; email is kept in memory and
-  is not written to the usage/quota database or logs.
+  or persisted. The only durable account linkage is an owner-keyed subscription
+  ID. The loopback dashboard may display each mapped subscription email from a
+  structured local auth claim; email is kept in memory and is not written to
+  the usage/quota database or logs.
 - Management credentials must come from an owner-only (`0600`) external file
   or environment variable. They are never committed here.
 - SQLite files, WAL files, `.env` files, key files, caches and local paths are
