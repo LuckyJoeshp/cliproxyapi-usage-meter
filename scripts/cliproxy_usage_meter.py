@@ -41,11 +41,21 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.cliproxyapi_quota_guard import (  # noqa: E402
+    DEFAULT_STATE_FILE as DEFAULT_QUOTA_GUARD_STATE_FILE,
+    QuotaRoutingGuard,
+)
+
+
 LOG = logging.getLogger("cliproxy_usage_meter")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8327
 DEFAULT_UPSTREAM = "http://127.0.0.1:8317"
-DEFAULT_DB = Path(__file__).resolve().parents[1] / "datas" / "cliproxy_usage.sqlite"
+DEFAULT_DB = PROJECT_ROOT / "datas" / "cliproxy_usage.sqlite"
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 OFFICIAL_PRICING_HOSTS = {"developers.openai.com", "platform.openai.com"}
 OFFICIAL_PRICE_PARSER_VERSION = "openai-html-table-v2-long-context"
@@ -4678,6 +4688,55 @@ class UsageRepository:
             )
             if entry.get("current_window_full_quota_usd") is None and not entry.get("windows"):
                 entry["current_window_full_quota_usd"] = entry["historical_complete_cycle_usd"]
+        with self.connect() as conn:
+            latest_attempts = {
+                row["identity_key"]: dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT event.identity_key, event.ts, event.status_code, event.ok
+                      FROM usage_events event
+                     WHERE event.identity_key IS NOT NULL
+                       AND event.identity_key!='unknown'
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM usage_events newer
+                            WHERE newer.identity_key=event.identity_key
+                              AND (
+                                    newer.ts>event.ts
+                                    OR (newer.ts=event.ts AND newer.id>event.id)
+                                  )
+                       )
+                    """
+                )
+            }
+            latest_usage_limits = {
+                row["identity_key"]: row["ts"]
+                for row in conn.execute(
+                    """
+                    SELECT identity_key, MAX(ts) ts
+                      FROM quota_events
+                     WHERE event_type IN ('usage_limit_hit', 'quota_hit', 'cooldown_hit')
+                       AND identity_key IS NOT NULL
+                     GROUP BY identity_key
+                    """
+                )
+            }
+        for key, attempt in latest_attempts.items():
+            entry = by_key.get(key)
+            if entry is None:
+                continue
+            entry["last_execution_at"] = attempt.get("ts")
+            entry["last_execution_status"] = attempt.get("status_code")
+            if int(attempt.get("ok") or 0) == 1:
+                entry["execution_availability"] = "recent_success"
+            elif (
+                int(attempt.get("status_code") or 0) == 429
+                and str(latest_usage_limits.get(key) or "")
+                >= str(attempt.get("ts") or "")
+            ):
+                entry["execution_availability"] = "confirmed_exhausted"
+            else:
+                entry["execution_availability"] = "recent_failure"
         scoped_account_hashes = {
             entry.get("account_id_hash")
             for entry in by_key.values()
@@ -6615,6 +6674,7 @@ class UsageQueuePoller:
         count: int = DEFAULT_USAGE_QUEUE_COUNT,
         poll_seconds: float = DEFAULT_USAGE_QUEUE_POLL_SECONDS,
         timeout: float = 10.0,
+        quota_guard: QuotaRoutingGuard | None = None,
     ) -> None:
         self.repo = repo
         self.resolver = resolver
@@ -6625,6 +6685,7 @@ class UsageQueuePoller:
         self.count = max(1, min(int(count), 1000))
         self.poll_seconds = max(0.5, float(poll_seconds))
         self.timeout = max(1.0, float(timeout))
+        self.quota_guard = quota_guard
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._warned_no_key = False
@@ -6669,6 +6730,11 @@ class UsageQueuePoller:
             "accepted": self._accepted,
             "skipped": self._skipped,
             "backoff_seconds": self._backoff,
+            "quota_routing_guard": (
+                self.quota_guard.status()
+                if self.quota_guard is not None
+                else {"enabled": False, "active_locks": 0}
+            ),
         }
 
     def _load_key(self) -> str | None:
@@ -6710,6 +6776,8 @@ class UsageQueuePoller:
                 if status == 200:
                     self._last_success_at = self._last_poll_at
                     self._backoff = self.poll_seconds
+                    if self.quota_guard is not None:
+                        self.quota_guard.reconcile(key)
                 elif status in {401, 403}:
                     # 403 is also the response used during CLIProxyAPI's IP
                     # ban; use a long backoff and never inspect/log the body.
@@ -6757,12 +6825,12 @@ class UsageQueuePoller:
                 except ValueError:
                     retry_after = None
             if status == 200:
-                self._consume(body)
+                self._consume(body, key)
             return status, body, retry_after
         finally:
             connection.close()
 
-    def _consume(self, body: bytes) -> None:
+    def _consume(self, body: bytes, key: str) -> None:
         try:
             payload = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -6781,6 +6849,8 @@ class UsageQueuePoller:
             event, info = converted
             try:
                 self.repo.record_event(event, info, source="usage_queue")
+                if self.quota_guard is not None:
+                    self.quota_guard.observe_record(item, event, key)
                 accepted += 1
             except Exception as exc:
                 skipped += 1
@@ -7082,11 +7152,37 @@ def dashboard_html(
         )
         alias = display_identity(row)
         plan = "LEGACY" if legacy_ambiguous else str(row.get("plan_type") or "unknown").upper()
-        status_text = (
-            "历史归属不确定"
-            if legacy_ambiguous
-            else ("实时额度" if row.get("fetched_at") else "等待额度快照")
+        upstream_reports_zero = any(
+            (
+                _percent_value(window.get("remaining_percent")) is not None
+                and float(window.get("remaining_percent")) <= 0.0001
+            )
+            or (
+                _percent_value(window.get("used_percent")) is not None
+                and float(window.get("used_percent")) >= 99.9999
+            )
+            for window in windows.values()
+            if isinstance(window, Mapping)
         )
+        execution_availability = row.get("execution_availability")
+        if legacy_ambiguous:
+            status_text = "历史归属不确定"
+            status_class = "reported"
+        elif execution_availability == "confirmed_exhausted":
+            status_text = "已确认耗尽 · 冷却中"
+            status_class = "confirmed"
+        elif upstream_reports_zero and execution_availability == "recent_success":
+            status_text = "上游 0% · 实测可用"
+            status_class = "available"
+        elif execution_availability == "recent_success":
+            status_text = "最近实测可用"
+            status_class = "available"
+        elif upstream_reports_zero:
+            status_text = "上游报告 0%"
+            status_class = "reported"
+        else:
+            status_text = "实时额度" if row.get("fetched_at") else "等待额度快照"
+            status_class = "reported"
         account_email = safe_email(row.get("account_email"))
         account_email_html = (
             f'<span class="account-email">{html.escape(account_email)}</span>'
@@ -7106,7 +7202,7 @@ def dashboard_html(
             f'<article class="subscription-card"><div class="account-head"><div class="avatar" title="{html.escape(badge_title)}">{badge}</div>'
             f'<div class="account-copy"><h3>{html.escape(alias)}</h3>{account_email_html}'
             f'<span class="account-meta">{html.escape(plan)} · {html.escape(badge_title)}</span></div>'
-            f'<i>{html.escape(status_text)}</i></div>'
+            f'<i class="{status_class}">{html.escape(status_text)}</i></div>'
             f'{window_meter_html(five_hour, "5 小时额度")}{window_meter_html(weekly, "周额度" if not windows.get("monthly") else "月额度")}'
             f'<div class="account-usage"><span>总调用 <b>{fmt_int(row.get("all_time_account_attempts"))}</b></span>'
             f'<span class="account-success">成功 <b>{fmt_int(row.get("all_time_successful_calls"))}</b></span>'
@@ -7171,6 +7267,10 @@ def dashboard_html(
     collector_ok = queue_status.get("key_loaded") and queue_status.get("last_status") == 200
     quota_ok = quota_status.get("last_success_at") is not None or persisted_quota_accounts > 0
     codex_app_ok = codex_app_status.get("last_success_at") is not None
+    guard_status = queue_status.get("quota_routing_guard")
+    guard_status = guard_status if isinstance(guard_status, Mapping) else {}
+    guard_enabled = bool(guard_status.get("enabled"))
+    guard_locks = as_nonnegative_int(guard_status.get("active_locks")) or 0
     price_ok = price_sync.get("status") == "ok"
     generated = datetime.now().astimezone().isoformat(timespec="seconds")
     return f"""<!doctype html>
@@ -7191,6 +7291,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 .two-col{{display:grid;grid-template-columns:1fr 1.2fr;gap:15px}}.panel{{padding:0}}.panel h3{{margin:0;padding:15px 18px;border-bottom:2px solid var(--ink);background:var(--sun);color:var(--on-color);font:900 15px/1 var(--font-display)}}.two-col .panel:nth-child(2) h3{{background:var(--sky)}}.table-wrap{{overflow:auto;max-height:520px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:11px 14px;text-align:left;border-bottom:1.5px solid color-mix(in srgb,var(--ink) 48%,transparent);white-space:nowrap}}th{{position:sticky;top:0;z-index:2;background:var(--cream);color:var(--ink-2);font:800 9px/1.2 var(--font-mono);letter-spacing:.06em;text-transform:uppercase}}tbody tr:nth-child(even){{background:color-mix(in srgb,var(--sky) 12%,var(--card))}}tr:last-child td{{border-bottom:0}}.status-pill{{display:inline-block;min-width:42px;padding:3px 7px;border:1.5px solid var(--ink);border-radius:999px;text-align:center;color:var(--on-color);font:900 9px/1 var(--font-mono)}}.status-pill.ok{{background:var(--mint)}}.status-pill.bad{{background:var(--rose)}}.empty,.empty-state{{padding:25px;text-align:center;color:var(--ink-3)}}
 .system-strip{{display:flex;flex-wrap:wrap;gap:9px;margin-top:27px}}.system-strip span{{padding:7px 10px;border:1.5px solid var(--ink);border-radius:999px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-2);font:700 9px/1 var(--font-mono)}}.system-strip span:nth-child(1){{background:var(--mint);color:var(--on-color)}}.system-strip span:nth-child(2){{background:var(--sky);color:var(--on-color)}}.system-strip span:nth-child(3){{background:var(--sun);color:var(--on-color)}}.system-strip b{{color:inherit}}footer{{margin-top:24px;padding-top:16px;border-top:2px solid var(--ink);color:var(--ink-3);font:600 9px/1.65 var(--font-mono)}}
 @media(max-width:1320px){{.hero-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:920px){{main{{padding:26px 16px 55px}}header{{align-items:flex-start}}.brand-mark{{width:46px;height:46px}}.subtitle{{max-width:560px}}.hero-grid,.period-grid,.two-col{{grid-template-columns:minmax(0,1fr)}}.form-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.trend{{gap:7px}}.notice{{display:grid;grid-template-columns:auto minmax(0,1fr)}}.notice b{{white-space:normal}}.notice span{{grid-column:2;overflow-wrap:anywhere}}}}@media(max-width:620px){{header{{align-items:flex-start;flex-direction:column}}.brand-lockup{{align-items:flex-start}}h1{{font-size:clamp(28px,9vw,38px)}}.header-actions{{width:100%;justify-content:space-between}}.hero-grid,.subscription-grid,.form-grid{{grid-template-columns:minmax(0,1fr)}}.period-head{{flex-wrap:wrap}}.mix-legend{{grid-template-columns:minmax(0,1fr)}}.account-usage{{grid-template-columns:repeat(3,minmax(0,1fr))}}.trend-column small{{display:none}}.section-title{{align-items:flex-start;flex-direction:column;gap:6px}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important;transition:none!important}}}}
+.account-head i.confirmed{{background:var(--rose)}}.account-head i.reported{{background:var(--sun)}}.account-head i.available{{background:var(--mint)}}
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
@@ -7208,7 +7309,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '等待'}</b></span><span>ChatGPT App <b>{'本地监控中' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；输入、缓存输入和输出成本分别按对应模型的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
 
@@ -7231,6 +7332,9 @@ class MeterHTTPServer(ThreadingHTTPServer):
         usage_queue_count: int = DEFAULT_USAGE_QUEUE_COUNT,
         usage_queue_poll_seconds: float = DEFAULT_USAGE_QUEUE_POLL_SECONDS,
         usage_queue_timeout: float = 10.0,
+        quota_routing_guard_enabled: bool = False,
+        quota_routing_guard_state_file: str | Path = DEFAULT_QUOTA_GUARD_STATE_FILE,
+        quota_routing_guard_timeout: float = 10.0,
         quota_poll_seconds: float = DEFAULT_QUOTA_POLL_SECONDS,
         quota_poll_timeout: float = DEFAULT_QUOTA_POLL_TIMEOUT,
         codex_app_home: str | Path = DEFAULT_CODEX_APP_HOME,
@@ -7249,6 +7353,13 @@ class MeterHTTPServer(ThreadingHTTPServer):
         self.upstream = parsed
         self.resolver = resolver
         self.upstream_timeout = upstream_timeout
+        self.quota_routing_guard = QuotaRoutingGuard(
+            repo,
+            parsed,
+            enabled=quota_routing_guard_enabled,
+            state_file=quota_routing_guard_state_file,
+            timeout=quota_routing_guard_timeout,
+        )
         self.queue_poller = UsageQueuePoller(
             repo,
             resolver,
@@ -7259,6 +7370,7 @@ class MeterHTTPServer(ThreadingHTTPServer):
             count=usage_queue_count,
             poll_seconds=usage_queue_poll_seconds,
             timeout=usage_queue_timeout,
+            quota_guard=self.quota_routing_guard,
         )
         self.quota_poller = CodexQuotaPoller(
             repo,
@@ -7375,6 +7487,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     "upstream": self.meter_server.upstream.geturl(),
                     "usage_queue": self.meter_server.queue_poller.status(),
                     "subscription_quota": self.meter_server.quota_poller.status(),
+                    "quota_routing_guard": self.meter_server.quota_routing_guard.status(),
                     "codex_app_local": self.meter_server.codex_app_importer.status(),
                 }
             ).encode()
@@ -7398,7 +7511,10 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             fields = urllib.parse.parse_qs(
                 body.decode("utf-8"), keep_blank_values=True, max_num_fields=20
             )
-            value = lambda name: fields.get(name, [""])[0]
+
+            def value(name: str) -> str:
+                return fields.get(name, [""])[0]
+
             alias = safe_alias(value("usage_alias"))
             if alias != self.meter_server.codex_app_importer.alias:
                 raise ValueError("unsupported alias")
@@ -7830,6 +7946,9 @@ def create_server(
     usage_queue_count: int = DEFAULT_USAGE_QUEUE_COUNT,
     usage_queue_poll_seconds: float = DEFAULT_USAGE_QUEUE_POLL_SECONDS,
     usage_queue_timeout: float = 10.0,
+    quota_routing_guard_enabled: bool = False,
+    quota_routing_guard_state_file: str | Path = DEFAULT_QUOTA_GUARD_STATE_FILE,
+    quota_routing_guard_timeout: float = 10.0,
     quota_poll_seconds: float = DEFAULT_QUOTA_POLL_SECONDS,
     quota_poll_timeout: float = DEFAULT_QUOTA_POLL_TIMEOUT,
     codex_app_home: str | Path = DEFAULT_CODEX_APP_HOME,
@@ -7856,6 +7975,9 @@ def create_server(
         usage_queue_count=usage_queue_count,
         usage_queue_poll_seconds=usage_queue_poll_seconds,
         usage_queue_timeout=usage_queue_timeout,
+        quota_routing_guard_enabled=quota_routing_guard_enabled,
+        quota_routing_guard_state_file=quota_routing_guard_state_file,
+        quota_routing_guard_timeout=quota_routing_guard_timeout,
         quota_poll_seconds=quota_poll_seconds,
         quota_poll_timeout=quota_poll_timeout,
         codex_app_home=codex_app_home,
@@ -7947,6 +8069,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--usage-queue-timeout",
         type=float,
         default=float(os.environ.get("CLIPROXY_USAGE_QUEUE_TIMEOUT", "10")),
+    )
+    parser.add_argument(
+        "--quota-routing-guard",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("CLIPROXY_QUOTA_ROUTING_GUARD", "0").lower()
+        in {"1", "true", "yes", "on"},
+        help=(
+            "Set weight zero only after an exact usage_limit_reached 429, then restore it "
+            "at the provider reset deadline (requires weighted-round-robin)"
+        ),
+    )
+    parser.add_argument(
+        "--quota-routing-guard-state-file",
+        default=os.environ.get(
+            "CLIPROXY_QUOTA_ROUTING_GUARD_STATE_FILE",
+            str(DEFAULT_QUOTA_GUARD_STATE_FILE),
+        ),
+        help="Owner-only state file for opaque quota routing locks",
+    )
+    parser.add_argument(
+        "--quota-routing-guard-timeout",
+        type=float,
+        default=float(os.environ.get("CLIPROXY_QUOTA_ROUTING_GUARD_TIMEOUT", "10")),
+        help="Loopback management timeout used by the quota routing guard",
     )
     parser.add_argument(
         "--quota-poll-seconds",
@@ -8060,6 +8206,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             usage_queue_count=args.usage_queue_count,
             usage_queue_poll_seconds=args.usage_queue_poll_seconds,
             usage_queue_timeout=args.usage_queue_timeout,
+            quota_routing_guard_enabled=(
+                args.quota_routing_guard and not args.no_usage_queue
+            ),
+            quota_routing_guard_state_file=args.quota_routing_guard_state_file,
+            quota_routing_guard_timeout=args.quota_routing_guard_timeout,
             quota_poll_seconds=args.quota_poll_seconds,
             quota_poll_timeout=args.quota_poll_timeout,
             codex_app_home=args.codex_app_home,
@@ -8075,6 +8226,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.upstream,
             repo.path,
         )
+        if args.quota_routing_guard and not args.no_usage_queue:
+            LOG.info(
+                "confirmed quota routing guard enabled; provider percentage alone never locks a credential"
+            )
         if not args.no_usage_queue:
             server.start_queue_poller()
         else:

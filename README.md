@@ -93,6 +93,73 @@ The command uses the current directory as Codex's workspace. It does not embed
 `127.0.0.1:8317`; the existing `~/.codex/cliproxy.config.toml` profile supplies
 the endpoint and reads the bearer key at runtime.
 
+### Avoid repeated probes of confirmed exhausted credentials
+
+Treat a provider-reported `0%` as telemetry, not a routing lock: Codex can
+continue returning successful responses for some time after WHAM rounds or
+reports the remaining percentage as zero. CLIProxyAPI should lock a credential
+only after the execution endpoint itself returns a confirmed
+`usage_limit_reached` 429.
+
+For a large account pool, keep cooldown persistence enabled and let one logical
+request continue through every distinct currently eligible credential. Use
+weighted round-robin so a confirmed-exhaustion guard can exclude one credential
+with weight zero without disabling or moving its auth file:
+
+```yaml
+max-retry-credentials: 0
+save-cooldown-status: true
+routing:
+  strategy: weighted-round-robin
+```
+
+`max-retry-credentials: 0` means “no per-request credential-count cap”; it does
+not disable cooldowns or cause an already cooled credential to be selected.
+This avoids returning 429 merely because the only healthy credential happened
+to be ninth in a pool whose old cap was eight. Equal default weights preserve
+normal round-robin distribution.
+
+Enable the sidecar guard when starting the direct-8317 queue collector:
+
+```bash
+CLIPROXY_QUOTA_ROUTING_GUARD=1 \
+CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
+  scripts/start_cliproxy_usage_meter.sh
+```
+
+CLIProxyAPI already persists a long cooldown when the 429 includes
+`resets_at`/`resets_in_seconds`. If an exact `usage_limit_reached` 429 arrives
+without that hint, the guard uses the matching fresh WHAM reset deadline and
+sets only that credential's weight to zero. It restores the previous explicit
+weight (or removes the temporary field) after the deadline. A provider-reported
+`0%`, a generic 429, and a transient `rate_limit_error` never trigger this
+guard. The owner-only guard state stores no token, email, auth filename, or
+management key.
+
+If Codex grants an early reset, clear only that credential's routing lock with
+the official management endpoint through the token-safe helper:
+
+```bash
+CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
+  python3 scripts/cliproxyapi_reset_quota.py --list
+
+CLIPROXY_MANAGEMENT_KEY_FILE=/path/to/owner-only-management.key \
+  python3 scripts/cliproxyapi_reset_quota.py codex-1
+```
+
+The helper clears both CLIProxyAPI's official quota cooldown and any guard-owned
+weight-zero lock, so it is also the early-reset path. The key file must be mode
+`0600`. An explicitly requested `--from-chrome`
+fallback can reuse the existing local management session without printing or
+persisting its key. The helper refuses remote management origins, ambiguous
+aliases, and credentials that are not currently in a confirmed quota
+cooldown; it calls `POST /v0/management/reset-quota` and never deletes `.cds`
+files directly.
+
+The usage dashboard labels these states separately: `上游报告 0%`,
+`上游 0% · 实测可用` after the latest execution still returned 200, and
+`已确认耗尽 · 冷却中` only after a quota-classified execution 429.
+
 For a direct-8317 queue collector, use an external owner-only key file (never
 put a management credential in this checkout):
 

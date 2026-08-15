@@ -1378,6 +1378,45 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertTrue(FakeUpstreamHandler.management_auth_forwarded)
         self.assertNotIn("queue-api-secret-must-not-be-stored", "\n".join(self._sqlite_dump()))
 
+    def test_usage_queue_passes_raw_429_to_quota_guard_only_in_memory(self) -> None:
+        observed: list[tuple[object, object, str]] = []
+
+        class FakeGuard:
+            def observe_record(self, record, event, key):
+                observed.append((record, event, key))
+                return True
+
+            def reconcile(self, key):
+                return 0
+
+            def status(self):
+                return {"enabled": True, "active_locks": 0}
+
+        record = {
+            "timestamp": "2026-08-12T00:00:00Z",
+            "latency_ms": 10,
+            "auth_index": "fixture-auth-index",
+            "model": "fake-responses",
+            "alias": "fake-responses",
+            "tokens": {},
+            "failed": True,
+            "fail": {
+                "status_code": 429,
+                "body": '{"error":{"type":"usage_limit_reached","fixture_secret":"must-not-persist"}}',
+            },
+        }
+        poller = meter.UsageQueuePoller(
+            self.sidecar.repo,
+            self.sidecar.resolver,
+            meter.urlsplit("http://127.0.0.1:8317"),
+            quota_guard=FakeGuard(),
+        )
+        poller._consume(json.dumps([record]).encode(), "fixture-management-key")
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0][2], "fixture-management-key")
+        self.assertEqual(observed[0][0]["auth_index"], "fixture-auth-index")
+        self.assertNotIn("must-not-persist", "\n".join(self._sqlite_dump()))
+
     def test_usage_queue_403_uses_long_backoff_without_retry_storm(self) -> None:
         FakeUpstreamHandler.management_status = 403
         key_file = self.temp_path / "management-backoff.key"
@@ -1456,6 +1495,12 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertTrue(cycles, "quota cycle was not persisted")
         self.assertEqual(quota[0]["event_type"], "usage_limit_hit")
         self.assertEqual(cycles[0]["is_complete_cycle"], 1)
+        card = next(
+            item
+            for item in self.sidecar.repo.subscription_dashboard_rows()
+            if item["identity_key"] == row["identity_key"]
+        )
+        self.assertEqual(card["execution_availability"], "confirmed_exhausted")
 
         with sqlite3.connect(self.db) as conn:
             dump = "\n".join(conn.iterdump())
@@ -1527,6 +1572,13 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.wait_events(2)
         events = [row["event_type"] for row in self.rows("SELECT event_type FROM quota_events ORDER BY id")]
         self.assertEqual(events, ["usage_limit_hit"])
+        card = next(
+            item
+            for item in self.sidecar.repo.subscription_dashboard_rows()
+            if item["identity_key"] == identity["identity_key"]
+        )
+        self.assertEqual(card["execution_availability"], "recent_success")
+        self.assertIn("上游 0% · 实测可用", meter.dashboard_html(self.sidecar.repo))
 
     def test_sse_is_byte_transparent_and_usage_is_recorded(self) -> None:
         expected = (
@@ -2069,13 +2121,18 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(fixture["windows"]["five_hour"]["remaining_percent"], 78.0)
         page = meter.dashboard_html(
             self.sidecar.repo,
-            {"key_loaded": True, "last_status": 200},
+            {
+                "key_loaded": True,
+                "last_status": 200,
+                "quota_routing_guard": {"enabled": True, "active_locks": 2},
+            },
             {"last_success_at": fetched_at, "account_count": 1},
         )
         self.assertIn("78%", page)
         self.assertIn("38.5%", page)
         self.assertIn("已用 22% · 剩余 78%", page)
         self.assertIn("1 个账号已刷新", page)
+        self.assertIn("Quota guard <b>开启 · 2 锁", page)
         page_after_restart_timeout = meter.dashboard_html(
             self.sidecar.repo,
             {"key_loaded": True, "last_status": 200},

@@ -6,8 +6,9 @@
 client -> http://127.0.0.1:8327/v1/... -> meter -> http://127.0.0.1:8317/v1/...
 ```
 
-它不修改 cliproxyapi、8317 端口、`~/.cli-proxy-api/config.yaml`、`.cds`、
-`.zshrc` 或任何现有客户端的 `base_url`。默认数据库为
+默认模式不修改 cliproxyapi、8317 端口、认证文件、`.cds`、`.zshrc` 或任何现有
+客户端的 `base_url`。只有显式开启“确认耗尽路由守卫”时，才会通过官方 management
+接口临时写入/恢复认证文件的 `weight` 字段；它仍不直接改写 `.cds`。默认数据库为
 `datas/cliproxy_usage.sqlite`，运行时数据库及 WAL 文件均被忽略。
 
 除了显式经过 8327 的请求，sidecar 还可以只读消费 CLIProxyAPI v7.2.125
@@ -55,6 +56,45 @@ CLIPROXY_MANAGEMENT_KEY_FILE="$HOME/.config/cliproxyapi-management.key" \
 不会连续重试触发 CLIProxyAPI 封禁。可用参数为 `--usage-queue-count`、
 `--usage-queue-poll-seconds`、`--usage-queue-timeout`，必要时用
 `--no-usage-queue` 明确关闭。
+
+### 确认耗尽后的持久路由锁（可选）
+
+CLIProxyAPI 7.2.130 在 `usage_limit_reached` 没有携带 reset hint 时，会从 1 秒开始
+指数冷却，最高 30 分钟，之后仍会探测同一账号。要让真实耗尽账号直接等到 WHAM
+窗口恢复，可先配置：
+
+```yaml
+max-retry-credentials: 0
+save-cooldown-status: true
+routing:
+  strategy: weighted-round-robin
+```
+
+再显式启用守卫：
+
+```bash
+CLIPROXY_QUOTA_ROUTING_GUARD=1 \
+CLIPROXY_MANAGEMENT_KEY_FILE="$HOME/.config/cliproxyapi-management.key" \
+  scripts/start_cliproxy_usage_meter.sh
+```
+
+守卫只消费执行队列中 `status_code=429` 且错误类型精确为
+`usage_limit_reached` 的记录。WHAM 的 `0%`、普通 429、瞬时
+`rate_limit_error` 都不会触发锁。确认后它将对应 credential 的 weight 设为 0，优先用
+错误体的 `resets_at`/`resets_in_seconds`，缺失时只接受 24 小时内、确实报告用满的
+WHAM 窗口 reset 时间；到期先调用官方 `reset-quota` 再恢复原 weight。
+
+状态文件默认为 `~/.config/cliproxy-usage/quota-routing-locks.json`，权限 `0600`，只含
+opaque auth index、keyed subscription identity、时间和原 weight，不含邮箱、认证文件名、
+token 或 management key。提前恢复额度时运行：
+
+```bash
+python3 scripts/cliproxyapi_reset_quota.py --list
+python3 scripts/cliproxyapi_reset_quota.py codex-1
+```
+
+该工具会同时清除官方 cooldown 和守卫 weight，不删除 `.cds`。额度卡分别显示“上游报告
+0%”“上游 0% · 实测可用”和“已确认耗尽 · 冷却中”，避免把百分比取整误认为真实封禁。
 
 如果 Chrome 已经保持 management 页面登录状态，可用本机专用启动器（凭据只在内存中
 传给 sidecar，不写入 key 文件）：
