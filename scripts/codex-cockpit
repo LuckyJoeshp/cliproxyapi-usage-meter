@@ -59,5 +59,6 @@ exec "$CODEX_BIN" \
   --no-alt-screen \
   -c "model_provider=\"$COCKPIT_PROVIDER\"" \
   -c "model_providers.$COCKPIT_PROVIDER.base_url=\"$COCKPIT_BASE_URL\"" \
-  -c "model_providers.$COCKPIT_PROVIDER.auth.command=\"cockpit-tools-api --token\"" \
+  -c "model_providers.$COCKPIT_PROVIDER.auth.command=\"cockpit-tools-api\"" \
+  -c "model_providers.$COCKPIT_PROVIDER.auth.args=[\"--token\"]" \
   "$@"
