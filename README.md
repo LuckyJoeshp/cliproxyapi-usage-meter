@@ -118,6 +118,11 @@ provider subscription ID or JWT principal is used only when email is absent.
 This keeps Team members separate while treating token/file rotation for the
 same mailbox as one subscription.
 
+If an old refresh-token file remains after rotation and returns 401, the quota
+poller tries the other structured record for that same mailbox before counting
+the subscription as unavailable; duplicate files therefore do not create a
+second card or a second quota window.
+
 Email and optional `codex-N` aliases exist only in memory for the loopback
 dashboard. SQLite stores the keyed subscription ID plus token/model/status/cost
 statistics; it does not store email, auth filenames, tokens or token digests,

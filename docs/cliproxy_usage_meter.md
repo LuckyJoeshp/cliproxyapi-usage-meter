@@ -117,6 +117,8 @@ JSON/JWT 字段读取。邮箱是 loopback 页面唯一可读的账号标识；`
 Team/工作区的 `chatgpt_account_id` 只标识 workspace，并不是成员级唯一键。持久身份使用本机随机
 0600 密钥计算 `HMAC(workspace + email)`，所以同一 Team 的不同成员不会串号，同邮箱加入不同
 workspace 也不会合并；同一 workspace + 邮箱发生 token 或时间戳文件轮换时则保持同一身份。
+如果旧 RT 文件尚未删除且返回 401，quota poller 会继续尝试同邮箱的其他结构化记录；
+重复文件不会产生第二张账号卡或第二个额度窗口。
 只有结构化邮箱缺失时，才依次退化到 JWT user principal 或结构化 provider subscription ID，且仍
 只保存 keyed digest。management 的 `name`/`id`、`auth_index`、原始 workspace/user ID、邮箱、
 token、token digest 和认证文件名都只在必要的本机内存映射中使用。
