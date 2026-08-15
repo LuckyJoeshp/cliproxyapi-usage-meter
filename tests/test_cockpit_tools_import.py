@@ -102,12 +102,17 @@ class CockpitToolsImporterTest(unittest.TestCase):
         self.importer.stop()
         self.temp.cleanup()
 
-    def _write_accounts(self, *records: dict[str, object]) -> None:
+    def _write_accounts(
+        self,
+        *records: dict[str, object],
+        index_version: str = "1",
+        detail_schema_version: int = 1,
+    ) -> None:
         (self.data_dir / meter.COCKPIT_TOOLS_ACCOUNTS_INDEX_NAME).write_text(
             json.dumps(
                 {
-                    "version": "1",
-                    "detail_schema_version": 1,
+                    "version": index_version,
+                    "detail_schema_version": detail_schema_version,
                     "accounts": [
                         {
                             "id": record["id"],
@@ -285,6 +290,26 @@ class CockpitToolsImporterTest(unittest.TestCase):
             str(self.data_dir),
         ):
             self.assertNotIn(forbidden.encode(), serialized)
+
+    def test_newer_metadata_versions_and_additive_columns_are_accepted(self) -> None:
+        self._write_accounts(
+            self.account_record,
+            index_version="999.0",
+            detail_schema_version=999,
+        )
+        with sqlite3.connect(
+            self.data_dir / meter.COCKPIT_TOOLS_LOG_DB_NAME
+        ) as connection:
+            connection.execute(
+                "ALTER TABLE request_logs ADD COLUMN future_metric INTEGER DEFAULT 0"
+            )
+        self._insert_request("future-compatible-event", 1_786_665_600)
+
+        result = self.importer.import_once()
+
+        self.assertEqual((result["imported"], result["scanned"]), (1, 1))
+        self.assertEqual(len(self._usage_rows()), 1)
+        self.assertTrue(self.resolver.cockpit_inventory()["authoritative"])
 
     def test_incremental_import_is_idempotent_and_reprices_in_place(self) -> None:
         self._insert_request("event-one", 1_786_665_600)

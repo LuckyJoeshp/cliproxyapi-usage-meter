@@ -96,7 +96,11 @@ meter database. Imported requests retain Cockpit's cache-read/cache-write token
 breakdown and frozen input/cache/output price snapshot, so historical totals do
 not follow later meter price syncs. If Cockpit increments its pricing version
 and rewrites those snapshots, the same imported rows are updated in place
-without being counted twice.
+without being counted twice. Compatibility is capability-based rather than tied
+to a Cockpit Tools application or accounts-index version: newer version values
+and additional database/index fields continue to import automatically. A
+breaking removal, rename, or semantic change to a required field is isolated in
+importer health instead of taking down the `8327` dashboard.
 
 For migration, point request traffic directly at Cockpit Tools and keep this
 meter running only to import Cockpit data and serve

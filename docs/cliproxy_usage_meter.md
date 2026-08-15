@@ -101,6 +101,11 @@ cache-write 与 reasoning 等 token breakdown。importer 沿用这些逐请求�
 历史快照，importer 会原位同步同一事件，不会重复计数。`/usage`
 因此可以把 Cockpit 用量并入 token 与 API 等价成本统计，同时保留历史计费口径。
 
+兼容性按实际能力/schema 探测，不按 Cockpit Tools 应用版本或账号索引中的 `version`、
+`detail_schema_version` 拒收。升级后仅增加版本号、数据库列或索引字段时会自动继续导入，
+未知新增字段会被忽略；只有必需字段被删除、改名或改变语义时才会在 importer health 中
+报告结构不兼容，且不会拖垮 `8327` 看板。
+
 推荐的迁移拓扑是：
 
 ```text

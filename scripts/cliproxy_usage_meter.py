@@ -6528,9 +6528,13 @@ def parse_codex_app_rate_windows(
 
 
 class CockpitToolsImporter:
-    """Read Cockpit Tools request and quota statistics without modifying it."""
+    """Read Cockpit Tools request and quota statistics without modifying it.
 
-    REQUEST_COLUMNS = (
+    Compatibility is capability-based: Cockpit application/index version
+    numbers are not gates, and additive request-log columns are ignored.
+    """
+
+    REQUIRED_REQUEST_COLUMNS = (
         "id",
         "event_key",
         "timestamp",
@@ -6933,7 +6937,7 @@ class CockpitToolsImporter:
             available_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(request_logs)")
             }
-            missing = set(self.REQUEST_COLUMNS) - available_columns
+            missing = set(self.REQUIRED_REQUEST_COLUMNS) - available_columns
             if missing:
                 raise ValueError("cockpit_request_logs_schema")
             maxima = connection.execute(
@@ -6948,7 +6952,7 @@ class CockpitToolsImporter:
             previous_version = as_nonnegative_int(state.get("size")) or 0
             if max_id < cursor_id or (state and max_version != previous_version):
                 cursor_id = 0
-            columns = ", ".join(self.REQUEST_COLUMNS)
+            columns = ", ".join(self.REQUIRED_REQUEST_COLUMNS)
             rows = connection.execute(
                 f"SELECT {columns} FROM request_logs WHERE id>? AND id<=? ORDER BY id",
                 (cursor_id, max_id),
