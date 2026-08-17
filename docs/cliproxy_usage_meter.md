@@ -169,17 +169,12 @@ Cockpit 的 WAL/SHM 短暂切换不会触发版本拒收：脚本会优先用正
 ```bash
 install -m 755 scripts/codex-cockpit scripts/cockpit-tools-api \
   scripts/cockpit_tools_api.py /opt/homebrew/bin/
-install -m 755 ../codex_default_autorun/scripts/start_codex_default_longrun.sh \
-  /opt/homebrew/bin/codex-default-longrun
 cd /absolute/path/to/project
-codex-cockpit --longrun-session codex_my_project
+codex-cockpit
 ```
 
-`codex-cockpit` 是唯一日常入口。无参数、`-C/--cd` 和最多一个 prompt 的交互启动会自动进入
-tmux，并在异常退出后精确恢复同一 thread；正常退出、Ctrl-C 和 TERM 不会重启。短 session 只
-增加少量本地 tmux/状态文件开销，不会额外发起模型请求或消耗 token。`exec`、`review`、
-`resume` 及其他高级参数保持原生直连，排障时可用 `codex-cockpit --direct`。内部状态仍可用
-`codex-default-longrun status --session codex_my_project` 查询。
+`codex-cockpit` 会在当前终端直接启动 Codex，保留调用者的工作目录并原样转发 Codex 参数。
+它不会自动创建 tmux、注入任务 prompt，也不会在退出后自动恢复 thread。
 
 默认读取 `~/.antigravity_cockpit`，可用 `COCKPIT_TOOLS_DATA_DIR` 覆盖；仅在排查服务启动
 竞态时使用 `COCKPIT_CODEX_SKIP_HEALTHCHECK=1`。helper 只接受 loopback host，避免把本地

@@ -42,6 +42,9 @@ class CodexCockpitLauncherTest(TestCase):
         self.assertIn('auth.args=[\\"--token\\"]', text)
         self.assertIn('auth.refresh_interval_ms=300000', text)
         self.assertIn("COCKPIT_CODEX_SKIP_HEALTHCHECK", text)
+        self.assertNotIn("codex-default-longrun", text)
+        self.assertNotIn("--longrun-session", text)
+        self.assertNotIn("CODEX_COCKPIT_DIRECT", text)
         self.assertNotIn("50083", text)
         self.assertNotIn("8317", text)
         self.assertNotIn("apiKey=", text)
@@ -52,73 +55,13 @@ class CodexCockpitLauncherTest(TestCase):
         self.assertIn("cockpit_tools_api.py", text)
         self.assertNotIn("/Users/", text)
 
-    def test_plain_interactive_launch_uses_long_run_supervisor(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            project = root / "project"
-            project.mkdir()
-            codex_home = root / "codex"
-            codex_home.mkdir()
-            capture = root / "supervisor-args.txt"
-            fake_supervisor = root / "codex-default-longrun"
-            fake_supervisor.write_text(
-                textwrap.dedent(
-                    '''\
-                    #!/bin/sh
-                    printf 'direct=%s\\n' "${CODEX_COCKPIT_DIRECT:-}" > "$SUPERVISOR_CAPTURE"
-                    printf 'arg=%s\\n' "$@" >> "$SUPERVISOR_CAPTURE"
-                    '''
-                ),
-                encoding="utf-8",
-            )
-            fake_supervisor.chmod(0o755)
-            env = os.environ.copy()
-            env.pop("TMUX", None)
-            env.pop("CODEX_COCKPIT_DIRECT", None)
-            env.update(
-                {
-                    "CODEX_HOME": str(codex_home),
-                    "CODEX_COCKPIT_LONGRUN_BIN": str(fake_supervisor),
-                    "SUPERVISOR_CAPTURE": str(capture),
-                    "PATH": "/usr/bin:/bin",
-                }
-            )
-            result = subprocess.run(
-                [
-                    "/bin/zsh",
-                    str(LAUNCHER),
-                    "-C",
-                    str(project),
-                    "finish every pending item",
-                    "--longrun-session",
-                    "unit_cockpit",
-                ],
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            lines = capture.read_text(encoding="utf-8").splitlines()
-
-        self.assertEqual(lines[0], "direct=1")
-        args = [line.removeprefix("arg=") for line in lines[1:]]
-        self.assertEqual(args[args.index("--session") + 1], "unit_cockpit")
-        self.assertEqual(args[args.index("--project") + 1], str(project.resolve()))
-        self.assertEqual(args[args.index("--launcher") + 1], str(LAUNCHER.resolve()))
-        self.assertEqual(
-            args[args.index("--runtime-dir") + 1],
-            str(codex_home / "default-longrun" / "unit_cockpit"),
-        )
-        self.assertEqual(args[args.index("--prompt") + 1], "finish every pending item")
-        self.assertIn("--attach", args)
-
-    def test_launcher_passes_runtime_endpoint_without_persisting_the_key(self) -> None:
+    def test_plain_launch_passes_runtime_endpoint_without_persisting_the_key(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _LauncherModelsHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
         self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
 
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -174,7 +117,7 @@ class CodexCockpitLauncherTest(TestCase):
                 }
             )
             result = subprocess.run(
-                ["/bin/zsh", str(LAUNCHER), "--direct", "--synthetic-argument"],
+                ["/bin/zsh", str(LAUNCHER), "finish every pending item"],
                 env=env,
                 text=True,
                 capture_output=True,
@@ -188,8 +131,7 @@ class CodexCockpitLauncherTest(TestCase):
         self.assertIn("cliproxy", args)
         self.assertIn("--strict-config", args)
         self.assertIn("--no-alt-screen", args)
-        self.assertIn("--synthetic-argument", args)
-        self.assertNotIn("--direct", args)
+        self.assertIn("finish every pending item", args)
         self.assertIn(f'base_url="http://127.0.0.1:{server.server_port}/v1"', joined)
         self.assertIn('auth.command="cockpit-tools-api"', joined)
         self.assertIn('auth.args=["--token"]', joined)

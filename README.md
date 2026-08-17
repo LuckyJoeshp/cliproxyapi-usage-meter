@@ -206,33 +206,20 @@ launcher also restores the documented five-minute proactive token refresh, so
 a base profile with `refresh_interval_ms = 0` does not create a spurious 401
 before every request.
 
-Install the launcher, its sibling helper, and the companion long-run
-supervisor:
+Install the launcher and its sibling helper:
 
 ```bash
 install -m 755 scripts/codex-cockpit scripts/cockpit-tools-api \
   scripts/cockpit_tools_api.py /opt/homebrew/bin/
-install -m 755 ../codex_default_autorun/scripts/start_codex_default_longrun.sh \
-  /opt/homebrew/bin/codex-default-longrun
 cd /path/to/any/project
-codex-cockpit --longrun-session codex_my_project
+codex-cockpit
 ```
 
 Cockpit Tools' Codex API Service must be enabled and listening on its local
-loopback endpoint. `codex-cockpit` is the single daily entry point. A plain
-interactive launch (optionally with `-C`/`--cd`, one prompt, and
-`--longrun-session`) enters tmux and enables exact-thread crash recovery.
-Without an explicit session name it generates one from the project and time.
-Clean exits, Ctrl-C, and TERM are not restarted; short sessions therefore add
-only local tmux/state-file overhead and no model request or token usage.
-
-Native subcommands such as `exec`, `review`, and `resume`, plus other advanced
-Codex flags, remain direct. `codex-cockpit --direct` is the troubleshooting
-bypass. The internal supervisor remains available for status inspection:
-
-```bash
-codex-default-longrun status --session codex_my_project
-```
+loopback endpoint. `codex-cockpit` starts Codex directly in the caller's
+terminal, keeps the caller's working directory, and forwards all Codex
+arguments unchanged. It does not create tmux sessions, inject a task prompt,
+or automatically resume a thread after exit.
 
 `COCKPIT_TOOLS_DATA_DIR` selects a non-default Cockpit data directory,
 `COCKPIT_CODEX_PROFILE` selects another base profile, and
