@@ -148,6 +148,9 @@ Cockpit 的 WAL/SHM 短暂切换不会触发版本拒收：脚本会优先用正
 `scripts/cockpit-tools-api` 从 `codex_local_access.json` 读取端口与 key，并在内存中探测
 `/v1/models`；key 不会写入仓库、profile 或日志。Cockpit 变更端口、轮换 key 或增加状态
 字段时，下一次启动会自动读取新能力，不按应用版本号拒收。
+启动器还显式把动态 auth command 的 `refresh_interval_ms` 设为 300000（5 分钟）。
+如果基础 profile 使用 `refresh_interval_ms = 0`，Codex 会等到鉴权失败后才取 token，
+从而在每次 Cockpit 请求前先产生一个无账号选择的 401；主动刷新可避免这类伪失败。
 
 ```bash
 install -m 755 scripts/codex-cockpit scripts/cockpit-tools-api \
@@ -323,7 +326,9 @@ CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。�
 
 - `logical_requests`：历史上有 request id 的行可按其去重；新写入为避免跨表关联，不持久化
   request id，因此按实际调用/聚合 `call_count` 计数。
-- `account_attempts`：SQLite 的实际账号调用行数；`retry_attempts = attempts - logical_requests`，
+- `account_attempts`：真正进入订阅账号选择后的 SQLite 调用行数；网关在账号选择前拒绝的
+  请求（例如 Cockpit `auth_failed` 且没有 `account_id` 的 401）仍保留为 API 调用和 HTTP
+  时间轴观测，但 `account_attempts` 为 0。`retry_attempts = attempts - logical_requests`，
   看板文案称为“额外调用”，不等同于失败数。
 
 每个订阅卡也会单独显示总调用、成功调用、失败调用和额外调用，便于识别某个账号是否
@@ -332,7 +337,8 @@ CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。�
 日志、额度快照或健康检查响应。额度快照可能由历史 JSONL 乱序回填，因此“当前额度”
 按 `fetched_at`（同时间再按数据库 id）选择，而不是把最后插入的历史行误认为最新。
 
-失败调用的状态与 token/cost 仍按 attempt 如实累计，但错误正文和请求关联 ID 不落库；系统不会
+失败调用的状态与 token/cost 仍按对应 API 调用如实累计；只有已选择账号的失败才进入账号
+尝试/账号卡失败计数。错误正文和请求关联 ID 不落库；系统不会
 猜测哪次成功 token 可以代表整组。
 
 ## 价格与 API 等价额度
@@ -407,12 +413,14 @@ http://127.0.0.1:8327/usage
 ```
 
 看板展示今日/近 7 日/SQLite 全量累计、成功/失败/streaming、各 token 与估算成本、全量按日历史、
-alias/account 与模型排行、quota 周期统计以及最近 50 条调用。页面顶部明确标出 SQLite 第一条和最后一条
+alias/account 与模型排行、quota 周期统计以及最近 50 次账号尝试。页面顶部明确标出 SQLite 第一条和最后一条
 记录时间，并显示 direct-8317 collector 是 active、backoff 还是因缺少 key 而 idle；
 Cockpit importer 的脱敏状态也由 `/healthz` 提供。页面只读取 meter SQLite，不直接接入
 cliproxyapi 或 Cockpit 本体。`/usage` 与
 `/healthz` 都是动态本机状态，响应带 `Cache-Control: no-store`，避免浏览器复用旧额度或身份映射。
 额度卡通过运行时 resolver 补回邮箱/alias；SQLite 中的额度快照本身不含这些可读身份信息。
+其中“最近 50 次账号尝试”只取已到达账号选择阶段的调用；账号选择前的网关 401 不占用列表名额，
+但仍会在 HTTP 响应时间轴的非 200 线上显示。
 
 新版主视图额外提供：
 
@@ -489,7 +497,7 @@ keyed identity 都不会推进删除；disabled 条目仍视为存在。
 
 确认清理时，逐调用行按本地日期、模型、状态和 token/cost 维度合并到不含 identity/source/request
 字段的 `anonymous_usage_daily`，随后删除该订阅的 quota snapshot、计划、续期、周期、账号关联和
-逐调用身份明细。匿名统计继续计入 `today`/`7d`/`all` 总量，但不会再出现在账号卡、最近调用或
+逐调用身份明细。匿名统计继续计入 `today`/`7d`/`all` 总量，但不会再出现在账号卡、最近账号尝试或
 quota summary 中。匿名桶保留 calls、成功/失败、streaming 总数、token 与成本总量，但舍弃逐调用
 时间、逐调用 streaming 标志和请求/重试关联。退休 tombstone 只含 keyed digest；迟到 queue、proxy
 或 import 记录仍可贡献匿名 token，却不能重建账号卡，只有后续完整 inventory 明确重新出现才解除。

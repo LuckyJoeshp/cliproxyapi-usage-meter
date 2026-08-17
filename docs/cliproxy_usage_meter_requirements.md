@@ -197,6 +197,9 @@ total_tokens
 
 必须记录每一次经过 sidecar 的调用，包括成功、失败、usage 缺失、streaming、非 streaming。
 
+记录层同时区分 API 调用与账号尝试：如果网关在选择订阅账号前就拒绝请求（例如没有可识别
+账号选择器的 401），该响应仍须进入 API 响应观测，但不得占用最近账号尝试列表或账号成功/失败计数。
+
 每条请求至少记录：
 
 - `call_count = 1`，聚合时求和即可。
@@ -215,7 +218,7 @@ HTML dashboard 必须展示：
 5. 近 7 日总调用次数。
 6. 按账号 / alias 调用次数排行。
 7. 按模型调用次数排行。
-8. 最近 50 条调用记录。
+8. 最近 50 次账号尝试；账号选择前的网关拒绝仅进入 API 响应时间轴，不占用列表名额。
 
 ## 10. SQLite Schema 建议
 
@@ -255,7 +258,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
   error_message_redacted TEXT,
   request_bytes INTEGER,
   response_bytes INTEGER,
-  call_count INTEGER DEFAULT 1
+  call_count INTEGER DEFAULT 1,
+  account_attempt INTEGER NOT NULL DEFAULT 1
 );
 ```
 
@@ -551,9 +555,9 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 - 历史周期 p50 / p20-p80
 - 当前周期 observed_floor_usd
 
-### 15.7 最近请求
+### 15.7 最近账号尝试
 
-最近 50 条：
+最近 50 次账号尝试（已到达订阅账号选择阶段）：
 
 - ts
 - alias/account

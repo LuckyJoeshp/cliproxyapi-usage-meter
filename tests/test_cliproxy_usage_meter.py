@@ -1733,7 +1733,7 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertIn("输出成本".encode(), page)
         self.assertIn("缓存成本".encode(), page)
         self.assertIn("API 原始处理量".encode(), page)
-        self.assertIn("调用统计".encode(), page)
+        self.assertIn("账号尝试".encode(), page)
         self.assertIn("推理（输出子集）".encode(), page)
         self.assertIn("API 响应时间轴".encode(), page)
         self.assertIn("HTTP 200 与非 200 双折线".encode(), page)

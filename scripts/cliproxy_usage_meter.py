@@ -2154,6 +2154,10 @@ class UsageEvent:
     call_count: int = 1
     source: str = "sidecar"
     request_id: str | None = None
+    # Some API responses happen before an upstream subscription is selected.
+    # Keep them in the all-API response ledger without treating them as an
+    # account-pool attempt or availability signal.
+    account_attempt: int = 1
 
 
 def _decode_jwt_claims_unverified(value: Any) -> Mapping[str, Any]:
@@ -2293,7 +2297,8 @@ class UsageRepository:
                   response_bytes INTEGER,
                   call_count INTEGER DEFAULT 1,
                   source TEXT DEFAULT 'sidecar',
-                  request_id TEXT
+                  request_id TEXT,
+                  account_attempt INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS model_prices (
@@ -2487,6 +2492,17 @@ class UsageRepository:
             self._ensure_column(conn, "usage_events", "identity_key", "TEXT")
             self._ensure_column(conn, "usage_events", "source", "TEXT DEFAULT 'sidecar'")
             self._ensure_column(conn, "usage_events", "request_id", "TEXT")
+            # Very old databases did not persist the HTTP status.  Add the
+            # nullable column before the Cockpit classification backfill
+            # below; otherwise that migration would fail while inspecting an
+            # otherwise valid legacy database.
+            self._ensure_column(conn, "usage_events", "status_code", "INTEGER")
+            self._ensure_column(
+                conn,
+                "usage_events",
+                "account_attempt",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
             self._ensure_column(conn, "usage_events", "non_cached_input_cost_usd", "REAL")
             self._ensure_column(conn, "usage_events", "cached_input_cost_usd", "REAL")
             self._ensure_column(conn, "usage_events", "output_cost_usd", "REAL")
@@ -2512,6 +2528,25 @@ class UsageRepository:
                 "anonymous_usage_daily",
                 "streaming_calls",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            # Cockpit records client-authentication failures before it chooses
+            # a subscription with an empty account selector.  Older meter
+            # builds imported those rows as unknown account attempts.  Their
+            # persisted zero-token shape is sufficient to repair the
+            # classification without retaining Cockpit's raw selector or
+            # error body.  The independent response ledger remains unchanged.
+            conn.execute(
+                """
+                UPDATE usage_events
+                   SET account_attempt=0
+                 WHERE source='cockpit_tools'
+                   AND status_code=401
+                   AND (identity_key IS NULL OR identity_key='unknown')
+                   AND model IS NULL
+                   AND COALESCE(input_tokens, 0)=0
+                   AND COALESCE(cached_tokens, 0)=0
+                   AND COALESCE(output_tokens, 0)=0
+                """
             )
             self._ensure_column(
                 conn,
@@ -2630,6 +2665,8 @@ class UsageRepository:
                        api_equivalent_quota_usd, usage_missing, error_type,
                        error_message_redacted, request_bytes, response_bytes,
                        call_count, source, request_id,
+                       CASE WHEN COALESCE(account_attempt, 1)=1
+                            THEN call_count ELSE 0 END AS account_attempt_count,
                        CASE WHEN stream=1 THEN call_count ELSE 0 END
                          AS streaming_call_count,
                        MAX(COALESCE(input_tokens, 0)
@@ -2650,7 +2687,7 @@ class UsageRepository:
                        non_cached_input_cost_usd, cached_input_cost_usd,
                        output_cost_usd, long_context_pricing_applied,
                        NULL, NULL, usage_missing, NULL, NULL, 0, 0,
-                       calls, 'anonymous', NULL, streaming_calls,
+                       calls, 'anonymous', NULL, calls, streaming_calls,
                        non_cached_input_tokens, codex_status_tokens
                   FROM anonymous_usage_daily;
                 """
@@ -4367,6 +4404,9 @@ class UsageRepository:
             values[field] = None
         values["model"] = safe_model_identifier(event.model)
         values["source"] = safe_alias(event.source) or "unknown"
+        values["account_attempt"] = int(
+            (as_nonnegative_int(event.account_attempt) or 0) > 0
+        )
         values["request_bytes"] = 0
         values["response_bytes"] = 0
         return values
@@ -5066,28 +5106,39 @@ class UsageRepository:
                          MAX(CASE WHEN ok=1 THEN 1 ELSE 0 END) logical_ok,
                          MAX(CASE WHEN stream=1 THEN 1 ELSE 0 END) logical_stream
                     FROM filtered
-                   WHERE request_id IS NOT NULL
+                   WHERE account_attempt_count>0 AND request_id IS NOT NULL
                    GROUP BY request_id
                 )
                 SELECT
                   COALESCE(SUM(call_count), 0) calls,
-                  COALESCE(SUM(call_count), 0) account_attempts,
+                  COALESCE(SUM(account_attempt_count), 0) account_attempts,
                   COALESCE(SUM(CASE WHEN ok=1 THEN call_count ELSE 0 END), 0) successful_calls,
                   COALESCE(SUM(CASE WHEN ok=0 THEN call_count ELSE 0 END), 0) failed_calls,
+                  COALESCE(SUM(CASE WHEN ok=1 THEN account_attempt_count ELSE 0 END), 0)
+                    successful_account_attempts,
+                  COALESCE(SUM(CASE WHEN ok=0 THEN account_attempt_count ELSE 0 END), 0)
+                    failed_account_attempts,
                   COALESCE(SUM(streaming_call_count), 0) streaming_calls,
                   (SELECT COUNT(*) FROM identified_requests)
-                    + COALESCE(SUM(CASE WHEN request_id IS NULL THEN call_count ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN account_attempt_count>0
+                                         AND request_id IS NULL
+                                        THEN account_attempt_count ELSE 0 END), 0)
                     logical_requests,
                   COALESCE((SELECT SUM(logical_ok) FROM identified_requests), 0)
-                    + COALESCE(SUM(CASE WHEN request_id IS NULL AND ok=1 THEN call_count ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN account_attempt_count>0
+                                         AND request_id IS NULL AND ok=1
+                                        THEN account_attempt_count ELSE 0 END), 0)
                     successful_logical_requests,
                   COALESCE((SELECT SUM(CASE WHEN logical_ok=0 THEN 1 ELSE 0 END)
                               FROM identified_requests), 0)
-                    + COALESCE(SUM(CASE WHEN request_id IS NULL AND ok=0 THEN call_count ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN account_attempt_count>0
+                                         AND request_id IS NULL AND ok=0
+                                        THEN account_attempt_count ELSE 0 END), 0)
                     failed_logical_requests,
                   COALESCE((SELECT SUM(logical_stream) FROM identified_requests), 0)
-                    + COALESCE(SUM(CASE WHEN request_id IS NULL
-                                       THEN streaming_call_count ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN account_attempt_count>0
+                                         AND request_id IS NULL
+                                        THEN streaming_call_count ELSE 0 END), 0)
                     streaming_logical_requests,
                   COALESCE(SUM(input_tokens), 0) input_tokens,
                   COALESCE(SUM(output_tokens), 0) output_tokens,
@@ -5269,9 +5320,11 @@ class UsageRepository:
                 """
                 SELECT COUNT(*) AS event_rows,
                        COALESCE(SUM(call_count), 0) AS calls,
-                       COALESCE(SUM(call_count), 0) AS account_attempts,
-                       COUNT(DISTINCT request_id)
-                         + COALESCE(SUM(CASE WHEN request_id IS NULL THEN call_count ELSE 0 END), 0)
+                       COALESCE(SUM(account_attempt_count), 0) AS account_attempts,
+                       COUNT(DISTINCT CASE WHEN account_attempt_count>0 THEN request_id END)
+                         + COALESCE(SUM(CASE WHEN account_attempt_count>0
+                                              AND request_id IS NULL
+                                             THEN account_attempt_count ELSE 0 END), 0)
                          AS logical_requests,
                        COALESCE(SUM(CASE WHEN session_id IS NOT NULL THEN call_count ELSE 0 END), 0)
                          AS session_identified_attempts,
@@ -5408,8 +5461,8 @@ class UsageRepository:
             "successful_logical_requests": summary["successful_logical_requests"],
             "failed_logical_requests": summary["failed_logical_requests"],
             "streaming_logical_requests": summary["streaming_logical_requests"],
-            "successful_attempts": summary["successful_calls"],
-            "failed_attempts": summary["failed_calls"],
+            "successful_attempts": summary["successful_account_attempts"],
+            "failed_attempts": summary["failed_account_attempts"],
             "streaming_attempts": summary["streaming_calls"],
         }
 
@@ -5426,9 +5479,11 @@ class UsageRepository:
                 """
                 SELECT date(ts, 'localtime') AS date,
                        COALESCE(SUM(call_count), 0) AS calls,
-                       COALESCE(SUM(call_count), 0) AS account_attempts,
-                       COUNT(DISTINCT request_id)
-                         + COALESCE(SUM(CASE WHEN request_id IS NULL THEN call_count ELSE 0 END), 0)
+                       COALESCE(SUM(account_attempt_count), 0) AS account_attempts,
+                       COUNT(DISTINCT CASE WHEN account_attempt_count>0 THEN request_id END)
+                         + COALESCE(SUM(CASE WHEN account_attempt_count>0
+                                              AND request_id IS NULL
+                                             THEN account_attempt_count ELSE 0 END), 0)
                          AS logical_requests,
                        COALESCE(SUM(total_tokens), 0) AS total_tokens,
                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -5697,10 +5752,12 @@ class UsageRepository:
                       FROM usage_events event
                      WHERE event.identity_key IS NOT NULL
                        AND event.identity_key!='unknown'
+                       AND COALESCE(event.account_attempt, 1)=1
                        AND NOT EXISTS (
                            SELECT 1
                              FROM usage_events newer
                             WHERE newer.identity_key=event.identity_key
+                              AND COALESCE(newer.account_attempt, 1)=1
                               AND (
                                     newer.ts>event.ts
                                     OR (newer.ts=event.ts AND newer.id>event.id)
@@ -5976,6 +6033,7 @@ class UsageRepository:
         if source_table == "usage_statistics":
             non_cached_input_expression = "non_cached_input_token_count"
             codex_status_expression = "codex_status_token_count"
+            account_attempt_expression = "account_attempt_count"
         else:
             non_cached_input_expression = (
                 "MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0)"
@@ -5983,6 +6041,9 @@ class UsageRepository:
             codex_status_expression = (
                 "MAX(COALESCE(input_tokens, 0) - COALESCE(cached_tokens, 0), 0) "
                 "+ COALESCE(output_tokens, 0)"
+            )
+            account_attempt_expression = (
+                "CASE WHEN COALESCE(account_attempt, 1)=1 THEN call_count ELSE 0 END"
             )
         extra_filter = ""
         if dimension == "account":
@@ -5998,14 +6059,21 @@ class UsageRepository:
                      WHERE tombstone.identity_key=usage_events.identity_key
                   )
             """
+        elif dimension == "model":
+            # A request rejected by the local gateway before account/model
+            # selection is an API response, not model consumption.
+            extra_filter = "AND account_attempt_count>0"
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT {select_expression},
                   COALESCE(SUM(call_count), 0) calls,
-                  COALESCE(SUM(call_count), 0) account_attempts,
-                  COUNT(DISTINCT request_id)
-                    + COALESCE(SUM(CASE WHEN request_id IS NULL THEN call_count ELSE 0 END), 0)
+                  COALESCE(SUM({account_attempt_expression}), 0) account_attempts,
+                  COUNT(DISTINCT CASE WHEN {account_attempt_expression}>0
+                                      THEN request_id END)
+                    + COALESCE(SUM(CASE WHEN {account_attempt_expression}>0
+                                         AND request_id IS NULL
+                                        THEN {account_attempt_expression} ELSE 0 END), 0)
                     logical_requests,
                   COALESCE(SUM(CASE WHEN ok=1 THEN call_count ELSE 0 END), 0) successful_calls,
                   COALESCE(SUM(CASE WHEN ok=0 THEN call_count ELSE 0 END), 0) failed_calls,
@@ -6046,10 +6114,28 @@ class UsageRepository:
         return result
 
     def recent(self, count: int) -> list[dict[str, Any]]:
+        """Return recent persisted calls, including pre-account API rejects."""
+
+        return self._recent(count, account_attempts_only=False)
+
+    def recent_account_attempts(self, count: int) -> list[dict[str, Any]]:
+        """Return recent calls that reached subscription account selection."""
+
+        return self._recent(count, account_attempts_only=True)
+
+    def _recent(
+        self,
+        count: int,
+        *,
+        account_attempts_only: bool,
+    ) -> list[dict[str, Any]]:
         count = max(1, min(int(count), 500))
+        attempt_filter = (
+            "AND COALESCE(account_attempt, 1)=1" if account_attempts_only else ""
+        )
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT ts, identity_key, usage_alias, account_id_tail, account_id_hash,
                   auth_fingerprint, session_id, model, endpoint, method,
                   status_code, ok, duration_ms, stream, input_tokens,
@@ -6057,7 +6143,7 @@ class UsageRepository:
                   estimated_api_cost_usd, non_cached_input_cost_usd,
                   cached_input_cost_usd, output_cost_usd, long_context_pricing_applied,
                   usage_missing, error_type,
-                  error_message_redacted, source, request_id
+                  error_message_redacted, source, request_id, account_attempt
                 FROM usage_events
                 WHERE NOT EXISTS (
                       SELECT 1 FROM active_subscription_registry registry
@@ -6068,6 +6154,7 @@ class UsageRepository:
                       SELECT 1 FROM retired_subscription_tombstones tombstone
                        WHERE tombstone.identity_key=usage_events.identity_key
                     )
+                  {attempt_filter}
                 ORDER BY ts DESC, id DESC LIMIT ?
                 """,
                 (count,),
@@ -7245,6 +7332,10 @@ class CockpitToolsImporter:
             response_bytes=0,
             source=COCKPIT_TOOLS_REQUEST_SOURCE,
             request_id=None,
+            # An empty Cockpit selector means its gateway rejected the client
+            # before choosing a subscription. Preserve the API response, but
+            # do not let it masquerade as an account-pool attempt.
+            account_attempt=int(bool(storage_id)),
         )
         return event, import_key
 
@@ -9198,8 +9289,8 @@ def period_card_html(label: str, data: Mapping[str, Any]) -> str:
         f'{fmt_money(data.get("cached_input_cost_usd"))}</span>'
         f'<span>API 原始处理：{fmt_int(data.get("api_processed_tokens"))}</span>'
         f'<span>缓存命中率：{fmt_percent(data.get("cache_hit_rate_percent"))}</span>'
-        f'<span>调用记录：{fmt_int(data.get("account_attempts"))}</span>'
-        f'<span>失败调用：{fmt_int(data.get("failed_attempts"))}</span>'
+        f'<span>账号尝试：{fmt_int(data.get("account_attempts"))}</span>'
+        f'<span>失败尝试：{fmt_int(data.get("failed_attempts"))}</span>'
         '</div>'
         f'{token_mix_html(data)}'
         '</article>'
@@ -9251,7 +9342,7 @@ def dashboard_html(
     subscriptions = repo.subscription_dashboard_rows()
     persisted_quota_accounts = sum(1 for row in subscriptions if row.get("windows"))
     models = repo.grouped("7d", "model")
-    recent = repo.recent(50)
+    recent = repo.recent_account_attempts(50)
     if account_resolver is not None:
         for row in [*subscriptions, *recent]:
             identity = account_resolver.resolve_identity_key(row.get("identity_key"))
@@ -9307,7 +9398,7 @@ def dashboard_html(
                 "violet-card",
             ),
             (
-                "调用统计",
+                "账号尝试",
                 fmt_int(all_time["account_attempts"]),
                 f"成功 {fmt_int(all_time['successful_attempts'])} · "
                 f"失败 {fmt_int(all_time['failed_attempts'])} · 请求关联不落库",
@@ -9566,11 +9657,11 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <section class="panel trend-panel"><div class="trend">{trend_bars}</div></section>
 <div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex 真实 5 小时/周窗口；美元额度优先按 provider 当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
 <section class="subscription-grid">{subscriptions_html}</section>
-<div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近调用。</p></div></div>
+<div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近账号尝试；账号选择前的网关鉴权拒绝仅保留在 HTTP 时间轴。</p></div></div>
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script><script>{RESPONSE_TIMELINE_SCRIPT}</script></body></html>"""
 

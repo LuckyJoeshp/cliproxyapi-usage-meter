@@ -209,7 +209,11 @@ fi
 # The verified base profile uses the cliproxyapi provider.  These overrides
 # leave its model/sandbox/retry settings intact while replacing only the
 # endpoint and runtime auth command.  The API helper reads Cockpit's current
-# key on every Codex auth refresh, including after key rotation.
+# key on every Codex auth refresh, including after key rotation.  The base
+# profile may intentionally use refresh_interval_ms=0 for a different proxy;
+# that setting makes Codex wait for an authentication failure before fetching
+# a token, which produces a needless 401 before every Cockpit request. Keep
+# the documented proactive refresh cadence for this dynamic local key.
 COCKPIT_BASE_URL="$($API_HELPER --endpoint)"
 COCKPIT_PROVIDER="${COCKPIT_CODEX_PROVIDER:-cliproxyapi}"
 if [[ ! "$COCKPIT_PROVIDER" =~ '^[A-Za-z0-9_-]+$' ]]; then
@@ -225,4 +229,5 @@ exec "$CODEX_BIN" \
   -c "model_providers.$COCKPIT_PROVIDER.base_url=\"$COCKPIT_BASE_URL\"" \
   -c "model_providers.$COCKPIT_PROVIDER.auth.command=\"cockpit-tools-api\"" \
   -c "model_providers.$COCKPIT_PROVIDER.auth.args=[\"--token\"]" \
+  -c "model_providers.$COCKPIT_PROVIDER.auth.refresh_interval_ms=300000" \
   "$@"

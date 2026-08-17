@@ -181,7 +181,10 @@ At each launch it reads `codex_local_access.json`, probes the authenticated
 `/v1/models` endpoint with proxy bypass for loopback, and reads the current key
 again whenever Codex refreshes credentials. Port changes, API-key rotation,
 and additional Cockpit state fields therefore do not require editing a Codex
-profile or this repository; no application-version comparison is used.
+profile or this repository; no application-version comparison is used. The
+launcher also restores the documented five-minute proactive token refresh, so
+a base profile with `refresh_interval_ms = 0` does not create a spurious 401
+before every request.
 
 Install the launcher, its sibling helper, and the companion long-run
 supervisor:

@@ -212,6 +212,18 @@ class CockpitToolsImporterTest(unittest.TestCase):
                 ),
             )
 
+    def _insert_pre_account_rejection(self, event_key: str, timestamp: int) -> None:
+        with sqlite3.connect(
+            self.data_dir / meter.COCKPIT_TOOLS_LOG_DB_NAME
+        ) as connection:
+            connection.execute(
+                """INSERT INTO request_logs (
+                     event_key, timestamp, account_id, success, http_status,
+                     error_category
+                   ) VALUES (?, ?, '', 0, 401, 'auth_failed')""",
+                (event_key, timestamp),
+            )
+
     def _usage_rows(self) -> list[sqlite3.Row]:
         with sqlite3.connect(self.meter_db) as connection:
             connection.row_factory = sqlite3.Row
@@ -292,6 +304,74 @@ class CockpitToolsImporterTest(unittest.TestCase):
             str(self.data_dir),
         ):
             self.assertNotIn(forbidden.encode(), serialized)
+
+    def test_pre_account_401_is_not_an_account_attempt_or_availability_signal(self) -> None:
+        self._insert_request("selected-account-success", 1_786_665_600)
+        self._insert_pre_account_rejection(
+            "gateway-auth-rejection",
+            1_786_665_601_000,
+        )
+
+        result = self.importer.import_once()
+
+        self.assertEqual((result["imported"], result["scanned"]), (2, 2))
+        rows = self._usage_rows()
+        self.assertEqual(
+            [(row["status_code"], row["account_attempt"]) for row in rows],
+            [(200, 1), (401, 0)],
+        )
+        summary = self.repo.summary("all")
+        self.assertEqual(summary["calls"], 2)
+        self.assertEqual(summary["account_attempts"], 1)
+        self.assertEqual(summary["successful_calls"], 1)
+        self.assertEqual(summary["failed_calls"], 1)
+        self.assertEqual(summary["successful_account_attempts"], 1)
+        self.assertEqual(summary["failed_account_attempts"], 0)
+        self.assertEqual(summary["logical_requests"], 1)
+        self.assertEqual(
+            [row["status_code"] for row in self.repo.recent(10)],
+            [401, 200],
+        )
+        self.assertEqual(
+            [row["status_code"] for row in self.repo.recent_account_attempts(10)],
+            [200],
+        )
+        self.assertEqual(
+            [row["model"] for row in self.repo.grouped("all", "model")],
+            ["gpt-5.1-codex"],
+        )
+        now = datetime(2026, 8, 14, 0, 0, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            self.repo.response_timeline(1, now=now)["totals"],
+            {"status_200": 1, "status_non_200": 1, "total": 2},
+        )
+        page = meter.dashboard_html(
+            self.repo,
+            account_resolver=self.resolver,
+            cockpit_status=self.importer.status(),
+        )
+        self.assertIn("账号选择前的网关鉴权拒绝仅保留在 HTTP 时间轴", page)
+        self.assertIn("成功 1 · 失败 0 · 请求关联不落库", page)
+        self.assertNotIn('<span class="status-pill bad">401</span>', page)
+
+    def test_initialize_repairs_legacy_pre_account_401_classification(self) -> None:
+        self._insert_pre_account_rejection("legacy-gateway-rejection", 1_786_665_600)
+        self.importer.import_once()
+        with sqlite3.connect(self.meter_db) as connection:
+            connection.execute(
+                "UPDATE usage_events SET account_attempt=1 WHERE status_code=401"
+            )
+
+        self.repo.initialize()
+
+        row = self._usage_rows()[0]
+        self.assertEqual(row["account_attempt"], 0)
+        self.assertEqual(self.repo.summary("all")["account_attempts"], 0)
+        now = datetime(2026, 8, 14, 0, 0, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            self.repo.response_timeline(1, now=now)["totals"]["status_non_200"],
+            1,
+        )
 
     def test_newer_metadata_versions_and_additive_columns_are_accepted(self) -> None:
         self._write_accounts(
