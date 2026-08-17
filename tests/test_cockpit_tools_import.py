@@ -305,6 +305,82 @@ class CockpitToolsImporterTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden.encode(), serialized)
 
+    def test_quota_duration_and_provider_gate_survive_index_cache_merge(self) -> None:
+        record = json.loads(json.dumps(self.account_record))
+        record["usage_updated_at"] = 1_786_752_100
+        quota = record["quota"]
+        assert isinstance(quota, dict)
+        # Current Cockpit builds put the weekly window in the legacy
+        # ``hourly`` slot and expose the actual gate only in raw_data.
+        quota.update(
+            {
+                "hourly_percentage": 0,
+                "hourly_window_minutes": 10_080,
+                "weekly_percentage": None,
+                "weekly_window_minutes": None,
+                "weekly_window_present": False,
+                "raw_data": {
+                    "rate_limit": {
+                        "allowed": False,
+                        "limit_reached": True,
+                    }
+                },
+            }
+        )
+        self._write_accounts(record)
+
+        first = self.importer.import_once()
+        self.assertEqual(first["quota_rows"], 1)
+        rows = self._usage_rows()
+        self.assertEqual(rows, [])
+        with sqlite3.connect(self.meter_db) as connection:
+            connection.row_factory = sqlite3.Row
+            snapshot = connection.execute(
+                """SELECT window_kind, window_seconds, remaining_percent,
+                          provider_allowed, provider_limit_reached
+                     FROM subscription_quota_snapshots"""
+            ).fetchone()
+        self.assertEqual(
+            tuple(snapshot),
+            ("weekly", 604_800, 0.0, 0, 1),
+        )
+        card = self.repo.subscription_dashboard_rows()[0]
+        self.assertEqual(card["execution_availability"], "confirmed_exhausted")
+        self.assertEqual(card["provider_allowed"], False)
+        self.assertEqual(card["provider_limit_reached"], True)
+        page = meter.dashboard_html(
+            self.repo,
+            account_resolver=self.resolver,
+            cockpit_status=self.importer.status(),
+        )
+        self.assertIn("已确认耗尽 · 冷却中", page)
+        self.assertIn("周额度", page)
+        self.assertNotIn("5 小时额度", page)
+
+        # A later provider observation can explicitly reopen a rounded 0%
+        # window.  The false gate value must not be discarded while merging
+        # LocalStorage over the index summary.
+        record["usage_updated_at"] = 1_786_752_101
+        quota["raw_data"] = {
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+            }
+        }
+        self._write_accounts(record)
+        second = self.importer.import_once()
+        self.assertEqual(second["quota_rows"], 1)
+        card = self.repo.subscription_dashboard_rows()[0]
+        self.assertEqual(card["execution_availability"], "provider_available")
+        self.assertEqual(card["provider_allowed"], True)
+        self.assertEqual(card["provider_limit_reached"], False)
+        page = meter.dashboard_html(
+            self.repo,
+            account_resolver=self.resolver,
+            cockpit_status=self.importer.status(),
+        )
+        self.assertIn("上游 0% · 仍允许调用", page)
+
     def test_pre_account_401_is_not_an_account_attempt_or_availability_signal(self) -> None:
         self._insert_request("selected-account-success", 1_786_665_600)
         self._insert_pre_account_rejection(

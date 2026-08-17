@@ -43,7 +43,7 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | Token accounting | Non-cached input, cached input, output, reasoning subset, and raw API processing |
 | Cost estimation | Collector-frozen per-request prices or official OpenAI short/long-context prices, split by token type |
 | Account behavior | Per-subscription calls, success/failure, models, dates, and token totals |
-| Quota visibility | Read-only 5-hour/week/month snapshots, reset times, cooldowns, and observed floors |
+| Quota visibility | Read-only windows classified by duration (5-hour/week/month), reset times, provider gate state, cooldowns, and observed floors |
 | Collection paths | Transparent `8327` proxy, optional destructive-read `8317` usage queue, and default-on read-only Cockpit Tools import |
 | Dashboard | Inline, dependency-free `/usage` HTML with a per-minute HTTP 200/non-200 line timeline, token trend, account, model, and recent-call views |
 | Privacy boundary | Loopback by default; credentials and request metadata discarded; email is memory-only |
@@ -291,9 +291,17 @@ Batch mode prevalidates the complete guard inventory before changing anything,
 then calls `POST /v0/management/reset-quota` only for confirmed locks; it never
 deletes `.cds` files directly.
 
-The usage dashboard labels these states separately: `上游报告 0%`,
-`上游 0% · 实测可用` after the latest execution still returned 200, and
-`已确认耗尽 · 冷却中` only after a quota-classified execution 429.
+The usage dashboard labels these states separately: `上游报告 0%` is only a
+percentage signal, `上游 0% · 仍允许调用` means Cockpit explicitly returned
+`allowed=true`, and `已确认耗尽 · 冷却中` requires the provider gate to report
+`allowed=false` or `limit_reached=true` (or a quota-classified execution 429).
+A successful request recorded before a later provider snapshot remains a
+historical event; it does not override the newer cooldown signal.
+
+The “最近 50 次账号尝试” table is a historical completion ledger. It includes
+seconds in its timestamps and excludes gateway authentication failures that
+occurred before an account was selected; entering cooldown does not delete
+successful rows recorded before that cooldown.
 
 For a direct-8317 queue collector, use an external owner-only key file (never
 put a management credential in this checkout):

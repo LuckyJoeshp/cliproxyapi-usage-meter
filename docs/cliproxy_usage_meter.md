@@ -211,7 +211,8 @@ python3 scripts/cliproxyapi_reset_quota.py --all
 
 `--all` 只处理官方 cooldown 或守卫已经确认的锁，并在任何写入前核对完整 guard inventory；
 它也能覆盖没有 `codex-N` alias 的凭证。该工具会同时清除官方 cooldown 和守卫 weight，
-不删除 `.cds`。额度卡分别显示“上游报告 0%”“上游 0% · 实测可用”和“已确认耗尽 · 冷却中”，
+不删除 `.cds`。额度卡分别显示“上游报告 0%”“上游 0% · 仍允许调用”和“已确认耗尽 · 冷却中”，
+并保留“上游 0% · 实测可用”作为没有结构化 gate 时、且成功发生在 0% 快照之后的兼容状态，
 避免把百分比取整误认为真实封禁。
 
 如果 Chrome 已经保持 management 页面登录状态，可用本机专用启动器（凭据只在内存中
@@ -337,6 +338,13 @@ CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。�
 日志、额度快照或健康检查响应。额度快照可能由历史 JSONL 乱序回填，因此“当前额度”
 按 `fetched_at`（同时间再按数据库 id）选择，而不是把最后插入的历史行误认为最新。
 
+Cockpit Tools 的窗口名称不是稳定语义：当前版本可能把 7 天（甚至月）窗口放在名为
+`hourly` 的字段中。导入器以 `window_minutes`/`window_seconds` 为准分类：18,000 秒为
+`five_hour`、604,800 秒为 `weekly`、约 28～31 天为 `monthly`；启动迁移也会修正旧版
+错误写成 `five_hour` 的 Cockpit 快照。额度百分比只是显示信号，不能单独证明账号已被
+封禁；Cockpit `rate_limit.allowed` 与 `rate_limit.limit_reached` 的结构化 gate 才用于
+区分“上游 0% · 仍允许调用”和“已确认耗尽 · 冷却中”。
+
 失败调用的状态与 token/cost 仍按对应 API 调用如实累计；只有已选择账号的失败才进入账号
 尝试/账号卡失败计数。错误正文和请求关联 ID 不落库；系统不会
 猜测哪次成功 token 可以代表整组。
@@ -420,7 +428,8 @@ cliproxyapi 或 Cockpit 本体。`/usage` 与
 `/healthz` 都是动态本机状态，响应带 `Cache-Control: no-store`，避免浏览器复用旧额度或身份映射。
 额度卡通过运行时 resolver 补回邮箱/alias；SQLite 中的额度快照本身不含这些可读身份信息。
 其中“最近 50 次账号尝试”只取已到达账号选择阶段的调用；账号选择前的网关 401 不占用列表名额，
-但仍会在 HTTP 响应时间轴的非 200 线上显示。
+但仍会在 HTTP 响应时间轴的非 200 线上显示。该列表是历史完成记录，时间精确到秒；账号进入
+冷却不会删除冷却前的成功行，当前可调用性以账号卡最新 provider gate/执行信号为准。
 
 新版主视图额外提供：
 
@@ -430,7 +439,7 @@ cliproxyapi 或 Cockpit 本体。`/usage` 与
   8327 sidecar 与 8317 usage queue 的全部 API 响应；无上游响应时 sidecar 写入的 502
   归入非 200 线。
 - 近 7 天 token/cost 柱状趋势。
-- 每个 Codex 订阅的 5 小时与周（Team 可能为月）剩余百分比、重置时间。
+- 每个 Codex 订阅按实际窗口时长归类的 5 小时、周或月剩余百分比、重置时间与 provider gate 状态。
 - 每账号当前周期已观测美元下限，以及基于 provider 周/月窗口的 API 等价满额度估值。
 
 ### 每分钟响应时间轴 API
@@ -470,6 +479,8 @@ API 等价额度不是订阅现金余额，而是把已观测 token 按官方 AP
 
 成功请求不再自动证明 reset。若最新 provider 周/月 snapshot 仍显示接近满额，quota 后的零星
 成功不会切割周期；这样 transient 429、重试和账号池路由变化不会制造 `$0.05` 一类的伪周期。
+同理，成功请求发生在 0% 快照之前时只作为历史事件保留，不会把较新的 provider 冷却信号
+显示成“实测可用”。
 
 订阅卡的 `C/A` 标识也有语义：`C` 表示已绑定本机 Codex alias/`CODEX_HOME`，`A` 表示只
 能由 auth/account 身份识别、没有稳定 alias。

@@ -583,6 +583,30 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertAlmostEqual(row["output_cost_usd"], 3.0, places=12)
         self.assertAlmostEqual(row["estimated_api_cost_usd"], 5.75, places=12)
 
+    def test_cockpit_quota_migration_classifies_window_by_duration(self) -> None:
+        fixture_db = self.temp_path / "cockpit-window-migration.sqlite"
+        repo = meter.UsageRepository(fixture_db)
+        identity_key = subscription_key("cockpit-window-migration")
+        with sqlite3.connect(fixture_db) as conn:
+            conn.execute(
+                """INSERT INTO subscription_quota_snapshots (
+                     fetched_at, identity_key, window_kind, used_percent,
+                     remaining_percent, window_seconds, source
+                   ) VALUES (?, ?, 'five_hour', 100, 0, 604800,
+                             'cockpit_tools_quota')""",
+                ("2026-08-17T20:19:11Z", identity_key),
+            )
+
+        # Re-opening an upgraded meter repairs snapshots written by the old
+        # importer, whose legacy ``hourly`` label was not authoritative.
+        repo.initialize()
+        with sqlite3.connect(fixture_db) as conn:
+            row = conn.execute(
+                """SELECT window_kind, window_seconds
+                     FROM subscription_quota_snapshots"""
+            ).fetchone()
+        self.assertEqual(row, ("weekly", 604800))
+
     def test_auth_fingerprint_maps_account_without_alias_and_unpriced_stays_null(self) -> None:
         status, _, _ = self.request(
             "POST", "/v1/responses", {"model": "unpriced-model", "input": "hello"}, alias=None
@@ -1621,6 +1645,41 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual(card["execution_availability"], "recent_success")
         self.assertIn("上游 0% · 实测可用", meter.dashboard_html(self.sidecar.repo))
 
+    def test_zero_quota_snapshot_after_success_is_not_called_live_available(self) -> None:
+        identity = self.sidecar.resolver.resolve("codex-1", None)
+        identity_key = meter.resolved_identity_key(identity)
+        self.sidecar.repo.insert_subscription_quota_snapshot(
+            {
+                "fetched_at": "2026-08-17T20:19:11Z",
+                "identity_key": identity_key,
+                "window_kind": "weekly",
+                "window_seconds": 604800,
+                "used_percent": 100,
+                "remaining_percent": 0,
+                "source": "fixture",
+            }
+        )
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                """INSERT INTO usage_events (
+                     ts, identity_key, model, status_code, ok, call_count,
+                     account_attempt, usage_missing
+                   ) VALUES (
+                     '2026-08-17T20:19:09Z', ?, 'fixture-model', 200, 1, 1,
+                     1, 0
+                   )""",
+                (identity_key,),
+            )
+        card = next(
+            row
+            for row in self.sidecar.repo.subscription_dashboard_rows()
+            if row["identity_key"] == identity_key
+        )
+        self.assertEqual(card["execution_availability"], "success_before_zero_snapshot")
+        page = meter.dashboard_html(self.sidecar.repo)
+        self.assertIn("上游报告 0%", page)
+        self.assertNotIn("上游 0% · 实测可用", page)
+
     def test_sse_is_byte_transparent_and_usage_is_recorded(self) -> None:
         expected = (
             b'data: {"type":"response.created","response":{"model":"fake-stream"}}\n\n'
@@ -2477,6 +2536,34 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertEqual([row["window_kind"] for row in windows], ["five_hour", "weekly"])
         self.assertEqual(windows[0]["remaining_percent"], 78.0)
         self.assertEqual(windows[1]["remaining_percent"], 38.5)
+        app_windows = meter.parse_codex_app_rate_windows(
+            {
+                "primary": {
+                    "used_percent": 100,
+                    "window_minutes": 10_080,
+                }
+            },
+            fetched_at,
+        )
+        self.assertEqual(app_windows[0]["window_kind"], "weekly")
+        self.assertEqual(app_windows[0]["window_seconds"], 604_800)
+        gated_windows = meter.parse_codex_quota_windows(
+            {
+                "rate_limit": {
+                    "allowed": False,
+                    "limit_reached": True,
+                    "primary_window": {
+                        "used_percent": 0,
+                        "limit_window_seconds": 604_800,
+                    },
+                }
+            },
+            fetched_at,
+        )
+        self.assertEqual(
+            (gated_windows[0]["provider_allowed"], gated_windows[0]["provider_limit_reached"]),
+            (False, True),
+        )
         for window in windows:
             self.sidecar.repo.insert_subscription_quota_snapshot(
                 {

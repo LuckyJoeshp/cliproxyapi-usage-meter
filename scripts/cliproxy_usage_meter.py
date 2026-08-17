@@ -1137,6 +1137,18 @@ class AccountResolver:
         if not storage_id:
             return None
         quota = value.get("quota") if isinstance(value.get("quota"), Mapping) else {}
+        raw_quota = (
+            quota.get("raw_data")
+            if isinstance(quota.get("raw_data"), Mapping)
+            else {}
+        )
+        rate_limit = (
+            raw_quota.get("rate_limit")
+            if isinstance(raw_quota.get("rate_limit"), Mapping)
+            else {}
+        )
+        provider_allowed = rate_limit.get("allowed")
+        provider_limit_reached = rate_limit.get("limit_reached")
         return {
             "id": storage_id,
             "account_id": safe_text(value.get("account_id"), 512),
@@ -1165,6 +1177,17 @@ class AccountResolver:
                 quota.get("weekly_window_minutes")
             ),
             "weekly_window_present": quota.get("weekly_window_present") is True,
+            # These structured booleans distinguish a rounded/displayed 0%
+            # from a provider-confirmed cooldown.  No error body, upsell text,
+            # or free-form rate-limit detail leaves the in-memory cache.
+            "provider_allowed": (
+                provider_allowed if isinstance(provider_allowed, bool) else None
+            ),
+            "provider_limit_reached": (
+                provider_limit_reached
+                if isinstance(provider_limit_reached, bool)
+                else None
+            ),
         }
 
     def _read_cockpit_localstorage_records(
@@ -1301,7 +1324,14 @@ class AccountResolver:
                 continue
             merged = dict(indexed)
             for key, value in cached.items():
-                if value is not None and value is not False:
+                # Most optional cache fields use ``False`` as an absent-value
+                # sentinel and must not erase a safe value from the index.
+                # The provider gate booleans are different: ``False`` is an
+                # explicit upstream decision and must survive the merge.
+                if value is not None and (
+                    value is not False
+                    or key in {"provider_allowed", "provider_limit_reached"}
+                ):
                     merged[key] = value
             combined.append(merged)
         combined.extend(cache_by_id.values())
@@ -2388,6 +2418,8 @@ class UsageRepository:
                   estimated_full_quota_usd REAL,
                   estimated_remaining_quota_usd REAL,
                   estimate_method TEXT,
+                  provider_allowed INTEGER,
+                  provider_limit_reached INTEGER,
                   source TEXT NOT NULL,
                   UNIQUE(identity_key, window_kind, fetched_at)
                 );
@@ -2525,6 +2557,18 @@ class UsageRepository:
             self._ensure_column(conn, "account_quota_cycles", "identity_key", "TEXT")
             self._ensure_column(
                 conn,
+                "subscription_quota_snapshots",
+                "provider_allowed",
+                "INTEGER",
+            )
+            self._ensure_column(
+                conn,
+                "subscription_quota_snapshots",
+                "provider_limit_reached",
+                "INTEGER",
+            )
+            self._ensure_column(
+                conn,
                 "anonymous_usage_daily",
                 "streaming_calls",
                 "INTEGER NOT NULL DEFAULT 0",
@@ -2586,6 +2630,32 @@ class UsageRepository:
                 "high_risk_missing",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            # Cockpit's cache field names describe an older two-window UI,
+            # but the embedded window duration is authoritative.  In current
+            # builds the field named ``hourly`` can carry a seven-day or
+            # monthly primary window.  Repair snapshots written by older meter
+            # versions so a 604800-second window cannot remain mislabeled as
+            # five-hour quota.  ``OR IGNORE`` plus the cleanup handles a cache
+            # that already supplied the correctly classified sibling row.
+            for window_kind, predicate in (
+                ("five_hour", "window_seconds=18000"),
+                ("weekly", "window_seconds=604800"),
+                (
+                    "monthly",
+                    "window_seconds BETWEEN 2419200 AND 2678400",
+                ),
+            ):
+                conn.execute(
+                    f"""UPDATE OR IGNORE subscription_quota_snapshots
+                           SET window_kind=?
+                         WHERE source=? AND {predicate} AND window_kind!=?""",
+                    (window_kind, COCKPIT_TOOLS_QUOTA_SOURCE, window_kind),
+                )
+                conn.execute(
+                    f"""DELETE FROM subscription_quota_snapshots
+                         WHERE source=? AND {predicate} AND window_kind!=?""",
+                    (COCKPIT_TOOLS_QUOTA_SOURCE, window_kind),
+                )
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts);
@@ -5562,6 +5632,16 @@ class UsageRepository:
             "estimated_full_quota_usd": snapshot.get("estimated_full_quota_usd"),
             "estimated_remaining_quota_usd": snapshot.get("estimated_remaining_quota_usd"),
             "estimate_method": safe_alias(snapshot.get("estimate_method")),
+            "provider_allowed": (
+                int(snapshot.get("provider_allowed"))
+                if isinstance(snapshot.get("provider_allowed"), bool)
+                else None
+            ),
+            "provider_limit_reached": (
+                int(snapshot.get("provider_limit_reached"))
+                if isinstance(snapshot.get("provider_limit_reached"), bool)
+                else None
+            ),
             "source": safe_alias(snapshot.get("source")) or "cliproxy_wham_usage",
         }
         if not values["identity_key"]:
@@ -5595,18 +5675,44 @@ class UsageRepository:
                   usage_alias, plan_type, subscription_active_until, window_kind,
                   used_percent, remaining_percent, window_seconds, reset_at,
                   estimated_full_quota_usd, estimated_remaining_quota_usd,
-                  estimate_method, source
+                  estimate_method, provider_allowed, provider_limit_reached,
+                  source
                 ) VALUES (
                   :fetched_at, :identity_key, :account_id_hash, :account_id_tail,
                   :usage_alias, :plan_type, :subscription_active_until, :window_kind,
                   :used_percent, :remaining_percent, :window_seconds, :reset_at,
                   :estimated_full_quota_usd, :estimated_remaining_quota_usd,
-                  :estimate_method, :source
+                  :estimate_method, :provider_allowed, :provider_limit_reached,
+                  :source
                 )
                 """,
                 values,
             )
-            return max(int(cursor.rowcount), 0) > 0
+            inserted = max(int(cursor.rowcount), 0) > 0
+            if not inserted and (
+                values["provider_allowed"] is not None
+                or values["provider_limit_reached"] is not None
+            ):
+                # A meter upgraded in place may already have this exact
+                # snapshot under the unique key, but without the newly
+                # allowlisted provider gate booleans.  Fill those fields
+                # without fabricating a second quota observation.
+                conn.execute(
+                    """UPDATE subscription_quota_snapshots
+                          SET provider_allowed=
+                                CASE WHEN :provider_allowed IS NULL
+                                     THEN provider_allowed
+                                     ELSE :provider_allowed END,
+                              provider_limit_reached=
+                                CASE WHEN :provider_limit_reached IS NULL
+                                     THEN provider_limit_reached
+                                     ELSE :provider_limit_reached END
+                        WHERE identity_key=:identity_key
+                          AND window_kind=:window_kind
+                          AND fetched_at=:fetched_at""",
+                    values,
+                )
+            return inserted
 
     def latest_subscription_quotas(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -5778,22 +5884,100 @@ class UsageRepository:
                     """
                 )
             }
-        for key, attempt in latest_attempts.items():
-            entry = by_key.get(key)
-            if entry is None:
-                continue
-            entry["last_execution_at"] = attempt.get("ts")
-            entry["last_execution_status"] = attempt.get("status_code")
-            if int(attempt.get("ok") or 0) == 1:
-                entry["execution_availability"] = "recent_success"
-            elif (
-                int(attempt.get("status_code") or 0) == 429
-                and str(latest_usage_limits.get(key) or "")
-                >= str(attempt.get("ts") or "")
+        for key, entry in by_key.items():
+            attempt = latest_attempts.get(key)
+            attempt_at = str(attempt.get("ts") or "") if attempt else ""
+            if attempt is not None:
+                entry["last_execution_at"] = attempt.get("ts")
+                entry["last_execution_status"] = attempt.get("status_code")
+
+            provider_signals: list[tuple[tuple[str, int], Mapping[str, Any]]] = []
+            reported_zero_at = ""
+            for window in (entry.get("windows") or {}).values():
+                if not isinstance(window, Mapping):
+                    continue
+                fetched_at = str(window.get("fetched_at") or "")
+                remaining = _percent_value(window.get("remaining_percent"))
+                used = _percent_value(window.get("used_percent"))
+                if (
+                    (remaining is not None and remaining <= 0.0001)
+                    or (used is not None and used >= 99.9999)
+                ) and fetched_at > reported_zero_at:
+                    reported_zero_at = fetched_at
+                if (
+                    window.get("provider_allowed") is not None
+                    or window.get("provider_limit_reached") is not None
+                ):
+                    provider_signals.append(
+                        (
+                            (fetched_at, int(window.get("id") or 0)),
+                            window,
+                        )
+                    )
+            if reported_zero_at:
+                entry["reported_zero_at"] = reported_zero_at
+
+            provider_at = ""
+            provider_exhausted = False
+            provider_available = False
+            if provider_signals:
+                (provider_at, _), provider = max(
+                    provider_signals,
+                    key=lambda item: item[0],
+                )
+                allowed = provider.get("provider_allowed")
+                limit_reached = provider.get("provider_limit_reached")
+                provider_exhausted = bool(
+                    (limit_reached is not None and int(limit_reached) == 1)
+                    or (allowed is not None and int(allowed) == 0)
+                )
+                provider_available = bool(
+                    allowed is not None
+                    and int(allowed) == 1
+                    and not (
+                        limit_reached is not None and int(limit_reached) == 1
+                    )
+                )
+                entry["provider_gate_at"] = provider_at
+                entry["provider_allowed"] = (
+                    None if allowed is None else bool(int(allowed))
+                )
+                entry["provider_limit_reached"] = (
+                    None if limit_reached is None else bool(int(limit_reached))
+                )
+
+            # Execution results and the structured provider gate are separate
+            # clocks.  Use the newest signal: a later success can disprove a
+            # stale cooldown, while a later ``allowed=false`` snapshot can
+            # confirm exhaustion even when Cockpit's aggregate request log
+            # records only the final successful retry on another account.
+            if (
+                provider_at
+                and provider_at >= attempt_at
+                and (provider_exhausted or provider_available)
             ):
-                entry["execution_availability"] = "confirmed_exhausted"
-            else:
-                entry["execution_availability"] = "recent_failure"
+                if provider_exhausted:
+                    entry["execution_availability"] = "confirmed_exhausted"
+                    entry["availability_source"] = "provider_gate"
+                elif provider_available:
+                    entry["execution_availability"] = "provider_available"
+                    entry["availability_source"] = "provider_gate"
+            elif attempt is not None:
+                if (
+                    int(attempt.get("status_code") or 0) == 429
+                    and str(latest_usage_limits.get(key) or "") >= attempt_at
+                ):
+                    entry["execution_availability"] = "confirmed_exhausted"
+                    entry["availability_source"] = "execution_429"
+                elif int(attempt.get("ok") or 0) == 1:
+                    if reported_zero_at and reported_zero_at >= attempt_at:
+                        entry["execution_availability"] = "success_before_zero_snapshot"
+                    else:
+                        entry["execution_availability"] = "recent_success"
+                    entry["availability_source"] = "execution"
+                else:
+                    entry["execution_availability"] = "recent_failure"
+                    entry["availability_source"] = "execution"
         scoped_account_hashes = {
             entry.get("account_id_hash")
             for entry in by_key.values()
@@ -6908,12 +7092,35 @@ def _percent_value(value: Any) -> float | None:
     return number
 
 
+def quota_window_kind(window_seconds: Any, fallback: str) -> str:
+    """Classify a Codex quota window by duration, not legacy field name."""
+
+    seconds = as_nonnegative_int(window_seconds)
+    if seconds == 18_000:
+        return "five_hour"
+    if seconds == 604_800:
+        return "weekly"
+    if seconds and 2_419_200 <= seconds <= 2_678_400:
+        return "monthly"
+    return fallback
+
+
 def parse_codex_quota_windows(payload: Any, fetched_at: str | None = None) -> list[dict[str, Any]]:
     if not isinstance(payload, Mapping):
         return []
     rate_limit = first_present(payload, ("rate_limit", "rateLimit"))
     if not isinstance(rate_limit, Mapping):
         return []
+    provider_allowed = rate_limit.get("allowed")
+    provider_limit_reached = first_present(
+        rate_limit, ("limit_reached", "limitReached")
+    )
+    provider_allowed = provider_allowed if isinstance(provider_allowed, bool) else None
+    provider_limit_reached = (
+        provider_limit_reached
+        if isinstance(provider_limit_reached, bool)
+        else None
+    )
     primary = first_present(rate_limit, ("primary_window", "primaryWindow"))
     secondary = first_present(rate_limit, ("secondary_window", "secondaryWindow"))
     candidates = [primary, secondary]
@@ -6925,14 +7132,10 @@ def parse_codex_quota_windows(payload: Any, fetched_at: str | None = None) -> li
         window_seconds = as_nonnegative_int(
             first_present(raw, ("limit_window_seconds", "limitWindowSeconds"))
         )
-        if window_seconds == 18_000:
-            kind = "five_hour"
-        elif window_seconds and 2_419_200 <= window_seconds <= 2_678_400:
-            kind = "monthly"
-        elif window_seconds == 604_800:
-            kind = "weekly"
-        else:
-            kind = "five_hour" if index == 0 else "weekly"
+        kind = quota_window_kind(
+            window_seconds,
+            "five_hour" if index == 0 else "weekly",
+        )
         if kind in seen:
             continue
         used = _percent_value(first_present(raw, ("used_percent", "usedPercent")))
@@ -6956,6 +7159,8 @@ def parse_codex_quota_windows(payload: Any, fetched_at: str | None = None) -> li
                 "remaining_percent": 100.0 - used if used is not None else None,
                 "window_seconds": window_seconds,
                 "reset_at": normalize_optional_timestamp(reset_value),
+                "provider_allowed": provider_allowed,
+                "provider_limit_reached": provider_limit_reached,
             }
         )
         seen.add(kind)
@@ -6980,14 +7185,10 @@ def parse_codex_app_rate_windows(
             first_present(raw, ("window_minutes", "windowMinutes"))
         )
         seconds = minutes * 60 if minutes is not None else None
-        if seconds == 18_000:
-            kind = "five_hour"
-        elif seconds and 2_419_200 <= seconds <= 2_678_400:
-            kind = "monthly"
-        elif seconds == 604_800:
-            kind = "weekly"
-        else:
-            kind = "five_hour" if index == 0 else "weekly"
+        kind = quota_window_kind(
+            seconds,
+            "five_hour" if index == 0 else "weekly",
+        )
         if kind in seen:
             continue
         used = _percent_value(first_present(raw, ("used_percent", "usedPercent")))
@@ -7357,6 +7558,8 @@ class CockpitToolsImporter:
                 if record.get(f"{prefix}_window_present") is not True or remaining is None:
                     continue
                 minutes = as_nonnegative_int(record.get(f"{prefix}_window_minutes"))
+                window_seconds = minutes * 60 if minutes is not None else None
+                kind = quota_window_kind(window_seconds, kind)
                 inserted = self.repo.insert_subscription_quota_snapshot(
                     {
                         "fetched_at": fetched_at,
@@ -7368,8 +7571,12 @@ class CockpitToolsImporter:
                         "window_kind": kind,
                         "used_percent": 100.0 - remaining,
                         "remaining_percent": remaining,
-                        "window_seconds": minutes * 60 if minutes is not None else None,
+                        "window_seconds": window_seconds,
                         "reset_at": record.get(f"{prefix}_reset_time"),
+                        "provider_allowed": record.get("provider_allowed"),
+                        "provider_limit_reached": record.get(
+                            "provider_limit_reached"
+                        ),
                         "source": COCKPIT_TOOLS_QUOTA_SOURCE,
                     }
                 )
@@ -8799,7 +9006,7 @@ def fmt_ratio(numerator: Any, denominator: Any) -> str:
     return f"{int(numerator or 0) / total * 100:.1f}%"
 
 
-def fmt_local_time(value: Any) -> str:
+def fmt_local_time(value: Any, *, seconds: bool = False) -> str:
     text = safe_text(value, 128)
     if not text:
         return "—"
@@ -8809,7 +9016,8 @@ def fmt_local_time(value: Any) -> str:
         return text
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone().strftime("%m-%d %H:%M")
+    pattern = "%m-%d %H:%M:%S" if seconds else "%m-%d %H:%M"
+    return parsed.astimezone().strftime(pattern)
 
 
 RESPONSE_TIMELINE_CSS = """
@@ -9464,8 +9672,14 @@ def dashboard_html(
         elif execution_availability == "confirmed_exhausted":
             status_text = "已确认耗尽 · 冷却中"
             status_class = "confirmed"
+        elif upstream_reports_zero and execution_availability == "provider_available":
+            status_text = "上游 0% · 仍允许调用"
+            status_class = "available"
         elif upstream_reports_zero and execution_availability == "recent_success":
             status_text = "上游 0% · 实测可用"
+            status_class = "available"
+        elif execution_availability == "provider_available":
+            status_text = "上游确认可用"
             status_class = "available"
         elif execution_availability == "recent_success":
             status_text = "最近实测可用"
@@ -9481,6 +9695,26 @@ def dashboard_html(
             f'<span class="account-email">{html.escape(account_email)}</span>'
             if account_email else '<span class="account-email unavailable">邮箱未获取</span>'
         )
+        observation_parts: list[str] = []
+        if row.get("last_execution_at"):
+            observation_parts.append(
+                f"最后账号尝试 {fmt_local_time(row.get('last_execution_at'), seconds=True)}"
+                f" · HTTP {int(row.get('last_execution_status') or 0)}"
+            )
+        quota_signal_at = (
+            row.get("provider_gate_at")
+            or row.get("reported_zero_at")
+            or row.get("fetched_at")
+        )
+        if quota_signal_at:
+            observation_parts.append(
+                f"额度信号 {fmt_local_time(quota_signal_at, seconds=True)}"
+            )
+        observation_text = " · ".join(observation_parts)
+        observation_html = (
+            f'<span class="account-observation">{html.escape(observation_text)}</span>'
+            if observation_text else ""
+        )
         quota_label = (
             "上周期满额 API 等价参考"
             if row.get("quota_estimate_method") == "previous_window_transfer"
@@ -9491,12 +9725,24 @@ def dashboard_html(
             quota_label = "历史记录"
             quota_text = "不参与额度"
             quota_note = "无法安全拆分 · 已保留调用统计"
+        quota_rows: list[str] = []
+        if five_hour:
+            quota_rows.append(window_meter_html(five_hour, "5 小时额度"))
+        if weekly:
+            quota_rows.append(
+                window_meter_html(
+                    weekly,
+                    "月额度" if windows.get("monthly") else "周额度",
+                )
+            )
+        if not quota_rows:
+            quota_rows.append(window_meter_html(None, "额度窗口"))
         subscription_cards.append(
             f'<article class="subscription-card"><div class="account-head"><div class="avatar" title="{html.escape(badge_title)}">{badge}</div>'
             f'<div class="account-copy"><h3>{html.escape(alias)}</h3>{account_email_html}'
-            f'<span class="account-meta">{html.escape(plan)} · {html.escape(badge_title)}</span></div>'
-            f'<i class="{status_class}">{html.escape(status_text)}</i></div>'
-            f'{window_meter_html(five_hour, "5 小时额度")}{window_meter_html(weekly, "周额度" if not windows.get("monthly") else "月额度")}'
+            f'<span class="account-meta">{html.escape(plan)} · {html.escape(badge_title)}</span>{observation_html}</div>'
+            f'<i class="{status_class}" title="{html.escape(observation_text)}">{html.escape(status_text)}</i></div>'
+            f'{"".join(quota_rows)}'
             f'<div class="account-usage"><span>总调用 <b>{fmt_int(row.get("all_time_account_attempts"))}</b></span>'
             f'<span class="account-success">成功 <b>{fmt_int(row.get("all_time_successful_calls"))}</b></span>'
             f'<span class="account-failure">失败 <b>{fmt_int(row.get("all_time_failed_calls"))}</b></span>'
@@ -9538,7 +9784,7 @@ def dashboard_html(
         return "ok" if row.get("ok") else "bad"
 
     recent_rows = "".join(
-        f'<tr><td>{html.escape(fmt_local_time(row["ts"]))}</td><td>{html.escape(display_identity(row))}</td>'
+        f'<tr><td>{html.escape(fmt_local_time(row["ts"], seconds=True))}</td><td>{html.escape(display_identity(row))}</td>'
         f'<td>{html.escape(str(row["model"] or "—"))}</td><td><span class="status-pill {_status_class(row)}">{row["status_code"]}</span></td>'
         f'<td>{fmt_int(max(int(row["input_tokens"] or 0) - int(row["cached_tokens"] or 0), 0))}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
@@ -9636,8 +9882,8 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 .app-import-notice{{background:color-mix(in srgb,var(--mint) 36%,var(--card))}}.app-import-notice:before{{content:"✓";background:var(--mint)}}.manual-import{{margin-top:15px;border:var(--border);border-radius:12px;background:var(--card);box-shadow:var(--shadow-sm);overflow:hidden}}.manual-import summary{{padding:13px 15px;cursor:pointer;font-family:var(--font-display)}}.manual-import summary span{{margin-left:8px;color:var(--ink-3);font:600 10px/1.2 var(--font-mono)}}.manual-import form{{padding:16px;border-top:1.5px solid var(--ink)}}.form-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}.manual-import label{{display:grid;gap:5px;color:var(--ink-2);font:700 10px/1.2 var(--font-mono)}}.manual-import input{{min-width:0;padding:9px 10px;border:1.5px solid var(--ink);border-radius:8px;background:var(--paper);color:var(--ink);font:600 12px/1.2 var(--font-mono)}}.note-label{{margin-top:12px}}.manual-import button{{margin-top:12px;padding:9px 14px;border:var(--border);border-radius:9px;background:var(--orange);color:var(--on-color);box-shadow:var(--shadow-sm);font-weight:900;cursor:pointer}}.manual-import p{{margin:11px 0 0;color:var(--ink-3);font-size:11px}}
 .section-title{{display:flex;justify-content:space-between;align-items:end;margin:38px 0 14px}}.section-title h2{{margin:0;font:900 22px/1.1 var(--font-display);letter-spacing:-.015em}}.section-title p{{margin:5px 0 0;color:var(--ink-2)}}.section-title small{{color:var(--ink-3);font-family:var(--font-mono)}}.period-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}}.period-card{{padding:20px;transition:.14s transform,.14s box-shadow}}.period-card:nth-child(1) .period-head span{{background:var(--sun)}}.period-card:nth-child(2) .period-head span{{background:var(--rose)}}.period-card:nth-child(3) .period-head span{{background:var(--sky)}}.period-head{{display:flex;min-width:0;align-items:end;justify-content:space-between;gap:14px}}.period-head>div{{min-width:0}}.period-head span{{display:inline-block;padding:5px 7px;border:1.5px solid var(--ink);border-radius:7px;color:var(--on-color)}}.period-head strong{{display:block;margin-top:9px;font:900 25px/1 var(--font-display);overflow-wrap:anywhere}}.period-head em{{flex:0 0 auto;font:900 20px/1 var(--font-display);font-style:normal;color:var(--ink)}}.period-meta{{display:flex;flex-wrap:wrap;gap:6px 8px;margin-top:14px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.period-meta span{{max-width:100%;padding:4px 6px;border:1px solid color-mix(in srgb,var(--ink) 38%,transparent);border-radius:6px;background:var(--paper);overflow-wrap:anywhere}}.mix-bar{{display:flex;height:11px;margin:16px 0 14px;border:1.5px solid var(--ink);border-radius:999px;overflow:hidden;background:var(--cream)}}.mix-segment.cyan,.dot.cyan{{background:var(--sky)}}.mix-segment.violet,.dot.violet{{background:var(--lavender)}}.mix-segment.amber,.dot.amber{{background:var(--orange)}}.dot.mint{{background:var(--mint)}}.mix-legend{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:9px 18px}}.mix-item{{display:grid;min-width:0;grid-template-columns:9px minmax(0,1fr) auto;align-items:center;gap:7px;color:var(--ink-2);font-size:11px}}.mix-item span{{min-width:0;overflow-wrap:anywhere}}.mix-item strong{{color:var(--ink);font-family:var(--font-mono)}}.dot{{width:8px;height:8px;border:1px solid var(--ink);border-radius:3px}}
 .trend-panel{{padding:22px 22px 17px;background-color:var(--card);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:16px 16px}}.trend{{height:230px;display:grid;grid-template-columns:repeat(7,1fr);gap:14px;align-items:end;padding-top:24px}}.trend-column{{position:relative;display:grid;grid-template-rows:160px auto auto;text-align:center;gap:5px;min-width:0}}.trend-track{{height:160px;display:flex;align-items:end;border:1.5px solid var(--ink);border-radius:9px;background:var(--cream);overflow:hidden}}.trend-track span{{width:100%;min-height:3px;border-top:1.5px solid var(--ink);background:var(--orange)}}.trend-column:nth-child(3n+2) .trend-track span{{background:var(--sun)}}.trend-column:nth-child(3n+3) .trend-track span{{background:var(--sky)}}.trend-column b{{font:700 10px/1 var(--font-mono);color:var(--ink-3)}}.trend-column small{{font:900 11px/1 var(--font-mono)}}.bar-tooltip{{position:absolute;z-index:3;bottom:190px;left:50%;transform:translate(-50%,8px);opacity:0;pointer-events:none;white-space:nowrap;padding:8px 10px;border:var(--border);border-radius:8px;background:var(--card);box-shadow:var(--shadow-sm);font:700 10px/1.45 var(--font-mono);transition:.16s}}.trend-column:hover .bar-tooltip{{opacity:1;transform:translate(-50%,0)}}
-.subscription-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(310px,100%),1fr));gap:15px}}.subscription-card{{padding:18px;transition:.14s transform,.14s box-shadow}}.subscription-card:nth-child(4n+1){{border-top:8px solid var(--sun)}}.subscription-card:nth-child(4n+2){{border-top:8px solid var(--rose)}}.subscription-card:nth-child(4n+3){{border-top:8px solid var(--sky)}}.subscription-card:nth-child(4n+4){{border-top:8px solid var(--mint)}}.account-head{{display:grid;min-width:0;grid-template-columns:44px minmax(0,1fr) auto;gap:11px;align-items:center;margin-bottom:18px}}.account-copy{{min-width:0}}.avatar{{display:grid;place-items:center;width:42px;height:42px;border:var(--border);border-radius:50%;background:var(--sun);box-shadow:var(--shadow-sm);color:var(--on-color);font:900 18px/1 var(--font-display)}}.subscription-card:nth-child(4n+2) .avatar{{background:var(--rose)}}.subscription-card:nth-child(4n+3) .avatar{{background:var(--sky)}}.subscription-card:nth-child(4n+4) .avatar{{background:var(--mint)}}.account-head h3{{margin:0;font:900 17px/1.1 var(--font-display);overflow-wrap:anywhere}}.account-head span{{display:block;overflow-wrap:anywhere}}.account-head .account-email{{margin-top:4px;color:var(--ink-2);font:700 10px/1.3 var(--font-mono)}}.account-head .account-email.unavailable{{color:var(--ink-3);font-weight:600}}.account-head .account-meta{{margin-top:3px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.account-head i{{padding:5px 7px;border:1.5px solid var(--ink);border-radius:999px;background:var(--mint);color:var(--on-color);font:800 9px/1 var(--font-mono);font-style:normal}}.quota-row{{margin:14px 0}}.quota-copy{{display:flex;justify-content:space-between;align-items:end}}.quota-copy b{{display:block;font-size:12px}}.quota-copy span,.muted-row span{{display:block;margin-top:2px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.quota-copy strong{{font:900 17px/1 var(--font-display)}}.healthy{{color:#18824c}}.warning{{color:#b06b00}}.critical{{color:#d6324f}}:root[data-theme="dark"] .healthy{{color:#8ce7af}}:root[data-theme="dark"] .warning{{color:#ffd36b}}:root[data-theme="dark"] .critical{{color:#ff91a3}}.meter{{height:10px;margin-top:8px;border:1.5px solid var(--ink);border-radius:999px;background:var(--cream);overflow:hidden}}.meter span{{display:block;height:100%;border-right:1.5px solid var(--ink);background:currentColor}}.muted-row{{display:flex;justify-content:space-between;color:var(--ink-3)}}.account-usage{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:15px 0 5px}}.account-usage span{{min-width:0;padding:8px;border:1.5px solid var(--ink);border-radius:8px;background:var(--paper);color:var(--ink-3);font:700 8px/1.3 var(--font-mono);overflow-wrap:anywhere}}.account-usage b{{display:block;margin-top:3px;color:var(--ink);font-size:11px}}.quota-value{{display:flex;justify-content:space-between;align-items:end;margin-top:14px;padding-top:15px;border-top:2px solid var(--ink)}}.quota-value span{{color:var(--ink-3)}}.quota-value strong{{display:block;margin-top:5px;font:900 22px/1 var(--font-display)}}.quota-value small{{text-align:right;color:var(--ink-3);font:600 9px/1.4 var(--font-mono)}}
-.two-col{{display:grid;grid-template-columns:1fr 1.2fr;gap:15px}}.panel{{padding:0}}.panel h3{{margin:0;padding:15px 18px;border-bottom:2px solid var(--ink);background:var(--sun);color:var(--on-color);font:900 15px/1 var(--font-display)}}.two-col .panel:nth-child(2) h3{{background:var(--sky)}}.table-wrap{{overflow:auto;max-height:520px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:11px 14px;text-align:left;border-bottom:1.5px solid color-mix(in srgb,var(--ink) 48%,transparent);white-space:nowrap}}th{{position:sticky;top:0;z-index:2;background:var(--cream);color:var(--ink-2);font:800 9px/1.2 var(--font-mono);letter-spacing:.06em;text-transform:uppercase}}tbody tr:nth-child(even){{background:color-mix(in srgb,var(--sky) 12%,var(--card))}}tr:last-child td{{border-bottom:0}}.status-pill{{display:inline-block;min-width:42px;padding:3px 7px;border:1.5px solid var(--ink);border-radius:999px;text-align:center;color:var(--on-color);font:900 9px/1 var(--font-mono)}}.status-pill.ok{{background:var(--mint)}}.status-pill.bad{{background:var(--rose)}}.empty,.empty-state{{padding:25px;text-align:center;color:var(--ink-3)}}
+.subscription-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(310px,100%),1fr));gap:15px}}.subscription-card{{padding:18px;transition:.14s transform,.14s box-shadow}}.subscription-card:nth-child(4n+1){{border-top:8px solid var(--sun)}}.subscription-card:nth-child(4n+2){{border-top:8px solid var(--rose)}}.subscription-card:nth-child(4n+3){{border-top:8px solid var(--sky)}}.subscription-card:nth-child(4n+4){{border-top:8px solid var(--mint)}}.account-head{{display:grid;min-width:0;grid-template-columns:44px minmax(0,1fr) auto;gap:11px;align-items:center;margin-bottom:18px}}.account-copy{{min-width:0}}.avatar{{display:grid;place-items:center;width:42px;height:42px;border:var(--border);border-radius:50%;background:var(--sun);box-shadow:var(--shadow-sm);color:var(--on-color);font:900 18px/1 var(--font-display)}}.subscription-card:nth-child(4n+2) .avatar{{background:var(--rose)}}.subscription-card:nth-child(4n+3) .avatar{{background:var(--sky)}}.subscription-card:nth-child(4n+4) .avatar{{background:var(--mint)}}.account-head h3{{margin:0;font:900 17px/1.1 var(--font-display);overflow-wrap:anywhere}}.account-head span{{display:block;overflow-wrap:anywhere}}.account-head .account-email{{margin-top:4px;color:var(--ink-2);font:700 10px/1.3 var(--font-mono)}}.account-head .account-email.unavailable{{color:var(--ink-3);font-weight:600}}.account-head .account-meta{{margin-top:3px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.account-head .account-observation{{margin-top:3px;color:var(--ink-3);font:600 8px/1.3 var(--font-mono)}}.account-head i{{padding:5px 7px;border:1.5px solid var(--ink);border-radius:999px;background:var(--mint);color:var(--on-color);font:800 9px/1 var(--font-mono);font-style:normal}}.quota-row{{margin:14px 0}}.quota-copy{{display:flex;justify-content:space-between;align-items:end}}.quota-copy b{{display:block;font-size:12px}}.quota-copy span,.muted-row span{{display:block;margin-top:2px;color:var(--ink-3);font:600 9px/1.3 var(--font-mono)}}.quota-copy strong{{font:900 17px/1 var(--font-display)}}.healthy{{color:#18824c}}.warning{{color:#b06b00}}.critical{{color:#d6324f}}:root[data-theme="dark"] .healthy{{color:#8ce7af}}:root[data-theme="dark"] .warning{{color:#ffd36b}}:root[data-theme="dark"] .critical{{color:#ff91a3}}.meter{{height:10px;margin-top:8px;border:1.5px solid var(--ink);border-radius:999px;background:var(--cream);overflow:hidden}}.meter span{{display:block;height:100%;border-right:1.5px solid var(--ink);background:currentColor}}.muted-row{{display:flex;justify-content:space-between;color:var(--ink-3)}}.account-usage{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:15px 0 5px}}.account-usage span{{min-width:0;padding:8px;border:1.5px solid var(--ink);border-radius:8px;background:var(--paper);color:var(--ink-3);font:700 8px/1.3 var(--font-mono);overflow-wrap:anywhere}}.account-usage b{{display:block;margin-top:3px;color:var(--ink);font-size:11px}}.quota-value{{display:flex;justify-content:space-between;align-items:end;margin-top:14px;padding-top:15px;border-top:2px solid var(--ink)}}.quota-value span{{color:var(--ink-3)}}.quota-value strong{{display:block;margin-top:5px;font:900 22px/1 var(--font-display)}}.quota-value small{{text-align:right;color:var(--ink-3);font:600 9px/1.4 var(--font-mono)}}
+.two-col{{display:grid;grid-template-columns:1fr 1.2fr;gap:15px}}.panel{{padding:0}}.panel h3{{margin:0;padding:15px 18px;border-bottom:2px solid var(--ink);background:var(--sun);color:var(--on-color);font:900 15px/1 var(--font-display)}}.two-col .panel:nth-child(2) h3{{background:var(--sky)}}.table-note{{margin:0;padding:10px 18px;border-bottom:1.5px solid color-mix(in srgb,var(--ink) 28%,transparent);color:var(--ink-3);font:600 9px/1.45 var(--font-mono)}}.table-wrap{{overflow:auto;max-height:520px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:11px 14px;text-align:left;border-bottom:1.5px solid color-mix(in srgb,var(--ink) 48%,transparent);white-space:nowrap}}th{{position:sticky;top:0;z-index:2;background:var(--cream);color:var(--ink-2);font:800 9px/1.2 var(--font-mono);letter-spacing:.06em;text-transform:uppercase}}tbody tr:nth-child(even){{background:color-mix(in srgb,var(--sky) 12%,var(--card))}}tr:last-child td{{border-bottom:0}}.status-pill{{display:inline-block;min-width:42px;padding:3px 7px;border:1.5px solid var(--ink);border-radius:999px;text-align:center;color:var(--on-color);font:900 9px/1 var(--font-mono)}}.status-pill.ok{{background:var(--mint)}}.status-pill.bad{{background:var(--rose)}}.empty,.empty-state{{padding:25px;text-align:center;color:var(--ink-3)}}
 .system-strip{{display:flex;flex-wrap:wrap;gap:9px;margin-top:27px}}.system-strip span{{padding:7px 10px;border:1.5px solid var(--ink);border-radius:999px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-2);font:700 9px/1 var(--font-mono)}}.system-strip span:nth-child(1){{background:var(--mint);color:var(--on-color)}}.system-strip span:nth-child(2){{background:var(--sky);color:var(--on-color)}}.system-strip span:nth-child(3){{background:var(--sun);color:var(--on-color)}}.system-strip b{{color:inherit}}footer{{margin-top:24px;padding-top:16px;border-top:2px solid var(--ink);color:var(--ink-3);font:600 9px/1.65 var(--font-mono)}}
 @media(max-width:1320px){{.hero-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:920px){{main{{padding:26px 16px 55px}}header{{align-items:flex-start}}.brand-mark{{width:46px;height:46px}}.subtitle{{max-width:560px}}.hero-grid,.period-grid,.two-col{{grid-template-columns:minmax(0,1fr)}}.form-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.trend{{gap:7px}}.notice{{display:grid;grid-template-columns:auto minmax(0,1fr)}}.notice b{{white-space:normal}}.notice span{{grid-column:2;overflow-wrap:anywhere}}}}@media(max-width:620px){{header{{align-items:flex-start;flex-direction:column}}.brand-lockup{{align-items:flex-start}}h1{{font-size:clamp(28px,9vw,38px)}}.header-actions{{width:100%;justify-content:space-between}}.hero-grid,.subscription-grid,.form-grid{{grid-template-columns:minmax(0,1fr)}}.period-head{{flex-wrap:wrap}}.mix-legend{{grid-template-columns:minmax(0,1fr)}}.account-usage{{grid-template-columns:repeat(3,minmax(0,1fr))}}.trend-column small{{display:none}}.section-title{{align-items:flex-start;flex-direction:column;gap:6px}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important;transition:none!important}}}}
 .account-head i.confirmed{{background:var(--rose)}}.account-head i.reported{{background:var(--sun)}}.account-head i.available{{background:var(--mint)}}
@@ -9655,10 +9901,10 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 {response_timeline_chart}
 <div class="section-title"><div><h2>近 7 天趋势</h2><p>柱高为非缓存输入 + 输出；悬停可看缓存和 API 原始处理量。</p></div></div>
 <section class="panel trend-panel"><div class="trend">{trend_bars}</div></section>
-<div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex 真实 5 小时/周窗口；美元额度优先按 provider 当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
+<div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex provider 实际窗口（按时长归类为 5 小时/周/月）；美元额度优先按当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
 <section class="subscription-grid">{subscriptions_html}</section>
 <div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近账号尝试；账号选择前的网关鉴权拒绝仅保留在 HTTP 时间轴。</p></div></div>
-  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
+  <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><p class="table-note">这是历史完成记录（时间精确到秒）；账号进入冷却不会删除冷却前的成功记录，当前状态以账号卡的最新额度信号为准。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
 <div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
