@@ -85,6 +85,12 @@ python3 scripts/cliproxy_usage_meter.py --serve \
 
 LocalStorage 覆盖也可通过 `COCKPIT_TOOLS_LOCALSTORAGE_DB` 设置。
 
+迁移期间默认仍以 CLIProxyAPI 与 Cockpit 完整清单的并集为有效账号。确认 Cockpit 已成为唯一
+账号所有者后，可用 `--cockpit-tools-authoritative-accounts` 或环境变量
+`COCKPIT_TOOLS_AUTHORITATIVE_ACCOUNTS=1` 启动；此时仅在 Cockpit 索引与凭据 cache 都完整时，
+由 Cockpit 当前清单决定 8327 可见账号，CLIProxyAPI 独有的残留 auth 会按已删除处理。任一
+来源不完整时该模式 fail closed，不会凭局部清单授权删除。
+
 WebKit cache 只按 allowlist 提取安全的身份与额度字段；OAuth/API token、cookie、授权头、
 原始账号 cache 记录和其他凭据不会写入 meter SQLite。可读账号信息仍遵守既有隐私边界：
 只在本机运行时用于映射，持久关联使用 keyed identity。
@@ -105,6 +111,14 @@ cache-write 与 reasoning 等 token breakdown。importer 沿用这些逐请求�
 `detail_schema_version` 拒收。升级后仅增加版本号、数据库列或索引字段时会自动继续导入，
 未知新增字段会被忽略；只有必需字段被删除、改名或改变语义时才会在 importer health 中
 报告结构不兼容，且不会拖垮 `8327` 看板。
+
+Cockpit 完整凭据 cache 与其中的结构化终止错误也是账号清单的一部分：索引账号若已从完整
+cache 消失，或明确返回 `deactivated_workspace` / `token_invalidated`，即使 CLIProxyAPI
+目录仍残留旧 auth 文件、`codex_accounts.json` 仍有陈旧摘要，meter 也会把它从有效账号并集
+中剔除。该账号的额度卡与账号累计会在下一次完整导入时立即隐藏，历史明细继续按既有确认期
+匿名汇总；`usage_limit_reached` 等单纯额度耗尽不属于账号终止。实现只读取严格白名单内的
+错误码，Cockpit 的错误正文不会进入 meter SQLite 或日志。任一清单缺失或损坏时仍 fail
+closed；重新登录并恢复凭据后，后续完整清单可以重新激活该账号。
 
 推荐的迁移拓扑是：
 

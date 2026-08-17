@@ -113,6 +113,18 @@ and additional database/index fields continue to import automatically. A
 breaking removal, rename, or semantic change to a required field is isolated in
 importer health instead of taking down the `8327` dashboard.
 
+Cockpit's complete credential cache and exact structured terminal account
+errors are authoritative for the active-account union. An indexed account is
+treated as deleted when that complete cache no longer contains it, or when the
+cache reports `deactivated_workspace` or `token_invalidated`, even if a stale
+CLIProxyAPI auth file or `codex_accounts.json` summary still exists. Its
+dashboard card is hidden on the next complete import, and the normal privacy
+grace period later folds its history into anonymous totals. Quota exhaustion
+such as `usage_limit_reached` is not a terminal account error. Free-form error
+messages are never copied out of Cockpit's cache or persisted by the meter. A
+later successful re-login that restores the credential can reactivate the
+account. Missing or malformed inventory sources remain fail-closed.
+
 For migration, point request traffic directly at Cockpit Tools and keep this
 meter running only to import Cockpit data and serve
 <http://127.0.0.1:8327/usage>. Tune the importer with
@@ -120,6 +132,14 @@ meter running only to import Cockpit data and serve
 `--cockpit-tools-poll-seconds SECONDS`, or disable it with
 `--no-cockpit-tools-import`. Sanitized importer state is available at
 <http://127.0.0.1:8327/healthz>.
+
+During migration the default active-account inventory remains the safe union
+of CLIProxyAPI and Cockpit. After Cockpit becomes the sole account owner, start
+the meter with `--cockpit-tools-authoritative-accounts` (or
+`COCKPIT_TOOLS_AUTHORITATIVE_ACCOUNTS=1`). A complete Cockpit index/cache pair
+then defines the visible accounts and CLI-only stale credentials are treated as
+deleted. If either Cockpit source becomes incomplete, the mode fails closed and
+does not authorize deletion from that partial view.
 
 > **Double-count warning:** if clients send the same requests through `8327`
 > with Cockpit Tools configured as its upstream while Cockpit import remains

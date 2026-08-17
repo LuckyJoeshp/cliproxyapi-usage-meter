@@ -81,6 +81,9 @@ DEFAULT_COCKPIT_TOOLS_POLL_SECONDS = 15.0
 MAX_COCKPIT_TOOLS_CACHE_BYTES = 16 * 1024 * 1024
 COCKPIT_TOOLS_REQUEST_SOURCE = "cockpit_tools"
 COCKPIT_TOOLS_QUOTA_SOURCE = "cockpit_tools_quota"
+COCKPIT_TOOLS_TERMINAL_ACCOUNT_ERROR_CODES = frozenset(
+    {"deactivated_workspace", "token_invalidated"}
+)
 # Sources that represent an actual API request/response.  Local Codex token
 # imports and manual imports have no HTTP response status and intentionally
 # stay out of the response health timeline.
@@ -704,6 +707,7 @@ class AccountResolver:
         cockpit_tools_data_dir: Path | str | None = None,
         cockpit_tools_localstorage_db: Path | str | None = None,
         cockpit_tools_enabled: bool = True,
+        cockpit_tools_authoritative_accounts: bool = False,
     ):
         self.home = home or Path.home()
         self.enabled = enabled
@@ -731,6 +735,9 @@ class AccountResolver:
         )
         self._cockpit_localstorage_explicit = bool(configured_localstorage)
         self.cockpit_tools_enabled = bool(cockpit_tools_enabled)
+        self.cockpit_tools_authoritative_accounts = bool(
+            cockpit_tools_authoritative_accounts
+        )
         self.cockpit_tools_localstorage_db = (
             Path(configured_localstorage).expanduser()
             if configured_localstorage
@@ -761,6 +768,7 @@ class AccountResolver:
         data_dir: Path | str | None = None,
         localstorage_db: Path | str | None = None,
         enabled: bool | None = None,
+        authoritative_accounts: bool | None = None,
     ) -> None:
         """Configure Cockpit sources before an importer starts polling."""
 
@@ -773,6 +781,10 @@ class AccountResolver:
                 self._cockpit_localstorage_explicit = True
             if enabled is not None:
                 self.cockpit_tools_enabled = bool(enabled)
+            if authoritative_accounts is not None:
+                self.cockpit_tools_authoritative_accounts = bool(
+                    authoritative_accounts
+                )
             self._last_refresh = -float("inf")
 
     def resolve(self, usage_alias: str | None, auth_fingerprint: str | None) -> AccountIdentity:
@@ -1058,6 +1070,11 @@ class AccountResolver:
         return {
             "detected": self._cockpit_detected,
             "authoritative": self._cockpit_inventory_authoritative,
+            "owns_active_inventory": bool(
+                self.cockpit_tools_authoritative_accounts
+                and self._cockpit_detected
+                and self._cockpit_inventory_authoritative
+            ),
             "account_count": len(keys),
             "active_keys": keys,
         }
@@ -1169,6 +1186,19 @@ class AccountResolver:
         )
         provider_allowed = rate_limit.get("allowed")
         provider_limit_reached = rate_limit.get("limit_reached")
+        quota_error = (
+            value.get("quota_error")
+            if isinstance(value.get("quota_error"), Mapping)
+            else {}
+        )
+        raw_terminal_error_code = safe_text(quota_error.get("code"), 64)
+        terminal_error_code = (
+            raw_terminal_error_code.casefold()
+            if raw_terminal_error_code
+            and raw_terminal_error_code.casefold()
+            in COCKPIT_TOOLS_TERMINAL_ACCOUNT_ERROR_CODES
+            else None
+        )
         return {
             "id": storage_id,
             "account_id": safe_text(value.get("account_id"), 512),
@@ -1208,6 +1238,10 @@ class AccountResolver:
                 if isinstance(provider_limit_reached, bool)
                 else None
             ),
+            # A small exact allowlist is enough to suppress credentials that
+            # Cockpit has authoritatively proved unusable.  Free-form error
+            # text never leaves the credential cache or reaches SQLite.
+            "terminal_error_code": terminal_error_code,
         }
 
     def _read_cockpit_localstorage_records(
@@ -1332,7 +1366,15 @@ class AccountResolver:
             indexed_ids.add(storage_id)
             cached = cache_by_id.pop(storage_id, None)
             if cached is None:
-                combined.append(indexed)
+                record = dict(indexed)
+                # Cockpit can remove an unusable credential from its WebKit
+                # cache while leaving a stale summary in codex_accounts.json.
+                # Only the agreement of two complete sources may classify
+                # that index-only record as deleted; a missing or malformed
+                # cache remains fail-closed below.
+                if cache_detected and cache_complete:
+                    record["credential_cache_missing"] = True
+                combined.append(record)
                 continue
             indexed_email = normalize_email_identity(indexed.get("email"))
             cached_email = normalize_email_identity(cached.get("email"))
@@ -1673,6 +1715,7 @@ class AccountResolver:
         ) = self._cockpit_source_records()
         cockpit_accounts: dict[str, AccountIdentity] = {}
         cockpit_inventory_keys: set[str] = set()
+        cockpit_inactive_keys: set[str] = set()
         cockpit_principal_targets: dict[str, set[str]] = {}
         for record in cockpit_records:
             workspace_id = safe_text(record.get("account_id"), 512)
@@ -1785,7 +1828,12 @@ class AccountResolver:
                 if old_key != canonical_key:
                     remember_legacy_identity(old_key, canonical_key)
             if storage_id in indexed_cockpit_ids:
-                cockpit_inventory_keys.add(canonical_key)
+                if record.get("terminal_error_code") or record.get(
+                    "credential_cache_missing"
+                ):
+                    cockpit_inactive_keys.add(canonical_key)
+                else:
+                    cockpit_inventory_keys.add(canonical_key)
 
         for account_id, keyed in account_identities.items():
             sample = next(iter(keyed.values()))
@@ -1804,7 +1852,23 @@ class AccountResolver:
             return current
 
         active_subscription_keys: set[str] = set()
-        for key in cli_active_keys | cockpit_inventory_keys:
+        cockpit_owns_inventory = bool(
+            self.cockpit_tools_authoritative_accounts
+            and cockpit_detected
+            and cockpit_inventory_authoritative
+        )
+        inventory_keys = (
+            cockpit_inventory_keys
+            if cockpit_owns_inventory
+            else cli_active_keys | cockpit_inventory_keys
+        )
+        # A structured terminal error or a record removed from Cockpit's
+        # complete credential cache is newer and more authoritative than a
+        # stale local auth file. Treat it as deleted until Cockpit restores a
+        # healthy credential record. After an operator declares Cockpit the
+        # inventory owner, every CLI-only key is likewise excluded, but only
+        # while Cockpit's two-source inventory remains complete.
+        for key in inventory_keys - cockpit_inactive_keys:
             migrated = migrated_active_key(key)
             if canonical_subscription_key(migrated):
                 active_subscription_keys.add(migrated)
@@ -7421,6 +7485,9 @@ class CockpitToolsImporter:
         }
         return {
             "enabled": True,
+            "authoritative_accounts": bool(
+                self.resolver.cockpit_tools_authoritative_accounts
+            ),
             "database_available": self._database_available,
             "last_poll_at": self._last_poll_at,
             "last_success_at": self._last_success_at,
@@ -7663,6 +7730,10 @@ class CockpitToolsImporter:
     def _import_quota_records(self, records: Sequence[Mapping[str, Any]]) -> int:
         count = 0
         for record in records:
+            if record.get("terminal_error_code") or record.get(
+                "credential_cache_missing"
+            ):
+                continue
             fetched_at = normalize_optional_timestamp(record.get("usage_updated_at"))
             if not fetched_at:
                 continue
@@ -10077,6 +10148,7 @@ class MeterHTTPServer(ThreadingHTTPServer):
         cockpit_tools_localstorage_db: str | Path | None = None,
         cockpit_tools_poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
         cockpit_tools_import_enabled: bool = True,
+        cockpit_tools_authoritative_accounts: bool = False,
     ):
         super().__init__(address, UsageMeterHandler)
         parsed = urlsplit(upstream)
@@ -10091,6 +10163,7 @@ class MeterHTTPServer(ThreadingHTTPServer):
             data_dir=cockpit_tools_data_dir,
             localstorage_db=cockpit_tools_localstorage_db,
             enabled=cockpit_tools_import_enabled,
+            authoritative_accounts=cockpit_tools_authoritative_accounts,
         )
         self.upstream_timeout = upstream_timeout
         self.quota_routing_guard = QuotaRoutingGuard(
@@ -10797,6 +10870,7 @@ def create_server(
     cockpit_tools_localstorage_db: str | Path | None = None,
     cockpit_tools_poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
     cockpit_tools_import_enabled: bool = True,
+    cockpit_tools_authoritative_accounts: bool = False,
 ) -> MeterHTTPServer:
     repo = UsageRepository(db_path)
     resolver = account_resolver or AccountResolver(
@@ -10805,12 +10879,14 @@ def create_server(
         cockpit_tools_data_dir=cockpit_tools_data_dir,
         cockpit_tools_localstorage_db=cockpit_tools_localstorage_db,
         cockpit_tools_enabled=cockpit_tools_import_enabled,
+        cockpit_tools_authoritative_accounts=cockpit_tools_authoritative_accounts,
     )
     if account_resolver is not None:
         resolver.configure_cockpit_sources(
             data_dir=cockpit_tools_data_dir,
             localstorage_db=cockpit_tools_localstorage_db,
             enabled=cockpit_tools_import_enabled,
+            authoritative_accounts=cockpit_tools_authoritative_accounts,
         )
     repo.reconcile_auth_identities(resolver)
     repo.apply_privacy_minimization(resolver)
@@ -10840,6 +10916,7 @@ def create_server(
         cockpit_tools_localstorage_db=cockpit_tools_localstorage_db,
         cockpit_tools_poll_seconds=cockpit_tools_poll_seconds,
         cockpit_tools_import_enabled=cockpit_tools_import_enabled,
+        cockpit_tools_authoritative_accounts=cockpit_tools_authoritative_accounts,
     )
 
 
@@ -11023,6 +11100,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable read-only Cockpit Tools request/quota import",
     )
+    parser.add_argument(
+        "--cockpit-tools-authoritative-accounts",
+        action="store_true",
+        default=os.environ.get(
+            "COCKPIT_TOOLS_AUTHORITATIVE_ACCOUNTS", "0"
+        ).lower()
+        in {"1", "true", "yes"},
+        help=(
+            "Treat a complete Cockpit account inventory as authoritative and "
+            "hide CLIProxyAPI-only credentials"
+        ),
+    )
     parser.add_argument("--no-usage-queue", action="store_true", help="Disable direct 8317 usage-queue polling")
     parser.add_argument("--cached-input-price", type=float, help="Cached input USD/M; defaults to input price")
     parser.add_argument("--price-source-note", help="Human-readable provenance for a manually supplied price")
@@ -11077,6 +11166,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         cockpit_tools_data_dir=args.cockpit_tools_data_dir,
         cockpit_tools_localstorage_db=args.cockpit_tools_localstorage_db,
         cockpit_tools_enabled=not args.no_cockpit_tools_import,
+        cockpit_tools_authoritative_accounts=(
+            args.cockpit_tools_authoritative_accounts
+        ),
     )
     rebound = repo.reconcile_auth_identities(resolver)
     if rebound:
@@ -11113,6 +11205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             cockpit_tools_localstorage_db=args.cockpit_tools_localstorage_db,
             cockpit_tools_poll_seconds=args.cockpit_tools_poll_seconds,
             cockpit_tools_import_enabled=not args.no_cockpit_tools_import,
+            cockpit_tools_authoritative_accounts=(
+                args.cockpit_tools_authoritative_accounts
+            ),
         )
         LOG.info(
             "usage meter listening on http://%s:%d; upstream=%s; db=%s",

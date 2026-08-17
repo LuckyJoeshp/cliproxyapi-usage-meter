@@ -724,6 +724,131 @@ class CockpitToolsImporterTest(unittest.TestCase):
             }
         self.assertEqual(active, expected)
 
+    def test_authoritative_cockpit_mode_excludes_cli_only_accounts(self) -> None:
+        proxy_dir = self.home / ".cli-proxy-api"
+        proxy_dir.mkdir(parents=True)
+        (proxy_dir / "cli-only.json").write_text(
+            json.dumps(
+                {
+                    "type": "codex",
+                    "account_id": "cli-only-workspace",
+                    "email": "cli-only@example.test",
+                    "access_token": "cli-only-token-never-persist",
+                }
+            ),
+            encoding="utf-8",
+        )
+        resolver = meter.AccountResolver(
+            home=self.home,
+            refresh_seconds=0,
+            cockpit_tools_data_dir=self.data_dir,
+            cockpit_tools_localstorage_db=self.localstorage,
+            cockpit_tools_authoritative_accounts=True,
+        )
+
+        active = resolver.active_subscription_keys(force_refresh=True)
+        cockpit = resolver.cockpit_inventory()
+
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active, cockpit["active_keys"])
+        self.assertTrue(cockpit["owns_active_inventory"])
+
+    def test_terminal_cockpit_error_hides_stale_cli_account_immediately(self) -> None:
+        proxy_dir = self.home / ".cli-proxy-api"
+        proxy_dir.mkdir(parents=True)
+        (proxy_dir / "terminal-member.json").write_text(
+            json.dumps(
+                {
+                    "type": "codex",
+                    "account_id": self.workspace_id,
+                    "email": self.email,
+                    "user_id": "user-fixture",
+                    "access_token": "stale-cli-token-never-persist",
+                }
+            ),
+            encoding="utf-8",
+        )
+        baseline = self.importer.import_once()
+        self.assertEqual(baseline["quota_rows"], 2)
+        self.assertEqual(len(self.repo.subscription_dashboard_rows()), 1)
+
+        terminal = dict(self.account_record)
+        terminal["quota"] = None
+        terminal["quota_error"] = {
+            "code": "deactivated_workspace",
+            "message": "private upstream error body must never persist",
+        }
+        self._write_accounts(terminal)
+        result = self.importer.import_once()
+
+        self.assertEqual(result["quota_rows"], 0)
+        self.assertEqual(self.resolver.active_subscription_keys(), set())
+        self.assertEqual(self.repo.subscription_dashboard_rows(), [])
+        status = self.importer.status()["inventory"]
+        self.assertEqual((status["active"], status["suspect"]), (0, 1))
+        safe_records = self.resolver.cockpit_account_records()
+        self.assertEqual(
+            safe_records[0]["terminal_error_code"],
+            "deactivated_workspace",
+        )
+        self.assertNotIn("private upstream error body", json.dumps(safe_records))
+
+    def test_complete_cache_removal_overrides_stale_index_and_cli_auth(self) -> None:
+        proxy_dir = self.home / ".cli-proxy-api"
+        proxy_dir.mkdir(parents=True)
+        (proxy_dir / "removed-member.json").write_text(
+            json.dumps(
+                {
+                    "type": "codex",
+                    "account_id": self.workspace_id,
+                    "email": self.email,
+                    "user_id": "user-fixture",
+                    "access_token": "stale-cli-token-never-persist",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.importer.import_once()
+        self.assertEqual(len(self.repo.subscription_dashboard_rows()), 1)
+
+        # Keep codex_accounts.json unchanged, matching Cockpit's stale index,
+        # but remove the credential from its complete WebKit cache.
+        with sqlite3.connect(self.localstorage) as connection:
+            connection.execute(
+                "UPDATE ItemTable SET value=? WHERE key=?",
+                (
+                    json.dumps([]).encode("utf-16le"),
+                    meter.COCKPIT_TOOLS_ACCOUNT_CACHE_KEY,
+                ),
+            )
+        result = self.importer.import_once()
+
+        self.assertEqual(result["quota_rows"], 0)
+        self.assertEqual(self.resolver.active_subscription_keys(), set())
+        self.assertEqual(self.repo.subscription_dashboard_rows(), [])
+        status = self.importer.status()["inventory"]
+        self.assertEqual((status["active"], status["suspect"]), (0, 1))
+        records = self.resolver.cockpit_account_records()
+        self.assertTrue(records[0]["credential_cache_missing"])
+
+    def test_only_exact_terminal_cockpit_error_codes_suppress_accounts(self) -> None:
+        for code, expected in (
+            ("token_invalidated", "token_invalidated"),
+            ("deactivated_workspace", "deactivated_workspace"),
+            ("usage_limit_reached", None),
+            ("arbitrary_provider_error", None),
+        ):
+            with self.subTest(code=code):
+                record = dict(self.account_record)
+                record["quota_error"] = {
+                    "code": code,
+                    "message": "never retain this message",
+                }
+                safe = self.resolver._safe_cockpit_account_record(record)
+                assert safe is not None
+                self.assertEqual(safe["terminal_error_code"], expected)
+                self.assertNotIn("never retain this message", json.dumps(safe))
+
     def test_fallback_identity_migrates_when_structured_cache_arrives(self) -> None:
         sparse = dict(self.account_record)
         sparse.pop("account_id")
