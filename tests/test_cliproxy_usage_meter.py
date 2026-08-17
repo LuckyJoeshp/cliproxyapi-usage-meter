@@ -1666,23 +1666,20 @@ class UsageMeterMVPTest(unittest.TestCase):
         row = self.rows("SELECT stream, total_tokens FROM usage_events")[0]
         self.assertEqual(tuple(row), (1, 3))
 
-    def test_response_timeline_is_dense_exact_and_source_filterable(self) -> None:
+    def test_response_timeline_is_dense_exact_and_all_api_only(self) -> None:
         now = datetime(2026, 8, 17, 12, 32, 59, tzinfo=timezone.utc)
         with self.sidecar.repo.connect() as conn:
             conn.executemany(
-                """INSERT INTO usage_events
-                   (ts, identity_key, model, status_code, ok, duration_ms,
-                    stream, usage_missing, request_bytes, response_bytes,
-                    call_count, source)
-                   VALUES (?, 'unknown', 'fixture-model', ?, ?, 0, 0, 1,
-                           0, 0, ?, ?)""",
+                """INSERT INTO api_response_observations
+                   (observation_key, minute_ts, status_code, call_count, source)
+                   VALUES (?, ?, ?, ?, ?)""",
                 (
-                    ("2026-08-17T12:30:00.000000Z", 200, 1, 1, "sidecar"),
-                    ("2026-08-17T12:31:10.000000Z", 200, 1, 3, "sidecar"),
-                    ("2026-08-17T12:32:01.000000Z", 201, 1, 2, "sidecar"),
-                    ("2026-08-17T12:32:40.000000Z", 502, 0, 4, "cockpit_tools"),
-                    ("2026-08-17T12:32:45.000000Z", 200, 1, 5, "manual_codex_app"),
-                    ("2026-08-17T12:29:59.000000Z", 500, 0, 7, "sidecar"),
+                    ("fixture-1", "2026-08-17T12:30:00Z", 200, 1, "sidecar"),
+                    ("fixture-2", "2026-08-17T12:31:00Z", 200, 3, "usage_queue"),
+                    ("fixture-3", "2026-08-17T12:32:00Z", 201, 2, "sidecar"),
+                    ("fixture-4", "2026-08-17T12:32:00Z", 502, 4, "cockpit_tools"),
+                    ("fixture-5", "2026-08-17T12:32:00Z", 200, 5, "manual_codex_app"),
+                    ("fixture-6", "2026-08-17T12:29:00Z", 500, 7, "sidecar"),
                 ),
             )
 
@@ -1710,18 +1707,13 @@ class UsageMeterMVPTest(unittest.TestCase):
                 "total": 10,
             },
         )
-        cockpit = self.sidecar.repo.response_timeline(
-            3, now=now, source="cockpit_tools"
+        self.assertEqual(
+            timeline["sources"],
+            ["sidecar", "usage_queue", "cockpit_tools"],
         )
-        self.assertEqual(cockpit["totals"]["status_200"], 0)
-        self.assertEqual(cockpit["totals"]["status_non_200"], 4)
-        all_events = self.sidecar.repo.response_timeline(3, now=now, source="all")
-        self.assertEqual(all_events["totals"]["status_200"], 9)
-        self.assertEqual(all_events["totals"]["status_non_200"], 6)
+        self.assertEqual(timeline["source"], "api")
         with self.assertRaises(ValueError):
             self.sidecar.repo.response_timeline(0, now=now)
-        with self.assertRaises(ValueError):
-            self.sidecar.repo.response_timeline(3, now=now, source="bad/source")
 
     def test_dashboard_and_all_required_cli_queries(self) -> None:
         self.request("POST", "/v1/responses", {"model": "fake-responses"})
@@ -1748,6 +1740,7 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertIn(b'data-role="timeline-line-200"', page)
         self.assertIn(b'data-role="timeline-line-non-200"', page)
         self.assertIn(b'/usage/timeline?minutes=1440', page)
+        self.assertNotIn(b'data-role="timeline-source"', page)
         self.assertIn(b'--paper:#fff4dd', page)
         self.assertIn(b'box-shadow:var(--shadow)', page)
         self.assertIn(b'data-role="theme-toggle"', page)
@@ -1773,6 +1766,11 @@ class UsageMeterMVPTest(unittest.TestCase):
         )
         self.assertEqual(invalid_status, 400)
         self.assertEqual(json.loads(invalid_body)["error"], "invalid timeline query")
+        scoped_status, _, scoped_body = self.request(
+            "GET", "/usage/timeline?minutes=60&source=cockpit_tools", None, alias=None
+        )
+        self.assertEqual(scoped_status, 400)
+        self.assertEqual(json.loads(scoped_body)["error"], "invalid timeline query")
         health_status, health_headers, health_body = self.request(
             "GET", "/healthz", None, alias=None
         )

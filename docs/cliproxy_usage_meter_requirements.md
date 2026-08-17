@@ -538,7 +538,8 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 
 - 同一张折线图展示精确 HTTP 200 与非 200 调用次数，不使用柱状图。
 - 聚合精度为每分钟，空分钟补 0；支持近 1、6、24 小时切换。
-- 支持全部 API、Cockpit Tools、8327 sidecar 和 8317 usage queue 来源筛选。
+- 固定合并 Cockpit Tools、8327 sidecar 和 8317 usage queue 的全部 API，不提供来源筛选。
+- 响应分钟使用不含账号信息的独立观测，账号明细退役不得删除或改变历史响应曲线。
 - 8327 上游连接失败/超时产生的 502 计入非 200；页面明确说明“无请求”不能等同于“服务正常”。
 - 图表适配现有明暗主题、移动端、键盘浏览和悬停明细。
 
@@ -579,7 +580,7 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 6. 测 `Authorization` header 不落库、不打印，只保存 hash。
 7. 如实现 streaming，至少测试 SSE 透传不被破坏。
 8. 测 HTML dashboard 可访问并显示总调用次数。
-9. 测 `/usage/timeline` 空分钟补零、精确 200/非 200 分类与来源筛选。
+9. 测 `/usage/timeline` 空分钟补零、精确 200/非 200 分类、全部 API 合并与账号退役后曲线保留。
 10. 测 CLI summary / recent / by-account / by-model / quota-summary。
 
 ## 17. 启动方式建议

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import sqlite3
 import tempfile
@@ -370,6 +371,51 @@ class CockpitToolsImporterTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(
             all(abs(row["estimated_api_cost_usd"] - 0.00528) < 1e-12 for row in rows)
+        )
+
+    def test_response_timeline_survives_retirement_and_raw_log_backfill(self) -> None:
+        self._insert_request("retired-response-fixture", 1_786_665_600)
+        self.assertEqual(self.importer.import_once()["imported"], 1)
+        now = datetime(2026, 8, 14, 0, 0, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            self.repo.response_timeline(1, now=now)["totals"]["status_200"],
+            1,
+        )
+
+        identity_key = self._usage_rows()[0]["identity_key"]
+        with self.repo.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            removed = self.repo._anonymize_subscription_conn(
+                connection,
+                identity_key,
+            )
+        self.assertEqual(removed["usage_events"], 1)
+        self.assertEqual(len(self._usage_rows()), 0)
+        self.assertEqual(
+            self.repo.response_timeline(1, now=now)["totals"]["status_200"],
+            1,
+        )
+
+        # Simulate upgrading an existing database after its account detail was
+        # already retired.  The one-time raw Cockpit replay must restore only
+        # the anonymous minute/status observation, never the retired detail.
+        with self.repo.connect() as connection:
+            connection.execute("DELETE FROM api_response_observations")
+            connection.execute(
+                "DELETE FROM api_response_backfills WHERE source=?",
+                (meter.COCKPIT_TOOLS_REQUEST_SOURCE,),
+            )
+        replay = self.importer.import_once()
+        self.assertEqual((replay["imported"], replay["scanned"]), (0, 1))
+        self.assertEqual(len(self._usage_rows()), 0)
+        timeline = self.repo.response_timeline(1, now=now)
+        self.assertEqual(
+            timeline["totals"],
+            {
+                "status_200": 1,
+                "status_non_200": 0,
+                "total": 1,
+            },
         )
 
     def test_zero_rate_tokens_stay_unpriced_and_millisecond_time_is_normalized(self) -> None:

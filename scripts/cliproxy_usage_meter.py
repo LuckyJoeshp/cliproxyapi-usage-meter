@@ -82,9 +82,10 @@ MAX_COCKPIT_TOOLS_CACHE_BYTES = 16 * 1024 * 1024
 COCKPIT_TOOLS_REQUEST_SOURCE = "cockpit_tools"
 COCKPIT_TOOLS_QUOTA_SOURCE = "cockpit_tools_quota"
 # Sources that represent an actual API request/response.  Local Codex token
-# imports and manual imports intentionally stay out of the response health
-# timeline unless the caller explicitly asks for ``source=all``.
+# imports and manual imports have no HTTP response status and intentionally
+# stay out of the response health timeline.
 RESPONSE_TIMELINE_SOURCES = ("sidecar", "usage_queue", COCKPIT_TOOLS_REQUEST_SOURCE)
+RESPONSE_OBSERVATION_BACKFILL_VERSION = 1
 DEFAULT_RESPONSE_TIMELINE_MINUTES = 24 * 60
 MAX_RESPONSE_TIMELINE_MINUTES = 7 * 24 * 60
 MAX_MANUAL_IMPORT_BYTES = 64 * 1024
@@ -2413,6 +2414,20 @@ class UsageRepository:
                   updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS api_response_observations (
+                  observation_key TEXT PRIMARY KEY,
+                  minute_ts TEXT NOT NULL,
+                  status_code INTEGER,
+                  call_count INTEGER NOT NULL DEFAULT 1,
+                  source TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS api_response_backfills (
+                  source TEXT PRIMARY KEY,
+                  version INTEGER NOT NULL,
+                  completed_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS anonymous_usage_daily (
                   bucket_start TEXT NOT NULL,
                   model TEXT NOT NULL,
@@ -2552,6 +2567,8 @@ class UsageRepository:
                   ON local_import_files(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_local_import_bindings_updated
                   ON local_import_bindings(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_api_response_observations_minute_source
+                  ON api_response_observations(minute_ts, source);
                 CREATE INDEX IF NOT EXISTS idx_anonymous_usage_daily_bucket
                   ON anonymous_usage_daily(bucket_start);
                 CREATE INDEX IF NOT EXISTS idx_active_subscription_registry_state
@@ -2560,6 +2577,42 @@ class UsageRepository:
                   ON retired_subscription_tombstones(retired_at);
                 """
             )
+            # Seed the identity-free response ledger from every API event that
+            # still has a live detail row.  Imported events use their stable,
+            # opaque import key so future repricing scans update the same
+            # observation.  Cockpit's one-time raw-log backfill restores
+            # observations whose account detail was already privacy-retired.
+            usage_event_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(usage_events)")
+            }
+            response_columns = {"id", "ts", "status_code", "call_count", "source"}
+            if response_columns <= usage_event_columns:
+                placeholders = ",".join("?" for _ in RESPONSE_TIMELINE_SOURCES)
+                conn.execute(
+                    f"""
+                    INSERT INTO api_response_observations (
+                      observation_key, minute_ts, status_code, call_count, source
+                    )
+                    SELECT CASE WHEN imported.import_key IS NOT NULL
+                                  THEN 'import:' || imported.import_key
+                                  ELSE 'usage:' || usage_events.id END,
+                           strftime('%Y-%m-%dT%H:%M:00Z', usage_events.ts),
+                           usage_events.status_code,
+                           MAX(COALESCE(usage_events.call_count, 1), 1),
+                           usage_events.source
+                      FROM usage_events
+                      LEFT JOIN local_import_records imported
+                        ON imported.usage_event_id=usage_events.id
+                     WHERE usage_events.source IN ({placeholders})
+                       AND strftime('%Y-%m-%dT%H:%M:00Z', usage_events.ts) IS NOT NULL
+                    ON CONFLICT(observation_key) DO UPDATE SET
+                      minute_ts=excluded.minute_ts,
+                      status_code=excluded.status_code,
+                      call_count=excluded.call_count,
+                      source=excluded.source
+                    """,
+                    RESPONSE_TIMELINE_SOURCES,
+                )
             conn.executescript(
                 """
                 DROP VIEW IF EXISTS usage_statistics;
@@ -4272,7 +4325,16 @@ class UsageRepository:
                 f"INSERT INTO usage_events ({','.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
             )
-            return int(cursor.lastrowid), identity_allowed
+            event_id = int(cursor.lastrowid)
+            self._upsert_api_response_observation_conn(
+                conn,
+                f"usage:{event_id}",
+                event.ts,
+                event.status_code,
+                event.call_count,
+                values["source"],
+            )
+            return event_id, identity_allowed
 
     @staticmethod
     def _minimized_event_values(event: UsageEvent) -> dict[str, Any]:
@@ -4308,6 +4370,50 @@ class UsageRepository:
         values["request_bytes"] = 0
         values["response_bytes"] = 0
         return values
+
+    @staticmethod
+    def _upsert_api_response_observation_conn(
+        conn: sqlite3.Connection,
+        observation_key: str,
+        timestamp: Any,
+        status_code: Any,
+        call_count: Any,
+        source: Any,
+    ) -> None:
+        """Persist identity-free HTTP response metadata at minute precision."""
+
+        safe_source = safe_alias(source)
+        safe_key = safe_text(observation_key, 512)
+        normalized = normalize_optional_timestamp(timestamp)
+        if (
+            safe_source not in RESPONSE_TIMELINE_SOURCES
+            or not safe_key
+            or not normalized
+        ):
+            return
+        parsed_status = as_nonnegative_int(status_code)
+        if parsed_status is not None and not 100 <= parsed_status <= 599:
+            parsed_status = None
+        calls = max(as_nonnegative_int(call_count) or 1, 1)
+        conn.execute(
+            """
+            INSERT INTO api_response_observations (
+              observation_key, minute_ts, status_code, call_count, source
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(observation_key) DO UPDATE SET
+              minute_ts=excluded.minute_ts,
+              status_code=excluded.status_code,
+              call_count=excluded.call_count,
+              source=excluded.source
+            """,
+            (
+                safe_key,
+                f"{normalized[:16]}:00Z",
+                parsed_status,
+                calls,
+                safe_source,
+            ),
+        )
 
     @staticmethod
     def _subscription_detail_allowed_conn(
@@ -4479,10 +4585,29 @@ class UsageRepository:
         placeholders = ",".join("?" for _ in columns)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if conn.execute(
-                "SELECT 1 FROM local_import_records WHERE import_key=?", (safe_key,)
-            ).fetchone():
+            imported = conn.execute(
+                "SELECT source FROM local_import_records WHERE import_key=?",
+                (safe_key,),
+            ).fetchone()
+            if imported is not None:
+                if imported["source"] == safe_source:
+                    self._upsert_api_response_observation_conn(
+                        conn,
+                        f"import:{safe_key}",
+                        event.ts,
+                        event.status_code,
+                        event.call_count,
+                        safe_source,
+                    )
                 return False
+            self._upsert_api_response_observation_conn(
+                conn,
+                f"import:{safe_key}",
+                event.ts,
+                event.status_code,
+                event.call_count,
+                safe_source,
+            )
             canonical_key = canonical_subscription_key(event.identity_key)
             if canonical_key and not self._subscription_detail_allowed_conn(
                 conn, canonical_key
@@ -4527,13 +4652,23 @@ class UsageRepository:
                      WHERE import_key=?""",
                 (safe_key,),
             ).fetchone()
+            if imported is not None and imported["source"] != safe_source:
+                return False
+            self._upsert_api_response_observation_conn(
+                conn,
+                f"import:{safe_key}",
+                event.ts,
+                event.status_code,
+                event.call_count,
+                safe_source,
+            )
             canonical_key = canonical_subscription_key(event.identity_key)
             identity_allowed = bool(
                 canonical_key
                 and self._subscription_detail_allowed_conn(conn, canonical_key)
             )
             if imported is not None:
-                if imported["source"] != safe_source or imported["usage_event_id"] is None:
+                if imported["usage_event_id"] is None:
                     return False
                 existing = conn.execute(
                     "SELECT identity_key FROM usage_events WHERE id=?",
@@ -4576,6 +4711,41 @@ class UsageRepository:
                 (source,),
             ).fetchone()
         return dict(row)
+
+    def api_response_backfill_required(
+        self,
+        source: str,
+        version: int = RESPONSE_OBSERVATION_BACKFILL_VERSION,
+    ) -> bool:
+        safe_source = safe_alias(source)
+        if safe_source not in RESPONSE_TIMELINE_SOURCES:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT version FROM api_response_backfills WHERE source=?",
+                (safe_source,),
+            ).fetchone()
+        return row is None or int(row["version"] or 0) < int(version)
+
+    def mark_api_response_backfill(
+        self,
+        source: str,
+        version: int = RESPONSE_OBSERVATION_BACKFILL_VERSION,
+    ) -> None:
+        safe_source = safe_alias(source)
+        if safe_source not in RESPONSE_TIMELINE_SOURCES:
+            raise ValueError("invalid API response source")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_response_backfills (source, version, completed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                  version=excluded.version,
+                  completed_at=excluded.completed_at
+                """,
+                (safe_source, int(version), utc_now()),
+            )
 
     @staticmethod
     def _local_import_path_key(path: Path | str) -> str:
@@ -5119,19 +5289,18 @@ class UsageRepository:
         minutes: int = DEFAULT_RESPONSE_TIMELINE_MINUTES,
         *,
         now: datetime | None = None,
-        source: str = "api",
     ) -> dict[str, Any]:
-        """Return a dense one-minute HTTP response-status timeline.
+        """Return the dense all-API one-minute HTTP response timeline.
 
         ``status_200`` deliberately means *exactly* HTTP 200.  Every other
         status (including the synthetic 502 recorded when the upstream does
-        not answer) is counted in ``status_non_200``.  The default ``api``
-        scope includes proxy, usage-queue, and Cockpit Tools request events;
-        local token imports are not API responses and are excluded unless the
-        caller requests ``source=all`` or a concrete source.
+        not answer) is counted in ``status_non_200``.  The fixed all-API scope
+        includes proxy, usage-queue, and Cockpit Tools request events.  Local
+        token imports are not API responses and are always excluded.
 
         The returned buckets are UTC and include zero-valued minutes so a
         client can draw a continuous line without inventing missing samples.
+        Observations are identity-free and survive account-detail retirement;
         ``now`` is injectable for deterministic callers and tests.
         """
 
@@ -5144,10 +5313,6 @@ class UsageRepository:
                 f"minutes must be between 1 and {MAX_RESPONSE_TIMELINE_MINUTES}"
             )
 
-        scope = (safe_text(source, 64) or "api").lower()
-        if scope != "all" and scope != "api" and not safe_alias(scope):
-            raise ValueError("source must be api, all, or a safe source name")
-
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
@@ -5155,27 +5320,13 @@ class UsageRepository:
         start = current - timedelta(minutes=window_minutes - 1)
         end = current + timedelta(minutes=1)
         start_text = start.isoformat(timespec="seconds").replace("+00:00", "Z")
-        query_start_text = start.isoformat(timespec="microseconds").replace(
-            "+00:00", "Z"
-        )
-        query_end_text = end.isoformat(timespec="microseconds").replace(
-            "+00:00", "Z"
-        )
-
-        source_clause = ""
-        source_params: list[Any] = []
-        if scope == "api":
-            placeholders = ",".join("?" for _ in RESPONSE_TIMELINE_SOURCES)
-            source_clause = f" AND source IN ({placeholders})"
-            source_params.extend(RESPONSE_TIMELINE_SOURCES)
-        elif scope != "all":
-            source_clause = " AND source=?"
-            source_params.append(scope)
+        end_text = end.isoformat(timespec="seconds").replace("+00:00", "Z")
+        placeholders = ",".join("?" for _ in RESPONSE_TIMELINE_SOURCES)
 
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT strftime('%Y-%m-%dT%H:%M:00Z', ts) AS bucket,
+                SELECT minute_ts AS bucket,
                        COALESCE(SUM(CASE WHEN status_code=200
                                          THEN call_count ELSE 0 END), 0)
                          AS status_200,
@@ -5183,11 +5334,12 @@ class UsageRepository:
                                               OR status_code!=200
                                          THEN call_count ELSE 0 END), 0)
                          AS status_non_200
-                  FROM usage_events
-                 WHERE ts>=? AND ts<?{source_clause}
+                  FROM api_response_observations
+                 WHERE minute_ts>=? AND minute_ts<?
+                   AND source IN ({placeholders})
                  GROUP BY bucket
                 """,
-                (query_start_text, query_end_text, *source_params),
+                (start_text, end_text, *RESPONSE_TIMELINE_SOURCES),
             ).fetchall()
 
         by_bucket = {
@@ -5218,10 +5370,8 @@ class UsageRepository:
             "interval": "1m",
             "window_minutes": window_minutes,
             "timezone": "UTC",
-            "source": scope,
-            "sources": list(RESPONSE_TIMELINE_SOURCES)
-            if scope == "api"
-            else (["all"] if scope == "all" else [scope]),
+            "source": "api",
+            "sources": list(RESPONSE_TIMELINE_SOURCES),
             "from": start_text,
             "to": current.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "totals": {
@@ -7193,7 +7343,15 @@ class CockpitToolsImporter:
             state = self.repo.local_import_file_state(self.database_path) or {}
             cursor_id = as_nonnegative_int(state.get("offset")) or 0
             previous_version = as_nonnegative_int(state.get("size")) or 0
+            response_backfill = self.repo.api_response_backfill_required(
+                COCKPIT_TOOLS_REQUEST_SOURCE
+            )
             if max_id < cursor_id or (state and max_version != previous_version):
+                cursor_id = 0
+            if response_backfill:
+                # Versioned, idempotent replay restores the minute/status
+                # observations for historical request rows whose account-level
+                # usage detail was already removed by privacy retirement.
                 cursor_id = 0
             columns = ", ".join(self.REQUIRED_REQUEST_COLUMNS)
             rows = connection.execute(
@@ -7226,6 +7384,8 @@ class CockpitToolsImporter:
                 "offset": max_id,
             }
         )
+        if response_backfill:
+            self.repo.mark_api_response_backfill(COCKPIT_TOOLS_REQUEST_SOURCE)
         return {
             "imported": imported,
             "scanned": scanned,
@@ -8565,12 +8725,12 @@ RESPONSE_TIMELINE_CSS = """
 .response-timeline-panel{overflow:hidden;background-color:var(--card);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:16px 16px}
 .timeline-toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:center;padding:17px 18px;border-bottom:2px solid var(--ink);background:color-mix(in srgb,var(--sky) 24%,var(--card))}
 .timeline-kpis{display:flex;min-width:0;flex-wrap:wrap;gap:9px}.timeline-kpi{display:grid;grid-template-columns:11px auto;grid-template-rows:auto auto;column-gap:8px;min-width:122px;padding:8px 10px;border:1.5px solid var(--ink);border-radius:10px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink)}.timeline-kpi i{grid-row:1/3;align-self:center;width:10px;height:10px;border:1.5px solid var(--ink);border-radius:50%}.timeline-kpi span{color:var(--ink-3);font:800 8px/1.1 var(--font-mono);letter-spacing:.07em;text-transform:uppercase}.timeline-kpi strong{margin-top:3px;font:900 15px/1 var(--font-display)}.timeline-kpi.ok i{background:var(--mint)}.timeline-kpi.bad i{background:var(--rose)}.timeline-kpi.rate i{background:var(--lavender)}.timeline-kpi.last i{background:var(--sun)}
-.timeline-controls{display:flex;align-items:center;justify-content:flex-end;gap:9px}.timeline-range{display:inline-flex;padding:3px;border:1.5px solid var(--ink);border-radius:10px;background:var(--paper);box-shadow:2px 2px 0 var(--shadow-ink)}.timeline-range button{min-width:47px;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:var(--ink-2);font:800 9px/1 var(--font-mono);cursor:pointer}.timeline-range button:hover{background:color-mix(in srgb,var(--sky) 30%,transparent);color:var(--ink)}.timeline-range button.is-active{background:var(--ink);color:var(--paper)}.timeline-source{display:flex;align-items:center;gap:7px;padding:6px 8px;border:1.5px solid var(--ink);border-radius:10px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-3);font:800 8px/1 var(--font-mono);text-transform:uppercase}.timeline-source select{max-width:145px;border:0;outline:0;background:transparent;color:var(--ink);font:800 9px/1 var(--font-mono);cursor:pointer}
+.timeline-controls{display:flex;align-items:center;justify-content:flex-end;gap:9px}.timeline-range{display:inline-flex;padding:3px;border:1.5px solid var(--ink);border-radius:10px;background:var(--paper);box-shadow:2px 2px 0 var(--shadow-ink)}.timeline-range button{min-width:47px;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:var(--ink-2);font:800 9px/1 var(--font-mono);cursor:pointer}.timeline-range button:hover{background:color-mix(in srgb,var(--sky) 30%,transparent);color:var(--ink)}.timeline-range button.is-active{background:var(--ink);color:var(--paper)}
 .timeline-chart-wrap{position:relative;padding:12px 18px 0}.timeline-chart-scroll{overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}.response-timeline-chart{display:block;width:100%;min-width:720px;height:auto;aspect-ratio:10/3;overflow:visible}.response-timeline-chart [hidden]{display:none}.timeline-plot-bg{fill:color-mix(in srgb,var(--paper) 76%,transparent);stroke:color-mix(in srgb,var(--ink) 45%,transparent);stroke-width:1;vector-effect:non-scaling-stroke}.timeline-grid-line{stroke:color-mix(in srgb,var(--ink) 20%,transparent);stroke-width:1;stroke-dasharray:4 6;vector-effect:non-scaling-stroke}.timeline-grid-line.vertical{stroke-dasharray:2 8}.timeline-axis-label{fill:var(--ink-3);font:700 20px/1 var(--font-mono)}.timeline-line{fill:none;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke;transition:.18s opacity}.timeline-line-200{stroke:var(--mint);stroke-width:4}.timeline-line-non-200{stroke:var(--orange);stroke-width:3.5;stroke-dasharray:8 5}.timeline-error-area{fill:url(#timeline-error-gradient);opacity:.42}.timeline-crosshair{stroke:var(--ink);stroke-width:1.5;stroke-dasharray:4 4;vector-effect:non-scaling-stroke;pointer-events:none}.timeline-marker{stroke:var(--ink);stroke-width:2.5;vector-effect:non-scaling-stroke;pointer-events:none}.timeline-marker.ok{fill:var(--mint)}.timeline-marker.bad{fill:var(--orange)}.timeline-hit-area{fill:transparent;cursor:crosshair}.timeline-empty{fill:var(--ink-3);font:900 24px/1 var(--font-display);text-anchor:middle}.response-timeline-panel.is-loading .timeline-line{opacity:.48}
 .timeline-tooltip{position:absolute;z-index:6;width:190px;padding:11px 12px;border:var(--border);border-radius:10px;background:var(--card);box-shadow:var(--shadow-sm);pointer-events:none}.timeline-tooltip strong{display:block;margin-bottom:8px;font:900 12px/1.2 var(--font-display)}.timeline-tooltip div{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:6px;color:var(--ink-2);font:700 10px/1.2 var(--font-mono)}.timeline-tooltip span{display:flex;align-items:center;gap:6px}.timeline-tooltip i{width:8px;height:8px;border:1px solid var(--ink);border-radius:50%}.timeline-tooltip i.ok{background:var(--mint)}.timeline-tooltip i.bad{background:var(--orange)}.timeline-tooltip b{color:var(--ink)}.timeline-tooltip small{display:block;margin-top:8px;padding-top:7px;border-top:1px solid color-mix(in srgb,var(--ink) 28%,transparent);color:var(--ink-3);font:700 9px/1.3 var(--font-mono)}
 .timeline-meta{display:flex;min-width:0;align-items:center;justify-content:space-between;gap:16px;padding:9px 18px 14px}.timeline-legend{display:flex;flex-wrap:wrap;gap:12px 18px;color:var(--ink-2);font:700 10px/1.2 var(--font-mono)}.timeline-legend span{display:flex;align-items:center;gap:7px}.timeline-legend i{width:22px;height:4px;border:1px solid var(--ink);border-radius:999px}.timeline-legend .ok{background:var(--mint)}.timeline-legend .bad{height:3px;background:repeating-linear-gradient(90deg,var(--orange) 0 7px,transparent 7px 11px)}.timeline-sync{min-width:0;color:var(--ink-3);font:700 9px/1.3 var(--font-mono);text-align:right;overflow-wrap:anywhere}.timeline-footnote{padding:11px 18px;border-top:1.5px solid color-mix(in srgb,var(--ink) 42%,transparent);background:color-mix(in srgb,var(--watch) 42%,var(--card));color:var(--ink-2);font-size:11px}.timeline-footnote code{padding:2px 5px;border:1px solid color-mix(in srgb,var(--ink) 42%,transparent);border-radius:5px;background:var(--paper);color:var(--ink);font:700 9px/1 var(--font-mono)}
-@media(max-width:920px){.timeline-toolbar{grid-template-columns:minmax(0,1fr)}.timeline-controls{justify-content:space-between}.timeline-source{margin-left:auto}}
-@media(max-width:620px){.timeline-toolbar{padding:14px}.timeline-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.timeline-kpi{min-width:0}.timeline-controls{align-items:stretch;flex-direction:column}.timeline-range{display:grid;grid-template-columns:repeat(3,1fr)}.timeline-source{width:100%;margin-left:0;justify-content:space-between}.timeline-source select{max-width:none}.timeline-chart-wrap{padding-left:10px;padding-right:10px}.timeline-meta{align-items:flex-start;flex-direction:column}.timeline-sync{text-align:left}}
+@media(max-width:920px){.timeline-toolbar{grid-template-columns:minmax(0,1fr)}.timeline-controls{justify-content:flex-start}}
+@media(max-width:620px){.timeline-toolbar{padding:14px}.timeline-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.timeline-kpi{min-width:0}.timeline-controls{align-items:stretch}.timeline-range{display:grid;grid-template-columns:repeat(3,1fr);width:100%}.timeline-chart-wrap{padding-left:10px;padding-right:10px}.timeline-meta{align-items:flex-start;flex-direction:column}.timeline-sync{text-align:left}}
 """
 
 
@@ -8592,7 +8752,6 @@ RESPONSE_TIMELINE_SCRIPT = """
   const emptyState = root.querySelector('[data-role="timeline-empty"]');
   const tooltip = root.querySelector('[data-role="timeline-tooltip"]');
   const chartWrap = root.querySelector('.timeline-chart-wrap');
-  const sourceSelect = root.querySelector('[data-role="timeline-source"]');
   const syncLabel = root.querySelector('[data-role="timeline-sync"]');
   if (!svg || !grid || !line200 || !lineNon200 || !errorArea || !hitArea || !tooltip) return;
 
@@ -8624,16 +8783,6 @@ RESPONSE_TIMELINE_SCRIPT = """
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return '—';
     return (compact ? compactTimeFormat : timeFormat).format(date).replace(/\//g, '-');
-  }
-
-  function sourceName(value) {
-    return {
-      api: '全部 API',
-      cockpit_tools: 'Cockpit Tools',
-      sidecar: '8327 代理',
-      usage_queue: '8317 队列',
-      all: '全部事件'
-    }[value] || value || '全部 API';
   }
 
   function niceMaximum(raw) {
@@ -8812,18 +8961,15 @@ RESPONSE_TIMELINE_SCRIPT = """
         Number(button.dataset.minutes) === Number(nextPayload.window_minutes)
       );
     });
-    if (sourceSelect && [...sourceSelect.options].some((option) => option.value === nextPayload.source)) {
-      sourceSelect.value = nextPayload.source;
-    }
     roleText(
       'timeline-sync',
-      sourceName(nextPayload.source) + ' · 每分钟 · 更新至 ' +
+      '全部 API · 每分钟 · 更新至 ' +
       localTime(nextPayload.to || points[points.length - 1].ts, false)
     );
     hideTooltip();
   }
 
-  async function load(minutes, source) {
+  async function load(minutes) {
     if (requestController) requestController.abort();
     requestController = new AbortController();
     root.classList.add('is-loading');
@@ -8831,7 +8977,6 @@ RESPONSE_TIMELINE_SCRIPT = """
     try {
       const url = new URL(root.dataset.endpoint, window.location.href);
       url.searchParams.set('minutes', String(minutes));
-      url.searchParams.set('source', source);
       const response = await fetch(url, {
         cache: 'no-store',
         headers: {'Accept': 'application/json'},
@@ -8842,7 +8987,6 @@ RESPONSE_TIMELINE_SCRIPT = """
       render(nextPayload);
       try {
         localStorage.setItem('cliproxy-timeline-minutes', String(minutes));
-        localStorage.setItem('cliproxy-timeline-source', source);
       } catch (error) {}
     } catch (error) {
       if (error.name !== 'AbortError' && syncLabel) {
@@ -8870,14 +9014,9 @@ RESPONSE_TIMELINE_SCRIPT = """
   });
   root.querySelectorAll('[data-minutes]').forEach((button) => {
     button.addEventListener('click', () => {
-      load(Number(button.dataset.minutes), sourceSelect ? sourceSelect.value : 'api');
+      load(Number(button.dataset.minutes));
     });
   });
-  if (sourceSelect) {
-    sourceSelect.addEventListener('change', () => {
-      load(Number(payload.window_minutes) || 1440, sourceSelect.value);
-    });
-  }
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
@@ -8893,21 +9032,16 @@ RESPONSE_TIMELINE_SCRIPT = """
   }
 
   let preferredMinutes = Number(payload.window_minutes) || 1440;
-  let preferredSource = payload.source || 'api';
   try {
     const storedMinutes = Number(localStorage.getItem('cliproxy-timeline-minutes'));
-    const storedSource = localStorage.getItem('cliproxy-timeline-source');
     if ([60, 360, 1440].includes(storedMinutes)) preferredMinutes = storedMinutes;
-    if (['api', 'cockpit_tools', 'sidecar', 'usage_queue'].includes(storedSource)) {
-      preferredSource = storedSource;
-    }
   } catch (error) {}
-  if (preferredMinutes !== Number(payload.window_minutes) || preferredSource !== payload.source) {
-    load(preferredMinutes, preferredSource);
+  if (preferredMinutes !== Number(payload.window_minutes)) {
+    load(preferredMinutes);
   }
   window.setInterval(() => {
     if (!document.hidden && payload) {
-      load(Number(payload.window_minutes) || 1440, payload.source || 'api');
+      load(Number(payload.window_minutes) || 1440);
     }
   }, 30000);
 })();
@@ -8960,7 +9094,7 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
         else "暂无"
     )
     return f"""
-<div class="section-title"><div><h2>API 响应时间轴</h2><p>HTTP 200 与非 200 双折线；连续到每一分钟，快速定位无响应与异常时段。</p></div><small>默认近 24 小时</small></div>
+<div class="section-title"><div><h2>API 响应时间轴</h2><p>全部 API 的 HTTP 200 与非 200 双折线；连续到每一分钟，快速定位无响应与异常时段。</p></div><small>默认近 24 小时</small></div>
 <section class="panel response-timeline-panel" data-role="response-timeline" data-endpoint="/usage/timeline">
   <div class="timeline-toolbar">
     <div class="timeline-kpis" aria-live="polite">
@@ -8975,12 +9109,6 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
         <button type="button" data-minutes="360">6 小时</button>
         <button type="button" data-minutes="1440" class="is-active">24 小时</button>
       </div>
-      <label class="timeline-source"><span>数据源</span><select data-role="timeline-source" aria-label="时间轴数据源">
-        <option value="api">全部 API</option>
-        <option value="cockpit_tools">Cockpit Tools</option>
-        <option value="sidecar">8327 代理</option>
-        <option value="usage_queue">8317 队列</option>
-      </select></label>
     </div>
   </div>
   <div class="timeline-chart-wrap">
@@ -9007,7 +9135,7 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
     </div>
   </div>
   <div class="timeline-meta"><div class="timeline-legend"><span><i class="ok"></i>HTTP 200</span><span><i class="bad"></i>非 200 / 无上游响应</span></div><div class="timeline-sync" data-role="timeline-sync">全部 API · 每分钟</div></div>
-  <div class="timeline-footnote">无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线。两条线同时为 0 只表示该分钟没有采集到请求，不能单独证明服务可用。JSON 数据可从 <code>/usage/timeline?minutes=1440&amp;source=cockpit_tools</code> 获取。</div>
+  <div class="timeline-footnote">时间轴固定合并 Cockpit Tools、8327 代理与 8317 队列，并写入不含账号信息的分钟观测，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
 </section>
 <script id="response-timeline-data" type="application/json">{payload_json}</script>
 """
@@ -9693,15 +9821,15 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 max_num_fields=8,
             )
             raw_minutes = query.get("minutes", [str(DEFAULT_RESPONSE_TIMELINE_MINUTES)])
-            raw_source = query.get("source", ["api"])
-            if len(raw_minutes) != 1 or len(raw_source) != 1:
+            raw_source = query.get("source")
+            if set(query) - {"minutes", "source"} or len(raw_minutes) != 1:
                 raise ValueError("query parameter must appear once")
+            if raw_source is not None and (
+                len(raw_source) != 1 or raw_source[0] not in {"", "api"}
+            ):
+                raise ValueError("timeline is fixed to all API sources")
             minutes = int(raw_minutes[0])
-            source = raw_source[0] or "api"
-            payload = self.meter_server.repo.response_timeline(
-                minutes,
-                source=source,
-            )
+            payload = self.meter_server.repo.response_timeline(minutes)
             body = json.dumps(
                 payload,
                 ensure_ascii=False,
