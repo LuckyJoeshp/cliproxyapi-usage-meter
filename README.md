@@ -183,22 +183,39 @@ again whenever Codex refreshes credentials. Port changes, API-key rotation,
 and additional Cockpit state fields therefore do not require editing a Codex
 profile or this repository; no application-version comparison is used.
 
-Install the launcher and its sibling helper together:
+Install the launcher, its sibling helper, and the companion long-run
+supervisor:
 
 ```bash
 install -m 755 scripts/codex-cockpit scripts/cockpit-tools-api \
   scripts/cockpit_tools_api.py /opt/homebrew/bin/
+install -m 755 ../codex_default_autorun/scripts/start_codex_default_longrun.sh \
+  /opt/homebrew/bin/codex-default-longrun
 cd /path/to/any/project
-codex-cockpit
+codex-cockpit --longrun-session codex_my_project
 ```
 
 Cockpit Tools' Codex API Service must be enabled and listening on its local
-loopback endpoint. The launcher keeps the caller's working directory and
-passes all arguments to Codex. `COCKPIT_TOOLS_DATA_DIR` selects a non-default
-Cockpit data directory, `COCKPIT_CODEX_PROFILE` selects another base profile,
-and `COCKPIT_CODEX_SKIP_HEALTHCHECK=1` is available for troubleshooting only.
-`COCKPIT_TOOLS_API_URL` can override the endpoint for a loopback-only test;
-the helper refuses LAN/remote URLs so the Cockpit key is not sent elsewhere.
+loopback endpoint. `codex-cockpit` is the single daily entry point. A plain
+interactive launch (optionally with `-C`/`--cd`, one prompt, and
+`--longrun-session`) enters tmux and enables exact-thread crash recovery.
+Without an explicit session name it generates one from the project and time.
+Clean exits, Ctrl-C, and TERM are not restarted; short sessions therefore add
+only local tmux/state-file overhead and no model request or token usage.
+
+Native subcommands such as `exec`, `review`, and `resume`, plus other advanced
+Codex flags, remain direct. `codex-cockpit --direct` is the troubleshooting
+bypass. The internal supervisor remains available for status inspection:
+
+```bash
+codex-default-longrun status --session codex_my_project
+```
+
+`COCKPIT_TOOLS_DATA_DIR` selects a non-default Cockpit data directory,
+`COCKPIT_CODEX_PROFILE` selects another base profile, and
+`COCKPIT_CODEX_SKIP_HEALTHCHECK=1` is available for troubleshooting only.
+`COCKPIT_TOOLS_API_URL` can override the endpoint for a loopback-only test; the
+helper refuses LAN/remote URLs so the Cockpit key is not sent elsewhere.
 
 ### Avoid repeated probes of confirmed exhausted credentials
 
