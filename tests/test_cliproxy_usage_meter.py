@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import http.client
 import importlib.util
 import hashlib
@@ -1665,6 +1666,63 @@ class UsageMeterMVPTest(unittest.TestCase):
         row = self.rows("SELECT stream, total_tokens FROM usage_events")[0]
         self.assertEqual(tuple(row), (1, 3))
 
+    def test_response_timeline_is_dense_exact_and_source_filterable(self) -> None:
+        now = datetime(2026, 8, 17, 12, 32, 59, tzinfo=timezone.utc)
+        with self.sidecar.repo.connect() as conn:
+            conn.executemany(
+                """INSERT INTO usage_events
+                   (ts, identity_key, model, status_code, ok, duration_ms,
+                    stream, usage_missing, request_bytes, response_bytes,
+                    call_count, source)
+                   VALUES (?, 'unknown', 'fixture-model', ?, ?, 0, 0, 1,
+                           0, 0, ?, ?)""",
+                (
+                    ("2026-08-17T12:30:00.000000Z", 200, 1, 1, "sidecar"),
+                    ("2026-08-17T12:31:10.000000Z", 200, 1, 3, "sidecar"),
+                    ("2026-08-17T12:32:01.000000Z", 201, 1, 2, "sidecar"),
+                    ("2026-08-17T12:32:40.000000Z", 502, 0, 4, "cockpit_tools"),
+                    ("2026-08-17T12:32:45.000000Z", 200, 1, 5, "manual_codex_app"),
+                    ("2026-08-17T12:29:59.000000Z", 500, 0, 7, "sidecar"),
+                ),
+            )
+
+        timeline = self.sidecar.repo.response_timeline(3, now=now)
+        self.assertEqual(
+            [point["ts"] for point in timeline["points"]],
+            [
+                "2026-08-17T12:30:00Z",
+                "2026-08-17T12:31:00Z",
+                "2026-08-17T12:32:00Z",
+            ],
+        )
+        self.assertEqual(
+            [
+                (point["status_200"], point["status_non_200"])
+                for point in timeline["points"]
+            ],
+            [(1, 0), (3, 0), (0, 6)],
+        )
+        self.assertEqual(
+            timeline["totals"],
+            {
+                "status_200": 4,
+                "status_non_200": 6,
+                "total": 10,
+            },
+        )
+        cockpit = self.sidecar.repo.response_timeline(
+            3, now=now, source="cockpit_tools"
+        )
+        self.assertEqual(cockpit["totals"]["status_200"], 0)
+        self.assertEqual(cockpit["totals"]["status_non_200"], 4)
+        all_events = self.sidecar.repo.response_timeline(3, now=now, source="all")
+        self.assertEqual(all_events["totals"]["status_200"], 9)
+        self.assertEqual(all_events["totals"]["status_non_200"], 6)
+        with self.assertRaises(ValueError):
+            self.sidecar.repo.response_timeline(0, now=now)
+        with self.assertRaises(ValueError):
+            self.sidecar.repo.response_timeline(3, now=now, source="bad/source")
+
     def test_dashboard_and_all_required_cli_queries(self) -> None:
         self.request("POST", "/v1/responses", {"model": "fake-responses"})
         self.request("POST", "/v1/chat/completions", {"model": "fake-chat", "messages": []})
@@ -1685,11 +1743,36 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertIn("API 原始处理量".encode(), page)
         self.assertIn("调用统计".encode(), page)
         self.assertIn("推理（输出子集）".encode(), page)
+        self.assertIn("API 响应时间轴".encode(), page)
+        self.assertIn("HTTP 200 与非 200 双折线".encode(), page)
+        self.assertIn(b'data-role="timeline-line-200"', page)
+        self.assertIn(b'data-role="timeline-line-non-200"', page)
+        self.assertIn(b'/usage/timeline?minutes=1440', page)
         self.assertIn(b'--paper:#fff4dd', page)
         self.assertIn(b'box-shadow:var(--shadow)', page)
         self.assertIn(b'data-role="theme-toggle"', page)
         self.assertIn(b"cliproxy-usage-theme", page)
         self.assertIn(b"codex-1", page)
+        timeline_status, timeline_headers, timeline_body = self.request(
+            "GET", "/usage/timeline?minutes=60", None, alias=None
+        )
+        self.assertEqual(timeline_status, 200)
+        normalized_timeline_headers = dict(
+            (key.lower(), value) for key, value in timeline_headers
+        )
+        self.assertEqual(normalized_timeline_headers["cache-control"], "no-store")
+        self.assertIn("application/json", normalized_timeline_headers["content-type"])
+        timeline = json.loads(timeline_body)
+        self.assertEqual(timeline["interval"], "1m")
+        self.assertEqual(timeline["window_minutes"], 60)
+        self.assertEqual(len(timeline["points"]), 60)
+        self.assertGreaterEqual(timeline["totals"]["status_200"], 2)
+        self.assertEqual(timeline["totals"]["status_non_200"], 0)
+        invalid_status, _, invalid_body = self.request(
+            "GET", "/usage/timeline?minutes=0", None, alias=None
+        )
+        self.assertEqual(invalid_status, 400)
+        self.assertEqual(json.loads(invalid_body)["error"], "invalid timeline query")
         health_status, health_headers, health_body = self.request(
             "GET", "/healthz", None, alias=None
         )

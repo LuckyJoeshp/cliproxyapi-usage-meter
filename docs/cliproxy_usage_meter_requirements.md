@@ -1,6 +1,6 @@
 # cliproxy Usage Meter Sidecar - 探索/MVP需求文档
 
-更新时间：2026-08-11
+更新时间：2026-08-17
 
 ## 1. 背景
 
@@ -140,6 +140,7 @@ MVP 必须支持：
 - `/v1/responses`
 - `/v1/chat/completions`
 - 其他 `/v1/...` 路径透明转发
+- `/usage/timeline` 返回只读、每分钟的 HTTP 200/非 200 连续时间轴 JSON
 
 行为要求：
 
@@ -533,7 +534,15 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 - estimated API cost USD
 - usage_missing count
 
-### 15.5 quota 看板
+### 15.5 API 响应时间轴
+
+- 同一张折线图展示精确 HTTP 200 与非 200 调用次数，不使用柱状图。
+- 聚合精度为每分钟，空分钟补 0；支持近 1、6、24 小时切换。
+- 支持全部 API、Cockpit Tools、8327 sidecar 和 8317 usage queue 来源筛选。
+- 8327 上游连接失败/超时产生的 502 计入非 200；页面明确说明“无请求”不能等同于“服务正常”。
+- 图表适配现有明暗主题、移动端、键盘浏览和悬停明细。
+
+### 15.6 quota 看板
 
 - 每账号当前周期累计 tokens / estimated USD
 - 是否已打满
@@ -541,7 +550,7 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 - 历史周期 p50 / p20-p80
 - 当前周期 observed_floor_usd
 
-### 15.6 最近请求
+### 15.7 最近请求
 
 最近 50 条：
 
@@ -570,7 +579,8 @@ usage dashboard:     http://127.0.0.1:8327/usage    # 单独看板
 6. 测 `Authorization` header 不落库、不打印，只保存 hash。
 7. 如实现 streaming，至少测试 SSE 透传不被破坏。
 8. 测 HTML dashboard 可访问并显示总调用次数。
-9. 测 CLI summary / recent / by-account / by-model / quota-summary。
+9. 测 `/usage/timeline` 空分钟补零、精确 200/非 200 分类与来源筛选。
+10. 测 CLI summary / recent / by-account / by-model / quota-summary。
 
 ## 17. 启动方式建议
 

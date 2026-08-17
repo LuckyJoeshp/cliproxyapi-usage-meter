@@ -409,9 +409,30 @@ cliproxyapi 或 Cockpit 本体。`/usage` 与
 
 - 累计、今日、近 7 日的实际消耗（非缓存输入 + 输出）、缓存输入、API 原始处理量、
   输出、推理 token、缓存命中率与 API 等价成本。
+- 近 1/6/24 小时的每分钟 HTTP 200 与非 200 双折线时间轴，可筛选全部 API、
+  Cockpit Tools、8327 sidecar 或 8317 usage queue；无上游响应时 sidecar 写入的 502
+  归入非 200 线。
 - 近 7 天 token/cost 柱状趋势。
 - 每个 Codex 订阅的 5 小时与周（Team 可能为月）剩余百分比、重置时间。
 - 每账号当前周期已观测美元下限，以及基于 provider 周/月窗口的 API 等价满额度估值。
+
+### 每分钟响应时间轴 API
+
+页面折线图使用同源、只读 JSON 接口：
+
+```text
+GET /usage/timeline?minutes=1440&source=api
+```
+
+`minutes` 可取 `1`～`10080`（最多 7 天），返回连续的 UTC 分钟桶；没有调用的分钟也会返回
+零值。`source=api` 是默认值，包含 `sidecar`、`usage_queue` 和 `cockpit_tools`；也可指定其中
+一个来源，或使用 `source=all` 查看包括本地/手动导入在内的所有事件。每个 point 的
+`status_200` 只统计精确的 HTTP 200，`status_non_200` 统计其余状态，`total` 为两者之和。
+顶层 `totals` 提供同一窗口汇总。接口带 `Cache-Control: no-store`，不返回账号、模型、错误正文
+或其他身份字段。
+
+两条线同时为 0 只表示该分钟没有采集到请求，不能据此证明服务可用；当请求经过 8327 且上游
+连接失败或超时时，meter 会返回并记录 502，因此可在非 200 线上看到该次无响应。
 
 ### 额度估算口径（2026-08-12）
 

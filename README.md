@@ -45,7 +45,7 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | Account behavior | Per-subscription calls, success/failure, models, dates, and token totals |
 | Quota visibility | Read-only 5-hour/week/month snapshots, reset times, cooldowns, and observed floors |
 | Collection paths | Transparent `8327` proxy, optional destructive-read `8317` usage queue, and default-on read-only Cockpit Tools import |
-| Dashboard | Inline, dependency-free `/usage` HTML with trend, account, model, and recent-call views |
+| Dashboard | Inline, dependency-free `/usage` HTML with a per-minute HTTP 200/non-200 line timeline, token trend, account, model, and recent-call views |
 | Privacy boundary | Loopback by default; credentials and request metadata discarded; email is memory-only |
 
 ## Quick start

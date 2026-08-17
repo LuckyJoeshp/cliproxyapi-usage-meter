@@ -81,6 +81,12 @@ DEFAULT_COCKPIT_TOOLS_POLL_SECONDS = 15.0
 MAX_COCKPIT_TOOLS_CACHE_BYTES = 16 * 1024 * 1024
 COCKPIT_TOOLS_REQUEST_SOURCE = "cockpit_tools"
 COCKPIT_TOOLS_QUOTA_SOURCE = "cockpit_tools_quota"
+# Sources that represent an actual API request/response.  Local Codex token
+# imports and manual imports intentionally stay out of the response health
+# timeline unless the caller explicitly asks for ``source=all``.
+RESPONSE_TIMELINE_SOURCES = ("sidecar", "usage_queue", COCKPIT_TOOLS_REQUEST_SOURCE)
+DEFAULT_RESPONSE_TIMELINE_MINUTES = 24 * 60
+MAX_RESPONSE_TIMELINE_MINUTES = 7 * 24 * 60
 MAX_MANUAL_IMPORT_BYTES = 64 * 1024
 DEFAULT_MANAGEMENT_BACKOFF_SECONDS = 300.0
 MAX_MANAGEMENT_BACKOFF_SECONDS = 1800.0
@@ -5108,6 +5114,124 @@ class UsageRepository:
             ).fetchone()
         return dict(row)
 
+    def response_timeline(
+        self,
+        minutes: int = DEFAULT_RESPONSE_TIMELINE_MINUTES,
+        *,
+        now: datetime | None = None,
+        source: str = "api",
+    ) -> dict[str, Any]:
+        """Return a dense one-minute HTTP response-status timeline.
+
+        ``status_200`` deliberately means *exactly* HTTP 200.  Every other
+        status (including the synthetic 502 recorded when the upstream does
+        not answer) is counted in ``status_non_200``.  The default ``api``
+        scope includes proxy, usage-queue, and Cockpit Tools request events;
+        local token imports are not API responses and are excluded unless the
+        caller requests ``source=all`` or a concrete source.
+
+        The returned buckets are UTC and include zero-valued minutes so a
+        client can draw a continuous line without inventing missing samples.
+        ``now`` is injectable for deterministic callers and tests.
+        """
+
+        try:
+            window_minutes = int(minutes)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("minutes must be an integer") from exc
+        if not 1 <= window_minutes <= MAX_RESPONSE_TIMELINE_MINUTES:
+            raise ValueError(
+                f"minutes must be between 1 and {MAX_RESPONSE_TIMELINE_MINUTES}"
+            )
+
+        scope = (safe_text(source, 64) or "api").lower()
+        if scope != "all" and scope != "api" and not safe_alias(scope):
+            raise ValueError("source must be api, all, or a safe source name")
+
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        start = current - timedelta(minutes=window_minutes - 1)
+        end = current + timedelta(minutes=1)
+        start_text = start.isoformat(timespec="seconds").replace("+00:00", "Z")
+        query_start_text = start.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+        query_end_text = end.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+
+        source_clause = ""
+        source_params: list[Any] = []
+        if scope == "api":
+            placeholders = ",".join("?" for _ in RESPONSE_TIMELINE_SOURCES)
+            source_clause = f" AND source IN ({placeholders})"
+            source_params.extend(RESPONSE_TIMELINE_SOURCES)
+        elif scope != "all":
+            source_clause = " AND source=?"
+            source_params.append(scope)
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT strftime('%Y-%m-%dT%H:%M:00Z', ts) AS bucket,
+                       COALESCE(SUM(CASE WHEN status_code=200
+                                         THEN call_count ELSE 0 END), 0)
+                         AS status_200,
+                       COALESCE(SUM(CASE WHEN status_code IS NULL
+                                              OR status_code!=200
+                                         THEN call_count ELSE 0 END), 0)
+                         AS status_non_200
+                  FROM usage_events
+                 WHERE ts>=? AND ts<?{source_clause}
+                 GROUP BY bucket
+                """,
+                (query_start_text, query_end_text, *source_params),
+            ).fetchall()
+
+        by_bucket = {
+            str(row["bucket"]): {
+                "ts": str(row["bucket"]),
+                "status_200": int(row["status_200"] or 0),
+                "status_non_200": int(row["status_non_200"] or 0),
+            }
+            for row in rows
+            if row["bucket"]
+        }
+        points: list[dict[str, Any]] = []
+        for offset in range(window_minutes):
+            bucket = start + timedelta(minutes=offset)
+            bucket_text = bucket.isoformat(timespec="seconds").replace(
+                "+00:00", "Z"
+            )
+            point = by_bucket.get(
+                bucket_text,
+                {"ts": bucket_text, "status_200": 0, "status_non_200": 0},
+            )
+            point["total"] = point["status_200"] + point["status_non_200"]
+            points.append(point)
+
+        total_200 = sum(point["status_200"] for point in points)
+        total_non_200 = sum(point["status_non_200"] for point in points)
+        return {
+            "interval": "1m",
+            "window_minutes": window_minutes,
+            "timezone": "UTC",
+            "source": scope,
+            "sources": list(RESPONSE_TIMELINE_SOURCES)
+            if scope == "api"
+            else (["all"] if scope == "all" else [scope]),
+            "from": start_text,
+            "to": current.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "totals": {
+                "status_200": total_200,
+                "status_non_200": total_non_200,
+                "total": total_200 + total_non_200,
+            },
+            "points": points,
+        }
+
     def token_breakdown(self, period: str) -> dict[str, Any]:
         summary = self.summary(period)
         return {
@@ -8437,6 +8561,458 @@ def fmt_local_time(value: Any) -> str:
     return parsed.astimezone().strftime("%m-%d %H:%M")
 
 
+RESPONSE_TIMELINE_CSS = """
+.response-timeline-panel{overflow:hidden;background-color:var(--card);background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:16px 16px}
+.timeline-toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:center;padding:17px 18px;border-bottom:2px solid var(--ink);background:color-mix(in srgb,var(--sky) 24%,var(--card))}
+.timeline-kpis{display:flex;min-width:0;flex-wrap:wrap;gap:9px}.timeline-kpi{display:grid;grid-template-columns:11px auto;grid-template-rows:auto auto;column-gap:8px;min-width:122px;padding:8px 10px;border:1.5px solid var(--ink);border-radius:10px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink)}.timeline-kpi i{grid-row:1/3;align-self:center;width:10px;height:10px;border:1.5px solid var(--ink);border-radius:50%}.timeline-kpi span{color:var(--ink-3);font:800 8px/1.1 var(--font-mono);letter-spacing:.07em;text-transform:uppercase}.timeline-kpi strong{margin-top:3px;font:900 15px/1 var(--font-display)}.timeline-kpi.ok i{background:var(--mint)}.timeline-kpi.bad i{background:var(--rose)}.timeline-kpi.rate i{background:var(--lavender)}.timeline-kpi.last i{background:var(--sun)}
+.timeline-controls{display:flex;align-items:center;justify-content:flex-end;gap:9px}.timeline-range{display:inline-flex;padding:3px;border:1.5px solid var(--ink);border-radius:10px;background:var(--paper);box-shadow:2px 2px 0 var(--shadow-ink)}.timeline-range button{min-width:47px;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:var(--ink-2);font:800 9px/1 var(--font-mono);cursor:pointer}.timeline-range button:hover{background:color-mix(in srgb,var(--sky) 30%,transparent);color:var(--ink)}.timeline-range button.is-active{background:var(--ink);color:var(--paper)}.timeline-source{display:flex;align-items:center;gap:7px;padding:6px 8px;border:1.5px solid var(--ink);border-radius:10px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-3);font:800 8px/1 var(--font-mono);text-transform:uppercase}.timeline-source select{max-width:145px;border:0;outline:0;background:transparent;color:var(--ink);font:800 9px/1 var(--font-mono);cursor:pointer}
+.timeline-chart-wrap{position:relative;padding:12px 18px 0}.timeline-chart-scroll{overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}.response-timeline-chart{display:block;width:100%;min-width:720px;height:auto;aspect-ratio:10/3;overflow:visible}.response-timeline-chart [hidden]{display:none}.timeline-plot-bg{fill:color-mix(in srgb,var(--paper) 76%,transparent);stroke:color-mix(in srgb,var(--ink) 45%,transparent);stroke-width:1;vector-effect:non-scaling-stroke}.timeline-grid-line{stroke:color-mix(in srgb,var(--ink) 20%,transparent);stroke-width:1;stroke-dasharray:4 6;vector-effect:non-scaling-stroke}.timeline-grid-line.vertical{stroke-dasharray:2 8}.timeline-axis-label{fill:var(--ink-3);font:700 20px/1 var(--font-mono)}.timeline-line{fill:none;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke;transition:.18s opacity}.timeline-line-200{stroke:var(--mint);stroke-width:4}.timeline-line-non-200{stroke:var(--orange);stroke-width:3.5;stroke-dasharray:8 5}.timeline-error-area{fill:url(#timeline-error-gradient);opacity:.42}.timeline-crosshair{stroke:var(--ink);stroke-width:1.5;stroke-dasharray:4 4;vector-effect:non-scaling-stroke;pointer-events:none}.timeline-marker{stroke:var(--ink);stroke-width:2.5;vector-effect:non-scaling-stroke;pointer-events:none}.timeline-marker.ok{fill:var(--mint)}.timeline-marker.bad{fill:var(--orange)}.timeline-hit-area{fill:transparent;cursor:crosshair}.timeline-empty{fill:var(--ink-3);font:900 24px/1 var(--font-display);text-anchor:middle}.response-timeline-panel.is-loading .timeline-line{opacity:.48}
+.timeline-tooltip{position:absolute;z-index:6;width:190px;padding:11px 12px;border:var(--border);border-radius:10px;background:var(--card);box-shadow:var(--shadow-sm);pointer-events:none}.timeline-tooltip strong{display:block;margin-bottom:8px;font:900 12px/1.2 var(--font-display)}.timeline-tooltip div{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:6px;color:var(--ink-2);font:700 10px/1.2 var(--font-mono)}.timeline-tooltip span{display:flex;align-items:center;gap:6px}.timeline-tooltip i{width:8px;height:8px;border:1px solid var(--ink);border-radius:50%}.timeline-tooltip i.ok{background:var(--mint)}.timeline-tooltip i.bad{background:var(--orange)}.timeline-tooltip b{color:var(--ink)}.timeline-tooltip small{display:block;margin-top:8px;padding-top:7px;border-top:1px solid color-mix(in srgb,var(--ink) 28%,transparent);color:var(--ink-3);font:700 9px/1.3 var(--font-mono)}
+.timeline-meta{display:flex;min-width:0;align-items:center;justify-content:space-between;gap:16px;padding:9px 18px 14px}.timeline-legend{display:flex;flex-wrap:wrap;gap:12px 18px;color:var(--ink-2);font:700 10px/1.2 var(--font-mono)}.timeline-legend span{display:flex;align-items:center;gap:7px}.timeline-legend i{width:22px;height:4px;border:1px solid var(--ink);border-radius:999px}.timeline-legend .ok{background:var(--mint)}.timeline-legend .bad{height:3px;background:repeating-linear-gradient(90deg,var(--orange) 0 7px,transparent 7px 11px)}.timeline-sync{min-width:0;color:var(--ink-3);font:700 9px/1.3 var(--font-mono);text-align:right;overflow-wrap:anywhere}.timeline-footnote{padding:11px 18px;border-top:1.5px solid color-mix(in srgb,var(--ink) 42%,transparent);background:color-mix(in srgb,var(--watch) 42%,var(--card));color:var(--ink-2);font-size:11px}.timeline-footnote code{padding:2px 5px;border:1px solid color-mix(in srgb,var(--ink) 42%,transparent);border-radius:5px;background:var(--paper);color:var(--ink);font:700 9px/1 var(--font-mono)}
+@media(max-width:920px){.timeline-toolbar{grid-template-columns:minmax(0,1fr)}.timeline-controls{justify-content:space-between}.timeline-source{margin-left:auto}}
+@media(max-width:620px){.timeline-toolbar{padding:14px}.timeline-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.timeline-kpi{min-width:0}.timeline-controls{align-items:stretch;flex-direction:column}.timeline-range{display:grid;grid-template-columns:repeat(3,1fr)}.timeline-source{width:100%;margin-left:0;justify-content:space-between}.timeline-source select{max-width:none}.timeline-chart-wrap{padding-left:10px;padding-right:10px}.timeline-meta{align-items:flex-start;flex-direction:column}.timeline-sync{text-align:left}}
+"""
+
+
+RESPONSE_TIMELINE_SCRIPT = """
+(() => {
+  const root = document.querySelector('[data-role="response-timeline"]');
+  const bootstrapNode = document.getElementById('response-timeline-data');
+  if (!root || !bootstrapNode) return;
+
+  const svg = root.querySelector('[data-role="timeline-svg"]');
+  const grid = root.querySelector('[data-role="timeline-grid"]');
+  const line200 = root.querySelector('[data-role="timeline-line-200"]');
+  const lineNon200 = root.querySelector('[data-role="timeline-line-non-200"]');
+  const errorArea = root.querySelector('[data-role="timeline-error-area"]');
+  const crosshair = root.querySelector('[data-role="timeline-crosshair"]');
+  const marker200 = root.querySelector('[data-role="timeline-marker-200"]');
+  const markerNon200 = root.querySelector('[data-role="timeline-marker-non-200"]');
+  const hitArea = root.querySelector('[data-role="timeline-hit-area"]');
+  const emptyState = root.querySelector('[data-role="timeline-empty"]');
+  const tooltip = root.querySelector('[data-role="timeline-tooltip"]');
+  const chartWrap = root.querySelector('.timeline-chart-wrap');
+  const sourceSelect = root.querySelector('[data-role="timeline-source"]');
+  const syncLabel = root.querySelector('[data-role="timeline-sync"]');
+  if (!svg || !grid || !line200 || !lineNon200 || !errorArea || !hitArea || !tooltip) return;
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const layout = {width: 1200, height: 360, left: 62, right: 1170, top: 28, bottom: 294};
+  const numberFormat = new Intl.NumberFormat('zh-CN');
+  const timeFormat = new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+  });
+  const compactTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit', minute: '2-digit', hour12: false
+  });
+  let payload = null;
+  let points = [];
+  let activeIndex = -1;
+  let requestController = null;
+  let resizeTimer = null;
+
+  function roleText(role, value) {
+    const node = root.querySelector('[data-role="' + role + '"]');
+    if (node) node.textContent = value;
+  }
+
+  function count(value) {
+    return numberFormat.format(Number(value) || 0);
+  }
+
+  function localTime(value, compact) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return (compact ? compactTimeFormat : timeFormat).format(date).replace(/\//g, '-');
+  }
+
+  function sourceName(value) {
+    return {
+      api: '全部 API',
+      cockpit_tools: 'Cockpit Tools',
+      sidecar: '8327 代理',
+      usage_queue: '8317 队列',
+      all: '全部事件'
+    }[value] || value || '全部 API';
+  }
+
+  function niceMaximum(raw) {
+    const value = Math.max(0, Math.ceil(raw));
+    if (value <= 4) return Math.max(value, 1);
+    const magnitude = Math.pow(10, Math.floor(Math.log10(value)));
+    const normalized = value / magnitude;
+    const factor = normalized <= 2 ? 2 : (normalized <= 5 ? 5 : 10);
+    return factor * magnitude;
+  }
+
+  function xFor(index) {
+    if (points.length <= 1) return (layout.left + layout.right) / 2;
+    return layout.left + index / (points.length - 1) * (layout.right - layout.left);
+  }
+
+  function yFor(value, maximum) {
+    return layout.bottom - (Number(value) || 0) / maximum * (layout.bottom - layout.top);
+  }
+
+  function linePath(key, maximum) {
+    return points.map((point, index) => {
+      const prefix = index === 0 ? 'M' : 'L';
+      return prefix + xFor(index).toFixed(2) + ' ' + yFor(point[key], maximum).toFixed(2);
+    }).join(' ');
+  }
+
+  function areaPath(key, maximum) {
+    if (!points.length) return '';
+    const body = points.map((point, index) => {
+      return 'L' + xFor(index).toFixed(2) + ' ' + yFor(point[key], maximum).toFixed(2);
+    }).join(' ');
+    return 'M' + xFor(0).toFixed(2) + ' ' + layout.bottom + ' ' + body +
+      ' L' + xFor(points.length - 1).toFixed(2) + ' ' + layout.bottom + ' Z';
+  }
+
+  function svgElement(name, attributes, text) {
+    const node = document.createElementNS(NS, name);
+    Object.entries(attributes || {}).forEach(([key, value]) => node.setAttribute(key, String(value)));
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function renderGrid(maximum) {
+    grid.replaceChildren();
+    const tickCount = Math.min(4, maximum);
+    const values = [];
+    for (let index = 0; index <= tickCount; index += 1) {
+      values.push(Math.round(maximum * index / tickCount));
+    }
+    [...new Set(values)].forEach((value) => {
+      const y = yFor(value, maximum);
+      grid.append(
+        svgElement('line', {
+          class: 'timeline-grid-line', x1: layout.left, x2: layout.right, y1: y, y2: y
+        }),
+        svgElement('text', {
+          class: 'timeline-axis-label', x: layout.left - 13, y: y + 7, 'text-anchor': 'end'
+        }, count(value))
+      );
+    });
+
+    const labelCount = root.clientWidth < 620 ? 4 : 6;
+    const seen = new Set();
+    for (let tick = 0; tick < labelCount; tick += 1) {
+      const index = Math.round(tick / (labelCount - 1) * (points.length - 1));
+      if (seen.has(index) || !points[index]) continue;
+      seen.add(index);
+      const x = xFor(index);
+      const anchor = tick === 0 ? 'start' : (tick === labelCount - 1 ? 'end' : 'middle');
+      grid.append(
+        svgElement('line', {
+          class: 'timeline-grid-line vertical', x1: x, x2: x, y1: layout.top, y2: layout.bottom
+        }),
+        svgElement('text', {
+          class: 'timeline-axis-label', x: x, y: layout.bottom + 31, 'text-anchor': anchor
+        }, localTime(points[index].ts, Number(payload.window_minutes) <= 360))
+      );
+    }
+  }
+
+  function hideTooltip() {
+    tooltip.hidden = true;
+    crosshair.setAttribute('hidden', '');
+    marker200.setAttribute('hidden', '');
+    markerNon200.setAttribute('hidden', '');
+    activeIndex = -1;
+  }
+
+  function showPoint(index) {
+    if (!points[index]) return;
+    activeIndex = index;
+    const point = points[index];
+    const maximum = Number(svg.dataset.maximum) || 1;
+    const x = xFor(index);
+    const y200 = yFor(point.status_200, maximum);
+    const yNon200 = yFor(point.status_non_200, maximum);
+    crosshair.setAttribute('x1', x);
+    crosshair.setAttribute('x2', x);
+    marker200.setAttribute('cx', x);
+    marker200.setAttribute('cy', y200);
+    markerNon200.setAttribute('cx', x);
+    markerNon200.setAttribute('cy', yNon200);
+    crosshair.removeAttribute('hidden');
+    marker200.removeAttribute('hidden');
+    markerNon200.removeAttribute('hidden');
+    tooltip.hidden = false;
+    roleText('timeline-tooltip-time', localTime(point.ts, false));
+    roleText('timeline-tooltip-200', count(point.status_200));
+    roleText('timeline-tooltip-non-200', count(point.status_non_200));
+    roleText('timeline-tooltip-total', '该分钟共 ' + count(
+      Number(point.status_200) + Number(point.status_non_200)
+    ) + ' 次调用');
+
+    requestAnimationFrame(() => {
+      const wrapBox = chartWrap.getBoundingClientRect();
+      const svgBox = svg.getBoundingClientRect();
+      const xPosition = svgBox.left - wrapBox.left + x / layout.width * svgBox.width;
+      const yPosition = svgBox.top - wrapBox.top + Math.min(y200, yNon200) / layout.height * svgBox.height;
+      let left = xPosition + 14;
+      if (left + tooltip.offsetWidth > wrapBox.width - 8) {
+        left = xPosition - tooltip.offsetWidth - 14;
+      }
+      const top = Math.max(9, Math.min(
+        yPosition - tooltip.offsetHeight - 10,
+        wrapBox.height - tooltip.offsetHeight - 9
+      ));
+      tooltip.style.left = Math.max(8, left) + 'px';
+      tooltip.style.top = top + 'px';
+    });
+  }
+
+  function render(nextPayload) {
+    if (!nextPayload || !Array.isArray(nextPayload.points)) return;
+    payload = nextPayload;
+    points = nextPayload.points.map((point) => ({
+      ts: String(point.ts || ''),
+      status_200: Math.max(0, Number(point.status_200) || 0),
+      status_non_200: Math.max(0, Number(point.status_non_200) || 0)
+    }));
+    if (!points.length) return;
+
+    const rawMaximum = Math.max(
+      0,
+      ...points.map((point) => Math.max(point.status_200, point.status_non_200))
+    );
+    const maximum = niceMaximum(rawMaximum);
+    svg.dataset.maximum = String(maximum);
+    renderGrid(maximum);
+    line200.setAttribute('d', linePath('status_200', maximum));
+    lineNon200.setAttribute('d', linePath('status_non_200', maximum));
+    errorArea.setAttribute('d', areaPath('status_non_200', maximum));
+
+    const totals = points.reduce((result, point) => {
+      result.status200 += point.status_200;
+      result.statusNon200 += point.status_non_200;
+      return result;
+    }, {status200: 0, statusNon200: 0});
+    const total = totals.status200 + totals.statusNon200;
+    const rate = total ? totals.statusNon200 / total * 100 : 0;
+    const latestFailure = [...points].reverse().find((point) => point.status_non_200 > 0);
+    roleText('timeline-total-200', count(totals.status200));
+    roleText('timeline-total-non-200', count(totals.statusNon200));
+    roleText('timeline-error-rate', rate.toFixed(rate >= 10 ? 0 : 1) + '%');
+    roleText('timeline-last-failure', latestFailure ? localTime(latestFailure.ts, false) : '暂无');
+    emptyState.toggleAttribute('hidden', total > 0);
+    svg.setAttribute(
+      'aria-label',
+      'API 响应时间轴，HTTP 200 共 ' + totals.status200 +
+      ' 次，非 200 共 ' + totals.statusNon200 + ' 次'
+    );
+
+    root.querySelectorAll('[data-minutes]').forEach((button) => {
+      button.classList.toggle(
+        'is-active',
+        Number(button.dataset.minutes) === Number(nextPayload.window_minutes)
+      );
+    });
+    if (sourceSelect && [...sourceSelect.options].some((option) => option.value === nextPayload.source)) {
+      sourceSelect.value = nextPayload.source;
+    }
+    roleText(
+      'timeline-sync',
+      sourceName(nextPayload.source) + ' · 每分钟 · 更新至 ' +
+      localTime(nextPayload.to || points[points.length - 1].ts, false)
+    );
+    hideTooltip();
+  }
+
+  async function load(minutes, source) {
+    if (requestController) requestController.abort();
+    requestController = new AbortController();
+    root.classList.add('is-loading');
+    if (syncLabel) syncLabel.textContent = '正在刷新时间轴…';
+    try {
+      const url = new URL(root.dataset.endpoint, window.location.href);
+      url.searchParams.set('minutes', String(minutes));
+      url.searchParams.set('source', source);
+      const response = await fetch(url, {
+        cache: 'no-store',
+        headers: {'Accept': 'application/json'},
+        signal: requestController.signal
+      });
+      if (!response.ok) throw new Error('timeline response ' + response.status);
+      const nextPayload = await response.json();
+      render(nextPayload);
+      try {
+        localStorage.setItem('cliproxy-timeline-minutes', String(minutes));
+        localStorage.setItem('cliproxy-timeline-source', source);
+      } catch (error) {}
+    } catch (error) {
+      if (error.name !== 'AbortError' && syncLabel) {
+        syncLabel.textContent = '刷新失败 · 已保留上次数据';
+      }
+    } finally {
+      root.classList.remove('is-loading');
+    }
+  }
+
+  hitArea.addEventListener('pointermove', (event) => {
+    const bounds = hitArea.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+    showPoint(Math.round(ratio * (points.length - 1)));
+  });
+  hitArea.addEventListener('pointerleave', hideTooltip);
+  svg.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const fallback = event.key === 'ArrowLeft' ? points.length - 1 : 0;
+    const nextIndex = activeIndex < 0
+      ? fallback
+      : Math.max(0, Math.min(points.length - 1, activeIndex + (event.key === 'ArrowLeft' ? -1 : 1)));
+    showPoint(nextIndex);
+  });
+  root.querySelectorAll('[data-minutes]').forEach((button) => {
+    button.addEventListener('click', () => {
+      load(Number(button.dataset.minutes), sourceSelect ? sourceSelect.value : 'api');
+    });
+  });
+  if (sourceSelect) {
+    sourceSelect.addEventListener('change', () => {
+      load(Number(payload.window_minutes) || 1440, sourceSelect.value);
+    });
+  }
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (payload) render(payload);
+    }, 120);
+  });
+
+  try {
+    render(JSON.parse(bootstrapNode.textContent));
+  } catch (error) {
+    if (syncLabel) syncLabel.textContent = '时间轴数据暂不可用';
+    return;
+  }
+
+  let preferredMinutes = Number(payload.window_minutes) || 1440;
+  let preferredSource = payload.source || 'api';
+  try {
+    const storedMinutes = Number(localStorage.getItem('cliproxy-timeline-minutes'));
+    const storedSource = localStorage.getItem('cliproxy-timeline-source');
+    if ([60, 360, 1440].includes(storedMinutes)) preferredMinutes = storedMinutes;
+    if (['api', 'cockpit_tools', 'sidecar', 'usage_queue'].includes(storedSource)) {
+      preferredSource = storedSource;
+    }
+  } catch (error) {}
+  if (preferredMinutes !== Number(payload.window_minutes) || preferredSource !== payload.source) {
+    load(preferredMinutes, preferredSource);
+  }
+  window.setInterval(() => {
+    if (!document.hidden && payload) {
+      load(Number(payload.window_minutes) || 1440, payload.source || 'api');
+    }
+  }, 30000);
+})();
+"""
+
+
+def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
+    """Render the status chart shell and a compact, safe bootstrap payload."""
+
+    points = timeline.get("points")
+    points = points if isinstance(points, list) else []
+    compact_payload = dict(timeline)
+    compact_payload["points"] = [
+        {
+            "ts": safe_text(point.get("ts"), 64) or "",
+            "status_200": int(point.get("status_200") or 0),
+            "status_non_200": int(point.get("status_non_200") or 0),
+        }
+        for point in points
+        if isinstance(point, Mapping)
+    ]
+    payload_json = json.dumps(
+        compact_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    payload_json = (
+        payload_json.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    totals = timeline.get("totals")
+    totals = totals if isinstance(totals, Mapping) else {}
+    total_200 = int(totals.get("status_200") or 0)
+    total_non_200 = int(totals.get("status_non_200") or 0)
+    total = total_200 + total_non_200
+    error_rate = total_non_200 / total * 100.0 if total else 0.0
+    last_failure = next(
+        (
+            point
+            for point in reversed(points)
+            if isinstance(point, Mapping)
+            and int(point.get("status_non_200") or 0) > 0
+        ),
+        None,
+    )
+    last_failure_text = (
+        fmt_local_time(last_failure.get("ts"))
+        if isinstance(last_failure, Mapping)
+        else "暂无"
+    )
+    return f"""
+<div class="section-title"><div><h2>API 响应时间轴</h2><p>HTTP 200 与非 200 双折线；连续到每一分钟，快速定位无响应与异常时段。</p></div><small>默认近 24 小时</small></div>
+<section class="panel response-timeline-panel" data-role="response-timeline" data-endpoint="/usage/timeline">
+  <div class="timeline-toolbar">
+    <div class="timeline-kpis" aria-live="polite">
+      <div class="timeline-kpi ok"><i></i><span>HTTP 200</span><strong data-role="timeline-total-200">{fmt_int(total_200)}</strong></div>
+      <div class="timeline-kpi bad"><i></i><span>非 200</span><strong data-role="timeline-total-non-200">{fmt_int(total_non_200)}</strong></div>
+      <div class="timeline-kpi rate"><i></i><span>异常比例</span><strong data-role="timeline-error-rate">{error_rate:.1f}%</strong></div>
+      <div class="timeline-kpi last"><i></i><span>最近非 200</span><strong data-role="timeline-last-failure">{html.escape(last_failure_text)}</strong></div>
+    </div>
+    <div class="timeline-controls">
+      <div class="timeline-range" role="group" aria-label="时间轴范围">
+        <button type="button" data-minutes="60">1 小时</button>
+        <button type="button" data-minutes="360">6 小时</button>
+        <button type="button" data-minutes="1440" class="is-active">24 小时</button>
+      </div>
+      <label class="timeline-source"><span>数据源</span><select data-role="timeline-source" aria-label="时间轴数据源">
+        <option value="api">全部 API</option>
+        <option value="cockpit_tools">Cockpit Tools</option>
+        <option value="sidecar">8327 代理</option>
+        <option value="usage_queue">8317 队列</option>
+      </select></label>
+    </div>
+  </div>
+  <div class="timeline-chart-wrap">
+    <div class="timeline-chart-scroll">
+      <svg class="response-timeline-chart" data-role="timeline-svg" viewBox="0 0 1200 360" role="img" tabindex="0" aria-label="API 响应时间轴">
+        <defs><linearGradient id="timeline-error-gradient" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="var(--rose)" stop-opacity=".72"/><stop offset="1" stop-color="var(--rose)" stop-opacity="0"/></linearGradient></defs>
+        <rect class="timeline-plot-bg" x="62" y="28" width="1108" height="266" rx="12"></rect>
+        <g data-role="timeline-grid" aria-hidden="true"></g>
+        <path class="timeline-error-area" data-role="timeline-error-area" aria-hidden="true"></path>
+        <path class="timeline-line timeline-line-200" data-role="timeline-line-200" aria-hidden="true"></path>
+        <path class="timeline-line timeline-line-non-200" data-role="timeline-line-non-200" aria-hidden="true"></path>
+        <line class="timeline-crosshair" data-role="timeline-crosshair" y1="28" y2="294" hidden></line>
+        <circle class="timeline-marker ok" data-role="timeline-marker-200" r="6" hidden></circle>
+        <circle class="timeline-marker bad" data-role="timeline-marker-non-200" r="6" hidden></circle>
+        <text class="timeline-empty" data-role="timeline-empty" x="616" y="168">当前范围暂无 API 调用记录</text>
+        <rect class="timeline-hit-area" data-role="timeline-hit-area" x="62" y="28" width="1108" height="266"></rect>
+      </svg>
+    </div>
+    <div class="timeline-tooltip" data-role="timeline-tooltip" hidden>
+      <strong data-role="timeline-tooltip-time">—</strong>
+      <div><span><i class="ok"></i>HTTP 200</span><b data-role="timeline-tooltip-200">0</b></div>
+      <div><span><i class="bad"></i>非 200</span><b data-role="timeline-tooltip-non-200">0</b></div>
+      <small data-role="timeline-tooltip-total">该分钟共 0 次调用</small>
+    </div>
+  </div>
+  <div class="timeline-meta"><div class="timeline-legend"><span><i class="ok"></i>HTTP 200</span><span><i class="bad"></i>非 200 / 无上游响应</span></div><div class="timeline-sync" data-role="timeline-sync">全部 API · 每分钟</div></div>
+  <div class="timeline-footnote">无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线。两条线同时为 0 只表示该分钟没有采集到请求，不能单独证明服务可用。JSON 数据可从 <code>/usage/timeline?minutes=1440&amp;source=cockpit_tools</code> 获取。</div>
+</section>
+<script id="response-timeline-data" type="application/json">{payload_json}</script>
+"""
+
+
 def token_mix_html(summary: Mapping[str, Any]) -> str:
     components = [
         (
@@ -8542,6 +9118,8 @@ def dashboard_html(
     week = repo.token_breakdown("7d")
     all_time = repo.token_breakdown("all")
     daily = repo.daily_usage(7)
+    response_timeline = repo.response_timeline()
+    response_timeline_chart = response_timeline_chart_html(response_timeline)
     subscriptions = repo.subscription_dashboard_rows()
     persisted_quota_accounts = sum(1 for row in subscriptions if row.get("windows"))
     models = repo.grouped("7d", "model")
@@ -8844,6 +9422,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 .system-strip{{display:flex;flex-wrap:wrap;gap:9px;margin-top:27px}}.system-strip span{{padding:7px 10px;border:1.5px solid var(--ink);border-radius:999px;background:var(--card);box-shadow:2px 2px 0 var(--shadow-ink);color:var(--ink-2);font:700 9px/1 var(--font-mono)}}.system-strip span:nth-child(1){{background:var(--mint);color:var(--on-color)}}.system-strip span:nth-child(2){{background:var(--sky);color:var(--on-color)}}.system-strip span:nth-child(3){{background:var(--sun);color:var(--on-color)}}.system-strip b{{color:inherit}}footer{{margin-top:24px;padding-top:16px;border-top:2px solid var(--ink);color:var(--ink-3);font:600 9px/1.65 var(--font-mono)}}
 @media(max-width:1320px){{.hero-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:920px){{main{{padding:26px 16px 55px}}header{{align-items:flex-start}}.brand-mark{{width:46px;height:46px}}.subtitle{{max-width:560px}}.hero-grid,.period-grid,.two-col{{grid-template-columns:minmax(0,1fr)}}.form-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.trend{{gap:7px}}.notice{{display:grid;grid-template-columns:auto minmax(0,1fr)}}.notice b{{white-space:normal}}.notice span{{grid-column:2;overflow-wrap:anywhere}}}}@media(max-width:620px){{header{{align-items:flex-start;flex-direction:column}}.brand-lockup{{align-items:flex-start}}h1{{font-size:clamp(28px,9vw,38px)}}.header-actions{{width:100%;justify-content:space-between}}.hero-grid,.subscription-grid,.form-grid{{grid-template-columns:minmax(0,1fr)}}.period-head{{flex-wrap:wrap}}.mix-legend{{grid-template-columns:minmax(0,1fr)}}.account-usage{{grid-template-columns:repeat(3,minmax(0,1fr))}}.trend-column small{{display:none}}.section-title{{align-items:flex-start;flex-direction:column;gap:6px}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto!important;transition:none!important}}}}
 .account-head i.confirmed{{background:var(--rose)}}.account-head i.reported{{background:var(--sun)}}.account-head i.available{{background:var(--mint)}}
+{RESPONSE_TIMELINE_CSS}
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
 <section class="hero-grid">{hero_metrics}</section>
@@ -8854,6 +9433,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
 <section class="period-grid">{period_cards}</section>
+{response_timeline_chart}
 <div class="section-title"><div><h2>近 7 天趋势</h2><p>柱高为非缓存输入 + 输出；悬停可看缓存和 API 原始处理量。</p></div></div>
 <section class="panel trend-panel"><div class="trend">{trend_bars}</div></section>
 <div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex 真实 5 小时/周窗口；美元额度优先按 provider 当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
@@ -8864,7 +9444,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
 <div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>调用记录 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
-</main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script></body></html>"""
+</main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script><script>{RESPONSE_TIMELINE_SCRIPT}</script></body></html>"""
 
 
 class MeterHTTPServer(ThreadingHTTPServer):
@@ -9067,6 +9647,12 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                 body,
             )
             return
+        if path in {"/usage/timeline", "/usage/api/timeline", "/api/usage/timeline"}:
+            if self.command not in {"GET", "HEAD"}:
+                self._plain_response(405, b"method not allowed\n")
+                return
+            self._usage_timeline()
+            return
         if path == "/usage/manual-import":
             if self.command != "POST":
                 self._plain_response(405, b"method not allowed\n")
@@ -9096,6 +9682,65 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
             self._proxy(path)
             return
         self._plain_response(404, b"not found\n")
+
+    def _usage_timeline(self) -> None:
+        """Serve the minute-level response-status series used by the chart."""
+
+        try:
+            query = urllib.parse.parse_qs(
+                urlsplit(self.path).query,
+                keep_blank_values=True,
+                max_num_fields=8,
+            )
+            raw_minutes = query.get("minutes", [str(DEFAULT_RESPONSE_TIMELINE_MINUTES)])
+            raw_source = query.get("source", ["api"])
+            if len(raw_minutes) != 1 or len(raw_source) != 1:
+                raise ValueError("query parameter must appear once")
+            minutes = int(raw_minutes[0])
+            source = raw_source[0] or "api"
+            payload = self.meter_server.repo.response_timeline(
+                minutes,
+                source=source,
+            )
+            body = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._send_bytes(
+                200,
+                "OK",
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                ],
+                body,
+            )
+        except (ValueError, TypeError, OverflowError):
+            body = b'{"error":"invalid timeline query"}'
+            self._send_bytes(
+                400,
+                "Bad Request",
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                ],
+                body,
+            )
+        except Exception as exc:
+            # Keep SQLite and local path details out of the public loopback
+            # response; the type-only log is enough for local diagnosis.
+            LOG.error("response timeline failed: %s", type(exc).__name__)
+            body = b'{"error":"timeline unavailable"}'
+            self._send_bytes(
+                500,
+                "Internal Server Error",
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                ],
+                body,
+            )
 
     def _manual_import(self) -> None:
         try:
