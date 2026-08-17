@@ -2475,6 +2475,7 @@ class UsageRepository:
                   split_priced INTEGER NOT NULL,
                   total_priced INTEGER NOT NULL,
                   calls INTEGER NOT NULL,
+                  account_attempts INTEGER NOT NULL DEFAULT 0,
                   streaming_calls INTEGER NOT NULL DEFAULT 0,
                   non_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                   codex_status_tokens INTEGER NOT NULL DEFAULT 0,
@@ -2572,6 +2573,54 @@ class UsageRepository:
                 "anonymous_usage_daily",
                 "streaming_calls",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            anonymous_usage_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(anonymous_usage_daily)")
+            }
+            had_anonymous_account_attempts = (
+                "account_attempts" in anonymous_usage_columns
+            )
+            self._ensure_column(
+                conn,
+                "anonymous_usage_daily",
+                "account_attempts",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            if not had_anonymous_account_attempts:
+                # Legacy anonymous buckets predate account-selection
+                # classification.  Calls were previously treated as account
+                # attempts, so preserve that behavior unless the aggregate has
+                # the uniquely repairable pre-account Cockpit 401 shape below.
+                conn.execute(
+                    "UPDATE anonymous_usage_daily SET account_attempts=calls"
+                )
+            # Privacy retirement removes the source column, but the historical
+            # Cockpit rejects at issue here still have a provable shape: no
+            # selected model, HTTP 401, and no token or cost consumption.  Keep
+            # their API-call/failure history while removing them from account
+            # attempts and model-consumption groupings.  Reapplying this repair
+            # is safe and makes upgrades from an interrupted older build
+            # deterministic.
+            conn.execute(
+                """
+                UPDATE anonymous_usage_daily
+                   SET account_attempts=0
+                 WHERE model='(unknown)'
+                   AND status_code=401
+                   AND COALESCE(input_tokens, 0)=0
+                   AND COALESCE(cached_tokens, 0)=0
+                   AND COALESCE(cache_write_tokens, 0)=0
+                   AND COALESCE(output_tokens, 0)=0
+                   AND COALESCE(reasoning_tokens, 0)=0
+                   AND COALESCE(total_tokens, 0)=0
+                   AND COALESCE(non_cached_input_tokens, 0)=0
+                   AND COALESCE(codex_status_tokens, 0)=0
+                   AND COALESCE(estimated_api_cost_usd, 0)=0
+                   AND COALESCE(non_cached_input_cost_usd, 0)=0
+                   AND COALESCE(cached_input_cost_usd, 0)=0
+                   AND COALESCE(output_cost_usd, 0)=0
+                """
             )
             # Cockpit records client-authentication failures before it chooses
             # a subscription with an empty account selector.  Older meter
@@ -2757,7 +2806,8 @@ class UsageRepository:
                        non_cached_input_cost_usd, cached_input_cost_usd,
                        output_cost_usd, long_context_pricing_applied,
                        NULL, NULL, usage_missing, NULL, NULL, 0, 0,
-                       calls, 'anonymous', NULL, calls, streaming_calls,
+                       calls, 'anonymous', NULL, account_attempts,
+                       streaming_calls,
                        non_cached_input_tokens, codex_status_tokens
                   FROM anonymous_usage_daily;
                 """
@@ -3459,7 +3509,7 @@ class UsageRepository:
             INSERT INTO anonymous_usage_daily (
               bucket_start, model, status_code, ok, usage_missing,
               long_context_pricing_applied, split_priced, total_priced,
-              calls, streaming_calls, non_cached_input_tokens,
+              calls, account_attempts, streaming_calls, non_cached_input_tokens,
               codex_status_tokens, duration_ms, input_tokens, cached_tokens,
               cache_write_tokens, output_tokens, reasoning_tokens,
               total_tokens, estimated_api_cost_usd,
@@ -3477,6 +3527,8 @@ class UsageRepository:
                          AND output_cost_usd IS NOT NULL THEN 1 ELSE 0 END,
               CASE WHEN estimated_api_cost_usd IS NOT NULL THEN 1 ELSE 0 END,
               COALESCE(SUM(call_count), 0),
+              COALESCE(SUM(CASE WHEN COALESCE(account_attempt, 1)=1
+                                THEN call_count ELSE 0 END), 0),
               COALESCE(SUM(CASE WHEN stream=1 THEN call_count ELSE 0 END), 0),
               COALESCE(SUM(MAX(COALESCE(input_tokens, 0)
                                    - COALESCE(cached_tokens, 0), 0)), 0),
@@ -3509,6 +3561,8 @@ class UsageRepository:
               long_context_pricing_applied, split_priced, total_priced
             ) DO UPDATE SET
               calls=anonymous_usage_daily.calls + excluded.calls,
+              account_attempts=anonymous_usage_daily.account_attempts
+                               + excluded.account_attempts,
               streaming_calls=anonymous_usage_daily.streaming_calls
                               + excluded.streaming_calls,
               non_cached_input_tokens=
@@ -3580,7 +3634,7 @@ class UsageRepository:
                 INSERT INTO anonymous_usage_daily (
                   bucket_start, model, status_code, ok, usage_missing,
                   long_context_pricing_applied, split_priced, total_priced,
-                  calls, streaming_calls, non_cached_input_tokens,
+                  calls, account_attempts, streaming_calls, non_cached_input_tokens,
                   codex_status_tokens, duration_ms, input_tokens, cached_tokens,
                   cache_write_tokens, output_tokens, reasoning_tokens,
                   total_tokens, estimated_api_cost_usd,
@@ -3589,7 +3643,7 @@ class UsageRepository:
                 )
                 SELECT bucket_start, '(unknown)', status_code, ok, usage_missing,
                        long_context_pricing_applied, split_priced, total_priced,
-                       calls, streaming_calls, non_cached_input_tokens,
+                       calls, account_attempts, streaming_calls, non_cached_input_tokens,
                        codex_status_tokens, duration_ms, input_tokens,
                        cached_tokens, cache_write_tokens, output_tokens,
                        reasoning_tokens, total_tokens, estimated_api_cost_usd,
@@ -3602,6 +3656,8 @@ class UsageRepository:
                   long_context_pricing_applied, split_priced, total_priced
                 ) DO UPDATE SET
                   calls=anonymous_usage_daily.calls + excluded.calls,
+                  account_attempts=anonymous_usage_daily.account_attempts
+                                   + excluded.account_attempts,
                   streaming_calls=anonymous_usage_daily.streaming_calls
                                   + excluded.streaming_calls,
                   non_cached_input_tokens=
@@ -8949,6 +9005,17 @@ def display_identity(row: Mapping[str, Any]) -> str:
     return "unknown"
 
 
+def dashboard_identity(row: Mapping[str, Any]) -> str:
+    """Return the dashboard's email-only account label.
+
+    Aliases remain authoritative internal routing keys, but they are local
+    implementation details and should not be presented as account identity on
+    ``/usage``.  Do not fall back to an alias when an email is unavailable.
+    """
+
+    return safe_email(row.get("account_email")) or "邮箱未获取"
+
+
 def identity_badge(row: Mapping[str, Any]) -> tuple[str, str]:
     """Return a meaningful one-letter account class for the dashboard.
 
@@ -9651,7 +9718,7 @@ def dashboard_html(
             f"{row.get('quota_estimate_confidence') or 'unknown'}"
             if full_quota is not None else f"当前已观测 ≥ {fmt_money(floor)} · 低置信度"
         )
-        alias = display_identity(row)
+        account_label = dashboard_identity(row)
         plan = "LEGACY" if legacy_ambiguous else str(row.get("plan_type") or "unknown").upper()
         upstream_reports_zero = any(
             (
@@ -9690,11 +9757,6 @@ def dashboard_html(
         else:
             status_text = "实时额度" if row.get("fetched_at") else "等待额度快照"
             status_class = "reported"
-        account_email = safe_email(row.get("account_email"))
-        account_email_html = (
-            f'<span class="account-email">{html.escape(account_email)}</span>'
-            if account_email else '<span class="account-email unavailable">邮箱未获取</span>'
-        )
         observation_parts: list[str] = []
         if row.get("last_execution_at"):
             observation_parts.append(
@@ -9739,7 +9801,7 @@ def dashboard_html(
             quota_rows.append(window_meter_html(None, "额度窗口"))
         subscription_cards.append(
             f'<article class="subscription-card"><div class="account-head"><div class="avatar" title="{html.escape(badge_title)}">{badge}</div>'
-            f'<div class="account-copy"><h3>{html.escape(alias)}</h3>{account_email_html}'
+            f'<div class="account-copy"><h3>{html.escape(account_label)}</h3>'
             f'<span class="account-meta">{html.escape(plan)} · {html.escape(badge_title)}</span>{observation_html}</div>'
             f'<i class="{status_class}" title="{html.escape(observation_text)}">{html.escape(status_text)}</i></div>'
             f'{"".join(quota_rows)}'
@@ -9768,7 +9830,7 @@ def dashboard_html(
         for row in models
     ) or '<tr><td colspan="11" class="empty">暂无数据</td></tr>'
     account_rows = "".join(
-        f'<tr><td><b>{html.escape(display_identity(row))}</b></td>'
+        f'<tr><td><b>{html.escape(dashboard_identity(row))}</b></td>'
         f'<td>{fmt_int(row.get("all_time_logical_requests"))}</td>'
         f'<td>{fmt_int(row.get("all_time_account_attempts"))}</td>'
         f'<td>{fmt_int(row.get("all_time_non_cached_input_tokens"))}</td>'
@@ -9784,7 +9846,7 @@ def dashboard_html(
         return "ok" if row.get("ok") else "bad"
 
     recent_rows = "".join(
-        f'<tr><td>{html.escape(fmt_local_time(row["ts"], seconds=True))}</td><td>{html.escape(display_identity(row))}</td>'
+        f'<tr><td>{html.escape(fmt_local_time(row["ts"], seconds=True))}</td><td>{html.escape(dashboard_identity(row))}</td>'
         f'<td>{html.escape(str(row["model"] or "—"))}</td><td><span class="status-pill {_status_class(row)}">{row["status_code"]}</span></td>'
         f'<td>{fmt_int(max(int(row["input_tokens"] or 0) - int(row["cached_tokens"] or 0), 0))}</td>'
         f'<td>{fmt_int(row["output_tokens"])}</td><td>{fmt_int(row["cached_tokens"])}</td>'
@@ -9813,6 +9875,12 @@ def dashboard_html(
     )
 
     codex_dynamic = codex_app_status.get("account_mode", "dynamic") == "dynamic"
+    manual_usage_alias = safe_alias(codex_app_status.get("usage_alias"))
+    manual_account_email: str | None = None
+    if not codex_dynamic and manual_usage_alias and account_resolver is not None:
+        manual_account_email = safe_email(
+            account_resolver.resolve(manual_usage_alias, None).account_email
+        )
     codex_discovered = as_nonnegative_int(
         codex_app_status.get("discovered_homes")
     ) or 0
@@ -9834,10 +9902,8 @@ def dashboard_html(
             else "账号切换时会先建立安全边界，避免把旧会话归到新账号。"
         )
     else:
-        codex_mode_text = html.escape(
-            str(codex_app_status.get("usage_alias") or "固定账号")
-        )
-        binding_text = "当前为显式 alias 严格匹配模式。"
+        codex_mode_text = html.escape(manual_account_email or "邮箱未获取")
+        binding_text = "当前为固定账号严格匹配模式。"
     codex_notice = (
         f'<div class="notice {"app-import-notice" if codex_matched else ""}">'
         '<b>ChatGPT Codex 本地监控</b>'
@@ -9849,9 +9915,12 @@ def dashboard_html(
         '“API 等价成本”不是 Pro 订阅实际扣款。</span></div>'
     )
     manual_import = ""
-    if not codex_dynamic and codex_app_status.get("usage_alias"):
-        manual_alias = html.escape(str(codex_app_status["usage_alias"]), quote=True)
-        manual_import = f"""<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><div class="form-grid"><label>账号<input name="usage_alias" value="{manual_alias}" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><button type="submit">导入并估价</button><p>只接收模型、时间、调用数和 token 统计，不接收备注、提示词或代码。输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。</p></form></details>"""
+    if not codex_dynamic and manual_usage_alias:
+        manual_alias = html.escape(manual_usage_alias, quote=True)
+        manual_account_label = html.escape(
+            manual_account_email or "邮箱未获取", quote=True
+        )
+        manual_import = f"""<details class="manual-import"><summary>手动补录用量 <span>跨设备或本地日志缺失时使用</span></summary><form method="post" action="/usage/manual-import"><input type="hidden" name="usage_alias" value="{manual_alias}"><div class="form-grid"><label>账号<input value="{manual_account_label}" readonly></label><label>模型<input name="model" value="gpt-5.6-sol" maxlength="200" required></label><label>时间<input name="ts" type="datetime-local"></label><label>调用数<input name="call_count" type="number" value="1" min="1" max="100000" required></label><label>输入 tokens<input name="input_tokens" type="number" min="0" required></label><label>缓存 tokens<input name="cached_tokens" type="number" value="0" min="0" required></label><label>输出 tokens<input name="output_tokens" type="number" min="0" required></label><label>推理 tokens<input name="reasoning_tokens" type="number" value="0" min="0"></label></div><button type="submit">导入并估价</button><p>只接收模型、时间、调用数和 token 统计，不接收备注、提示词或代码。输入应包含缓存 token，系统按 max(输入−缓存, 0) + 缓存 + 输出分别套用价格。</p></form></details>"""
 
     collector_ok = queue_status.get("key_loaded") and queue_status.get("last_status") == 200
     quota_ok = quota_status.get("last_success_at") is not None or persisted_quota_accounts > 0

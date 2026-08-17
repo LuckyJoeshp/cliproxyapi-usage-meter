@@ -1804,7 +1804,8 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.assertIn(b'box-shadow:var(--shadow)', page)
         self.assertIn(b'data-role="theme-toggle"', page)
         self.assertIn(b"cliproxy-usage-theme", page)
-        self.assertIn(b"codex-1", page)
+        self.assertIn(b"fixture@example.com", page)
+        self.assertNotIn(b"codex-1", page)
         timeline_status, timeline_headers, timeline_body = self.request(
             "GET", "/usage/timeline?minutes=60", None, alias=None
         )
@@ -2689,6 +2690,8 @@ class UsageMeterMVPTest(unittest.TestCase):
     def test_dashboard_displays_local_account_email_without_persisting_it(self) -> None:
         identity = self.sidecar.resolver.resolve("codex-1", None)
         self.assertEqual(identity.account_email, "fixture@example.com")
+        self.request("POST", "/v1/responses", {"model": "fake-responses"})
+        self.wait_events(1)
         self.sidecar.repo.insert_subscription_quota_snapshot(
             {
                 "fetched_at": "2026-08-13T04:00:00Z",
@@ -2709,7 +2712,14 @@ class UsageMeterMVPTest(unittest.TestCase):
             self.sidecar.repo,
             account_resolver=self.sidecar.resolver,
         )
-        self.assertIn("fixture@example.com", page)
+        # The subscription card, account totals, and recent-attempt table each
+        # use the email exactly once.  The local routing alias is never used as
+        # a dashboard identity label.
+        self.assertEqual(page.count("fixture@example.com"), 3)
+        self.assertNotIn("codex-1", page)
+        unresolved_page = meter.dashboard_html(self.sidecar.repo)
+        self.assertGreaterEqual(unresolved_page.count("邮箱未获取"), 3)
+        self.assertNotIn("codex-1", unresolved_page)
         with sqlite3.connect(self.db) as conn:
             serialized = "\n".join(
                 str(value)

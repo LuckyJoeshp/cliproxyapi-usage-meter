@@ -861,6 +861,7 @@ class SubscriptionPrivacyTest(unittest.TestCase):
             self.assertEqual(len(anonymous), 1)
             row = anonymous[0]
             self.assertEqual((row["calls"], row["input_tokens"], row["total_tokens"]), (2, 100, 130))
+            self.assertEqual(row["account_attempts"], 2)
             self.assertAlmostEqual(row["estimated_api_cost_usd"], 1.25)
             anonymous_columns = {
                 item[1] for item in conn.execute("PRAGMA table_info(anonymous_usage_daily)")
@@ -880,6 +881,7 @@ class SubscriptionPrivacyTest(unittest.TestCase):
         after = self.repo.summary("all")
         for key in (
             "calls",
+            "account_attempts",
             "successful_calls",
             "failed_calls",
             "streaming_calls",
@@ -913,6 +915,205 @@ class SubscriptionPrivacyTest(unittest.TestCase):
             {active_key}, "2026-08-15T00:20:00Z", authoritative=True
         )
         self.assertEqual(again["retired"], 0)
+
+    def test_anonymous_retirement_preserves_account_attempt_classification(self) -> None:
+        active_key = subscription_key("fixture-attempt-active")
+        retired_key = subscription_key("fixture-attempt-retired")
+        self.repo.reconcile_subscription_inventory(
+            {active_key, retired_key},
+            "2026-08-15T00:00:00Z",
+            authoritative=True,
+        )
+        with self.repo.connect() as conn:
+            conn.executemany(
+                """INSERT INTO usage_events (
+                       ts, identity_key, model, status_code, ok, duration_ms,
+                       stream, input_tokens, cached_tokens, output_tokens,
+                       total_tokens, usage_missing, call_count, account_attempt,
+                       source
+                     ) VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?,
+                               'fixture')""",
+                (
+                    (
+                        "2026-08-15T00:01:00Z",
+                        retired_key,
+                        None,
+                        401,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                        4,
+                        0,
+                    ),
+                    (
+                        "2026-08-15T00:01:01Z",
+                        retired_key,
+                        "fixture-model",
+                        200,
+                        1,
+                        20,
+                        5,
+                        7,
+                        27,
+                        0,
+                        2,
+                        1,
+                    ),
+                ),
+            )
+
+        for observed in (
+            "2026-08-15T00:02:00Z",
+            "2026-08-15T00:06:00Z",
+            "2026-08-15T00:13:00Z",
+        ):
+            result = self.repo.reconcile_subscription_inventory(
+                {active_key}, observed, authoritative=True
+            )
+        self.assertEqual(result["retired"], 1)
+
+        with self.repo.connect() as conn:
+            rows = {
+                row["model"]: row
+                for row in conn.execute(
+                    "SELECT * FROM anonymous_usage_daily ORDER BY model"
+                )
+            }
+        self.assertEqual(
+            (rows["(unknown)"]["calls"], rows["(unknown)"]["account_attempts"]),
+            (4, 0),
+        )
+        self.assertEqual(
+            (rows["fixture-model"]["calls"], rows["fixture-model"]["account_attempts"]),
+            (2, 2),
+        )
+        summary = self.repo.summary("all")
+        self.assertEqual(summary["calls"], 6)
+        self.assertEqual(summary["account_attempts"], 2)
+        self.assertEqual(summary["failed_calls"], 4)
+        self.assertEqual(
+            [row["model"] for row in self.repo.grouped("all", "model")],
+            ["fixture-model"],
+        )
+
+    def test_legacy_anonymous_pre_account_401_migration_keeps_http_history(self) -> None:
+        with self.repo.connect() as conn:
+            current_schema = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='anonymous_usage_daily'"
+            ).fetchone()[0]
+        legacy_schema = "\n".join(
+            line
+            for line in str(current_schema).splitlines()
+            if "account_attempts INTEGER" not in line
+        )
+        self.assertNotEqual(legacy_schema, current_schema)
+        legacy_path = self.root / "legacy-anonymous.sqlite"
+        insert_sql = """INSERT INTO anonymous_usage_daily (
+              bucket_start, model, status_code, ok, usage_missing,
+              long_context_pricing_applied, split_priced, total_priced,
+              calls, streaming_calls, non_cached_input_tokens,
+              codex_status_tokens, duration_ms, input_tokens, cached_tokens,
+              cache_write_tokens, output_tokens, reasoning_tokens,
+              total_tokens, estimated_api_cost_usd,
+              non_cached_input_cost_usd, cached_input_cost_usd,
+              output_cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?)"""
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute(legacy_schema)
+            conn.executemany(
+                insert_sql,
+                (
+                    (
+                        "2026-08-17T04:00:00Z",
+                        "(unknown)",
+                        401,
+                        0,
+                        1,
+                        0,
+                        1,
+                        1,
+                        23_418,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ),
+                    (
+                        "2026-08-17T04:00:00Z",
+                        "fixture-model",
+                        200,
+                        1,
+                        0,
+                        0,
+                        1,
+                        1,
+                        3,
+                        0,
+                        270,
+                        330,
+                        30,
+                        300,
+                        30,
+                        0,
+                        60,
+                        10,
+                        360,
+                        1.2,
+                        0.6,
+                        0.1,
+                        0.5,
+                    ),
+                ),
+            )
+
+        legacy_repo = meter.UsageRepository(legacy_path)
+        with legacy_repo.connect() as conn:
+            rows = {
+                row["model"]: row
+                for row in conn.execute(
+                    "SELECT model, calls, account_attempts "
+                    "FROM anonymous_usage_daily"
+                )
+            }
+        self.assertEqual(
+            (rows["(unknown)"]["calls"], rows["(unknown)"]["account_attempts"]),
+            (23_418, 0),
+        )
+        self.assertEqual(
+            (rows["fixture-model"]["calls"], rows["fixture-model"]["account_attempts"]),
+            (3, 3),
+        )
+        summary = legacy_repo.summary("all")
+        self.assertEqual(summary["calls"], 23_421)
+        self.assertEqual(summary["failed_calls"], 23_418)
+        self.assertEqual(summary["account_attempts"], 3)
+        self.assertEqual(
+            [
+                (row["model"], row["calls"], row["account_attempts"])
+                for row in legacy_repo.grouped("all", "model")
+            ],
+            [("fixture-model", 3, 3)],
+        )
+
+        # Reinitialization must not reinterpret accurately stored zeroes as
+        # account attempts.
+        legacy_repo.initialize()
+        self.assertEqual(legacy_repo.summary("all")["account_attempts"], 3)
 
     def test_anonymous_bucket_preserves_per_event_derived_token_totals(self) -> None:
         active_key = subscription_key("fixture-derived-active")
@@ -960,6 +1161,7 @@ class SubscriptionPrivacyTest(unittest.TestCase):
         daily_after = self.repo.daily_usage(7)
         invariant_fields = (
             "calls",
+            "account_attempts",
             "input_tokens",
             "cached_tokens",
             "output_tokens",
@@ -1728,18 +1930,19 @@ class SubscriptionPrivacyTest(unittest.TestCase):
                 """INSERT INTO anonymous_usage_daily (
                      bucket_start, model, status_code, ok, usage_missing,
                      long_context_pricing_applied, split_priced, total_priced,
-                     calls, streaming_calls, non_cached_input_tokens,
+                     calls, account_attempts, streaming_calls, non_cached_input_tokens,
                      codex_status_tokens, duration_ms, input_tokens,
                      cached_tokens, cache_write_tokens, output_tokens,
                      reasoning_tokens, total_tokens, estimated_api_cost_usd,
                      non_cached_input_cost_usd, cached_input_cost_usd,
                      output_cost_usd
-                   ) VALUES (?, ?, 200, 1, 0, 0, 1, 1, ?, ?, ?, ?, ?, ?, ?, 0,
+                   ) VALUES (?, ?, 200, 1, 0, 0, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, 0,
                              ?, 0, ?, ?, ?, ?, ?)""",
                 (
                     (
                         bucket,
                         "(unknown)",
+                        2,
                         2,
                         1,
                         8,
@@ -1757,6 +1960,7 @@ class SubscriptionPrivacyTest(unittest.TestCase):
                     (
                         bucket,
                         "bucket-owner@example.test",
+                        3,
                         3,
                         2,
                         12,
@@ -1780,6 +1984,7 @@ class SubscriptionPrivacyTest(unittest.TestCase):
         after = self.repo.summary("all")
         for field in (
             "calls",
+            "account_attempts",
             "streaming_calls",
             "input_tokens",
             "cached_tokens",
@@ -1798,6 +2003,7 @@ class SubscriptionPrivacyTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["model"], "(unknown)")
             self.assertEqual(rows[0]["calls"], 5)
+            self.assertEqual(rows[0]["account_attempts"], 5)
             self.assertEqual(rows[0]["input_tokens"], 10)
         self.assertNotIn("bucket-owner@example.test", "\n".join(self._sqlite_dump()))
 
