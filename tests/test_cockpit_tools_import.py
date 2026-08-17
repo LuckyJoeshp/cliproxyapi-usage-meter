@@ -419,14 +419,18 @@ class CockpitToolsImporterTest(unittest.TestCase):
         now = datetime(2026, 8, 14, 0, 0, 59, tzinfo=timezone.utc)
         self.assertEqual(
             self.repo.response_timeline(1, now=now)["totals"],
-            {"status_200": 1, "status_non_200": 1, "total": 2},
+            {"status_200": 1, "status_non_200": 0, "total": 1},
         )
         page = meter.dashboard_html(
             self.repo,
             account_resolver=self.resolver,
             cockpit_status=self.importer.status(),
         )
-        self.assertIn("账号选择前的网关鉴权拒绝仅保留在 HTTP 时间轴", page)
+        self.assertIn(
+            "账号选择前的网关鉴权拒绝仅保留在调用/失败历史",
+            page,
+        )
+        self.assertIn("账号选择前的网关拒绝不进入时间轴", page)
         self.assertIn("成功 1 · 失败 0 · 请求关联不落库", page)
         self.assertNotIn('<span class="status-pill bad">401</span>', page)
 
@@ -437,6 +441,15 @@ class CockpitToolsImporterTest(unittest.TestCase):
             connection.execute(
                 "UPDATE usage_events SET account_attempt=1 WHERE status_code=401"
             )
+            event_id = connection.execute(
+                "SELECT id FROM usage_events WHERE status_code=401"
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO api_response_observations (
+                       observation_key, minute_ts, status_code, call_count, source
+                   ) VALUES (?, '2026-08-14T00:00:00Z', 401, 1, ?)""",
+                (f"usage:{event_id}", meter.COCKPIT_TOOLS_REQUEST_SOURCE),
+            )
 
         self.repo.initialize()
 
@@ -446,7 +459,7 @@ class CockpitToolsImporterTest(unittest.TestCase):
         now = datetime(2026, 8, 14, 0, 0, 59, tzinfo=timezone.utc)
         self.assertEqual(
             self.repo.response_timeline(1, now=now)["totals"]["status_non_200"],
-            1,
+            0,
         )
 
     def test_newer_metadata_versions_and_additive_columns_are_accepted(self) -> None:
@@ -573,6 +586,57 @@ class CockpitToolsImporterTest(unittest.TestCase):
                 "total": 1,
             },
         )
+
+    def test_response_timeline_backfill_removes_legacy_pre_account_401(self) -> None:
+        event_key = "legacy-gateway-401-observation"
+        self._insert_pre_account_rejection(event_key, 1_786_665_600)
+        self.assertEqual(self.importer.import_once()["imported"], 1)
+        now = datetime(2026, 8, 14, 0, 0, 59, tzinfo=timezone.utc)
+        self.assertEqual(
+            self.repo.response_timeline(1, now=now)["totals"],
+            {"status_200": 0, "status_non_200": 0, "total": 0},
+        )
+
+        import_key = self.resolver.cockpit_event_import_key(event_key)
+        assert import_key is not None
+        # Simulate a database created by the previous response-ledger build.
+        with self.repo.connect() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO api_response_observations (
+                       observation_key, minute_ts, status_code, call_count, source
+                   ) VALUES (?, '2026-08-14T00:00:00Z', 401, 1, ?)""",
+                (
+                    f"import:{import_key}",
+                    meter.COCKPIT_TOOLS_REQUEST_SOURCE,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO api_response_backfills (source, version, completed_at)
+                   VALUES (?, 1, '2026-08-14T00:00:00Z')
+                   ON CONFLICT(source) DO UPDATE SET version=excluded.version""",
+                (meter.COCKPIT_TOOLS_REQUEST_SOURCE,),
+            )
+
+        replay = self.importer.import_once()
+        self.assertEqual((replay["imported"], replay["scanned"]), (0, 1))
+        self.assertEqual(
+            self.repo.response_timeline(1, now=now)["totals"],
+            {"status_200": 0, "status_non_200": 0, "total": 0},
+        )
+        with self.repo.connect() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM api_response_observations WHERE observation_key=?",
+                    (f"import:{import_key}",),
+                ).fetchone()
+            )
+
+    def test_repository_connection_context_closes_descriptor(self) -> None:
+        connection = self.repo.connect()
+        with connection:
+            self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
     def test_zero_rate_tokens_stay_unpriced_and_millisecond_time_is_normalized(self) -> None:
         self._insert_request(

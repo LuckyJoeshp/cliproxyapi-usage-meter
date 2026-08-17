@@ -85,7 +85,9 @@ COCKPIT_TOOLS_QUOTA_SOURCE = "cockpit_tools_quota"
 # imports and manual imports have no HTTP response status and intentionally
 # stay out of the response health timeline.
 RESPONSE_TIMELINE_SOURCES = ("sidecar", "usage_queue", COCKPIT_TOOLS_REQUEST_SOURCE)
-RESPONSE_OBSERVATION_BACKFILL_VERSION = 1
+# Version 2 removes pre-account gateway responses from the HTTP health
+# timeline while retaining them in the usage/failure history.
+RESPONSE_OBSERVATION_BACKFILL_VERSION = 2
 DEFAULT_RESPONSE_TIMELINE_MINUTES = 24 * 60
 MAX_RESPONSE_TIMELINE_MINUTES = 7 * 24 * 60
 MAX_MANUAL_IMPORT_BYTES = 64 * 1024
@@ -326,6 +328,24 @@ def open_sqlite_readonly(path: Path | str, timeout: float = 2.0) -> sqlite3.Conn
     if errors:
         raise errors[-1]
     raise sqlite3.OperationalError("unable to open database file")
+
+
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit or roll back a context-managed transaction, then close it.
+
+    ``sqlite3.Connection.__exit__`` only finishes the transaction; it does not
+    close the file descriptor.  Normal request traffic usually lets cyclic GC
+    catch up, but a full Cockpit replay can open tens of thousands of
+    short-lived connections and exhaust the process descriptor limit first.
+    Repository callers already scope every connection with ``with``, so make
+    that scope own the underlying descriptor as well.
+    """
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool | None:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 def canonical_subscription_key(value: Any) -> str | None:
@@ -2184,9 +2204,9 @@ class UsageEvent:
     call_count: int = 1
     source: str = "sidecar"
     request_id: str | None = None
-    # Some API responses happen before an upstream subscription is selected.
-    # Keep them in the all-API response ledger without treating them as an
-    # account-pool attempt or availability signal.
+    # Some gateway responses happen before an upstream subscription is
+    # selected. Keep them in usage history without treating them as an
+    # upstream API response, account-pool attempt, or availability signal.
     account_attempt: int = 1
 
 
@@ -2272,7 +2292,11 @@ class UsageRepository:
                 LOG.warning("database permission hardening failed: %s", type(exc).__name__)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=15.0)
+        conn = sqlite3.connect(
+            self.path,
+            timeout=15.0,
+            factory=_ClosingSQLiteConnection,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -2731,6 +2755,27 @@ class UsageRepository:
                   ON retired_subscription_tombstones(retired_at);
                 """
             )
+            # A pre-account response is a local gateway decision, not an
+            # upstream API response.  Remove observations created by older
+            # builds before reseeding the identity-free ledger.  Imported rows
+            # whose detail was already privacy-retired are cleaned by the
+            # versioned Cockpit raw-log replay below.
+            conn.execute(
+                """
+                DELETE FROM api_response_observations
+                 WHERE observation_key IN (
+                       SELECT 'usage:' || id
+                         FROM usage_events
+                        WHERE COALESCE(account_attempt, 1)=0
+                       UNION
+                       SELECT 'import:' || imports.import_key
+                         FROM local_import_records imports
+                         JOIN usage_events events
+                           ON events.id=imports.usage_event_id
+                        WHERE COALESCE(events.account_attempt, 1)=0
+                 )
+                """
+            )
             # Seed the identity-free response ledger from every API event that
             # still has a live detail row.  Imported events use their stable,
             # opaque import key so future repricing scans update the same
@@ -2758,6 +2803,7 @@ class UsageRepository:
                       LEFT JOIN local_import_records imported
                         ON imported.usage_event_id=usage_events.id
                      WHERE usage_events.source IN ({placeholders})
+                       AND COALESCE(usage_events.account_attempt, 1)=1
                        AND strftime('%Y-%m-%dT%H:%M:00Z', usage_events.ts) IS NOT NULL
                     ON CONFLICT(observation_key) DO UPDATE SET
                       minute_ts=excluded.minute_ts,
@@ -4496,6 +4542,7 @@ class UsageRepository:
                 event.status_code,
                 event.call_count,
                 values["source"],
+                values["account_attempt"],
             )
             return event_id, identity_allowed
 
@@ -4545,8 +4592,14 @@ class UsageRepository:
         status_code: Any,
         call_count: Any,
         source: Any,
+        account_attempt: Any = 1,
     ) -> None:
-        """Persist identity-free HTTP response metadata at minute precision."""
+        """Persist eligible HTTP response metadata at minute precision.
+
+        Account-selection failures are retained in ``usage_events`` for
+        request/failure history, but they are not upstream API responses and
+        therefore must not affect the HTTP health timeline.
+        """
 
         safe_source = safe_alias(source)
         safe_key = safe_text(observation_key, 512)
@@ -4556,6 +4609,12 @@ class UsageRepository:
             or not safe_key
             or not normalized
         ):
+            return
+        if as_nonnegative_int(account_attempt) == 0:
+            conn.execute(
+                "DELETE FROM api_response_observations WHERE observation_key=?",
+                (safe_key,),
+            )
             return
         parsed_status = as_nonnegative_int(status_code)
         if parsed_status is not None and not 100 <= parsed_status <= 599:
@@ -4764,6 +4823,7 @@ class UsageRepository:
                         event.status_code,
                         event.call_count,
                         safe_source,
+                        values["account_attempt"],
                     )
                 return False
             self._upsert_api_response_observation_conn(
@@ -4773,6 +4833,7 @@ class UsageRepository:
                 event.status_code,
                 event.call_count,
                 safe_source,
+                values["account_attempt"],
             )
             canonical_key = canonical_subscription_key(event.identity_key)
             if canonical_key and not self._subscription_detail_allowed_conn(
@@ -4827,6 +4888,7 @@ class UsageRepository:
                 event.status_code,
                 event.call_count,
                 safe_source,
+                values["account_attempt"],
             )
             canonical_key = canonical_subscription_key(event.identity_key)
             identity_allowed = bool(
@@ -5469,13 +5531,14 @@ class UsageRepository:
         *,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Return the dense all-API one-minute HTTP response timeline.
+        """Return the dense one-minute HTTP response timeline.
 
         ``status_200`` deliberately means *exactly* HTTP 200.  Every other
         status (including the synthetic 502 recorded when the upstream does
-        not answer) is counted in ``status_non_200``.  The fixed all-API scope
-        includes proxy, usage-queue, and Cockpit Tools request events.  Local
-        token imports are not API responses and are always excluded.
+        not answer) is counted in ``status_non_200``.  The fixed scope includes
+        proxy, usage-queue, and Cockpit Tools request events that reached an
+        upstream API.  Local gateway decisions made before account selection
+        are retained in usage history but are excluded.
 
         The returned buckets are UTC and include zero-valued minutes so a
         client can draw a continuous line without inventing missing samples.
@@ -6301,7 +6364,7 @@ class UsageRepository:
             """
         elif dimension == "model":
             # A request rejected by the local gateway before account/model
-            # selection is an API response, not model consumption.
+            # selection remains failure history, not model consumption.
             extra_filter = "AND account_attempt_count>0"
         with self.connect() as conn:
             rows = conn.execute(
@@ -7590,8 +7653,9 @@ class CockpitToolsImporter:
             source=COCKPIT_TOOLS_REQUEST_SOURCE,
             request_id=None,
             # An empty Cockpit selector means its gateway rejected the client
-            # before choosing a subscription. Preserve the API response, but
-            # do not let it masquerade as an account-pool attempt.
+            # before choosing a subscription. Preserve the request history,
+            # but do not let it masquerade as an upstream response or
+            # account-pool attempt.
             account_attempt=int(bool(storage_id)),
         )
         return event, import_key
@@ -9329,7 +9393,7 @@ RESPONSE_TIMELINE_SCRIPT = """
     });
     roleText(
       'timeline-sync',
-      '全部 API · 每分钟 · 更新至 ' +
+      '账号选择后 API · 每分钟 · 更新至 ' +
       localTime(nextPayload.to || points[points.length - 1].ts, false)
     );
     hideTooltip();
@@ -9460,7 +9524,7 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
         else "暂无"
     )
     return f"""
-<div class="section-title"><div><h2>API 响应时间轴</h2><p>全部 API 的 HTTP 200 与非 200 双折线；连续到每一分钟，快速定位无响应与异常时段。</p></div><small>默认近 24 小时</small></div>
+<div class="section-title"><div><h2>API 响应时间轴</h2><p>已进入账号选择阶段的 API HTTP 200 与非 200 双折线；连续到每一分钟，快速定位无响应与异常时段。</p></div><small>默认近 24 小时</small></div>
 <section class="panel response-timeline-panel" data-role="response-timeline" data-endpoint="/usage/timeline">
   <div class="timeline-toolbar">
     <div class="timeline-kpis" aria-live="polite">
@@ -9500,8 +9564,8 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
       <small data-role="timeline-tooltip-total">该分钟共 0 次调用</small>
     </div>
   </div>
-  <div class="timeline-meta"><div class="timeline-legend"><span><i class="ok"></i>HTTP 200</span><span><i class="bad"></i>非 200 / 无上游响应</span></div><div class="timeline-sync" data-role="timeline-sync">全部 API · 每分钟</div></div>
-  <div class="timeline-footnote">时间轴固定合并 Cockpit Tools、8327 代理与 8317 队列，并写入不含账号信息的分钟观测，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
+  <div class="timeline-meta"><div class="timeline-legend"><span><i class="ok"></i>HTTP 200</span><span><i class="bad"></i>非 200 / 无上游响应</span></div><div class="timeline-sync" data-role="timeline-sync">账号选择后 API · 每分钟</div></div>
+  <div class="timeline-footnote">时间轴固定合并 Cockpit Tools、8327 代理与 8317 队列中已进入账号选择阶段的请求；账号选择前的网关拒绝不进入时间轴。分钟观测不含账号信息，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
 </section>
 <script id="response-timeline-data" type="application/json">{payload_json}</script>
 """
@@ -9972,7 +10036,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 <section class="panel trend-panel"><div class="trend">{trend_bars}</div></section>
 <div class="section-title"><div><h2>订阅额度雷达</h2><p>剩余百分比来自 Codex provider 实际窗口（按时长归类为 5 小时/周/月）；美元额度优先按当前窗口估算，低使用量只显示观测下限。</p></div><small>{fmt_int(persisted_quota_accounts)} 个账号已刷新</small></div>
 <section class="subscription-grid">{subscriptions_html}</section>
-<div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近账号尝试；账号选择前的网关鉴权拒绝仅保留在 HTTP 时间轴。</p></div></div>
+<div class="section-title"><div><h2>消费明细</h2><p>近 7 天模型分布与最近账号尝试；账号选择前的网关鉴权拒绝仅保留在调用/失败历史，不计入模型消费、账号尝试或 HTTP 响应时间轴。</p></div></div>
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><p class="table-note">这是历史完成记录（时间精确到秒）；账号进入冷却不会删除冷却前的成功记录，当前状态以账号卡的最新额度信号为准。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>

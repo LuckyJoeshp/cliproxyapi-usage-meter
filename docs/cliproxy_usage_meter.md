@@ -328,8 +328,8 @@ CLIProxyAPI 账号池可能用多个订阅账号处理同一个逻辑请求。�
 - `logical_requests`：历史上有 request id 的行可按其去重；新写入为避免跨表关联，不持久化
   request id，因此按实际调用/聚合 `call_count` 计数。
 - `account_attempts`：真正进入订阅账号选择后的 SQLite 调用行数；网关在账号选择前拒绝的
-  请求（例如 Cockpit `auth_failed` 且没有 `account_id` 的 401）仍保留为 API 调用和 HTTP
-  时间轴观测，但 `account_attempts` 为 0。`retry_attempts = attempts - logical_requests`，
+  请求（例如 Cockpit `auth_failed` 且没有 `account_id` 的 401）仍保留在调用/失败历史中，
+  但不进入 HTTP 响应时间轴，且 `account_attempts` 为 0。`retry_attempts = attempts - logical_requests`，
   看板文案称为“额外调用”，不等同于失败数。
 
 每个订阅卡也会单独显示总调用、成功调用、失败调用和额外调用，便于识别某个账号是否
@@ -428,7 +428,7 @@ cliproxyapi 或 Cockpit 本体。`/usage` 与
 `/healthz` 都是动态本机状态，响应带 `Cache-Control: no-store`，避免浏览器复用旧额度或身份映射。
 额度卡通过运行时 resolver 补回邮箱/alias；SQLite 中的额度快照本身不含这些可读身份信息。
 其中“最近 50 次账号尝试”只取已到达账号选择阶段的调用；账号选择前的网关 401 不占用列表名额，
-但仍会在 HTTP 响应时间轴的非 200 线上显示。该列表是历史完成记录，时间精确到秒；账号进入
+也不进入 HTTP 响应时间轴，而只保留在调用/失败历史中。该列表是历史完成记录，时间精确到秒；账号进入
 冷却不会删除冷却前的成功行，当前可调用性以账号卡最新 provider gate/执行信号为准。
 
 新版主视图额外提供：
@@ -436,8 +436,8 @@ cliproxyapi 或 Cockpit 本体。`/usage` 与
 - 累计、今日、近 7 日的实际消耗（非缓存输入 + 输出）、缓存输入、API 原始处理量、
   输出、推理 token、缓存命中率与 API 等价成本。
 - 近 1/6/24 小时的每分钟 HTTP 200 与非 200 双折线时间轴，固定合并 Cockpit Tools、
-  8327 sidecar 与 8317 usage queue 的全部 API 响应；无上游响应时 sidecar 写入的 502
-  归入非 200 线。
+  8327 sidecar 与 8317 usage queue 中已进入账号选择阶段的 API 请求；账号选择前的网关
+  拒绝排除在外，无上游响应时 sidecar 写入的 502 归入非 200 线。
 - 近 7 天 token/cost 柱状趋势。
 - 每个 Codex 订阅按实际窗口时长归类的 5 小时、周或月剩余百分比、重置时间与 provider gate 状态。
 - 每账号当前周期已观测美元下限，以及基于 provider 周/月窗口的 API 等价满额度估值。
@@ -452,7 +452,7 @@ GET /usage/timeline?minutes=1440
 
 `minutes` 可取 `1`～`10080`（最多 7 天），返回连续的 UTC 分钟桶；没有调用的分钟也会返回
 零值。接口固定包含 `sidecar`、`usage_queue` 和 `cockpit_tools` 三类 API 来源，不提供单来源
-筛选，也不把缺少 HTTP 状态的本地/手动 token 导入混入响应曲线。每个 point 的
+筛选，也不把账号选择前的网关拒绝或缺少 HTTP 状态的本地/手动 token 导入混入响应曲线。每个 point 的
 `status_200` 只统计精确的 HTTP 200，`status_non_200` 统计其余状态，`total` 为两者之和。
 顶层 `totals` 提供同一窗口汇总。接口带 `Cache-Control: no-store`，不返回账号、模型、错误正文
 或其他身份字段。
