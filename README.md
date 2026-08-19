@@ -11,7 +11,8 @@ See every request, split input/cache/output tokens, estimate API-equivalent
 cost, observe quota resets, and understand account-pool retries from one
 private-by-default dashboard. It runs as a transparent sidecar: clients can
 send traffic through `8327`, while the optional read-only queue collector also
-captures clients that still use `8317`.
+captures clients that still use `8317`, and the Sub2API importer observes
+`codex-s2a` traffic sent directly to a local Sub2API instance.
 
 ![Usage Observatory demo — real aggregates with account IDs masked](assets/usage-dashboard-demo.png)
 
@@ -44,7 +45,7 @@ retry?** This sidecar keeps those questions separate and auditable in SQLite.
 | Cost estimation | Collector-frozen per-request prices or official OpenAI short/long-context prices, split by token type |
 | Account behavior | Per-subscription calls, success/failure, models, dates, and token totals |
 | Quota visibility | Read-only windows classified by duration (5-hour/week/month), reset times, provider gate state, cooldowns, and observed floors |
-| Collection paths | Transparent `8327` proxy, optional destructive-read `8317` usage queue, and default-on read-only Cockpit Tools import |
+| Collection paths | Transparent `8327` proxy, optional destructive-read `8317` usage queue, read-only Cockpit Tools import, and authenticated loopback Sub2API import |
 | Dashboard | Inline, dependency-free `/usage` HTML with a per-minute HTTP 200/non-200 line timeline, token trend, account, model, and recent-call views |
 | Privacy boundary | Loopback by default; credentials and request metadata discarded; email is memory-only |
 
@@ -85,6 +86,47 @@ produces no quota card. Set
 single-home matching is desired. The `/usage` manual import form is exposed in
 that fixed-alias mode only. Dollar values are API-equivalent estimates, not Pro
 subscription billing.
+
+### Import direct `codex-s2a` traffic from Sub2API
+
+Requests sent by `codex-s2a` directly to Sub2API on `127.0.0.1:8080` never pass
+through the `8327` proxy or CLIProxyAPI queue. The default-on Sub2API importer
+therefore reads the paginated management endpoints
+`GET /api/v1/admin/accounts` and `GET /api/v1/admin/usage`. It stays idle until
+an admin API key is configured.
+
+Enable `admin_api_key` in Sub2API, then put the matching plaintext key in an
+owner-only file outside this checkout. Do not use a normal client API key:
+
+```bash
+chmod 600 /path/to/sub2api-admin.key
+SUB2API_BASE_URL=http://127.0.0.1:8080 \
+SUB2API_ADMIN_KEY_FILE=/path/to/sub2api-admin.key \
+  PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
+  scripts/start_cliproxy_usage_meter.sh
+```
+
+The admin key is highly privileged, so the importer accepts only loopback
+HTTP(S) origins; use a local tunnel for a remote deployment. The environment
+variable `SUB2API_ADMIN_KEY` is supported, but an external `0600` file is
+preferred. Initial history defaults to 30 days, followed by an overlapping,
+idempotent incremental scan. Configure it with `SUB2API_POLL_SECONDS`,
+`SUB2API_TIMEOUT`, `SUB2API_PAGE_SIZE`, and `SUB2API_BACKFILL_DAYS`, or the
+matching `--sub2api-*` flags. Use `--no-sub2api-import` to disable it.
+
+Sub2API's non-cached input, cache creation, and cache read counters are rebuilt
+into the meter's input/cache split, while the request's frozen cost components
+are retained. A complete account inventory also creates account-status cards,
+so a newly added account appears before its first request; Codex 5-hour and
+7-day quota snapshots are imported when present. Email is available only to
+the running dashboard. SQLite stores domain-separated keyed identities, not
+the admin key, account/request IDs, account names, or email. Sanitized state is
+shown on `/usage` and `/healthz`.
+
+> **Double-count warning:** leave `codex-s2a` pointed directly at Sub2API when
+> this importer is enabled. If the same request is also proxied through `8327`,
+> the transparent proxy event and Sub2API usage row are two independent
+> observations of one call.
 
 ### Migrate traffic to Cockpit Tools
 

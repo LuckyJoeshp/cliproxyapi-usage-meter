@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import http.client
 import importlib.util
 import hashlib
@@ -1618,9 +1618,11 @@ class UsageMeterMVPTest(unittest.TestCase):
         self.request("POST", "/v1/fail", {"model": "fake-error"})
         self.wait_events(1)
         identity = self.rows("SELECT identity_key, account_id_hash, account_id_tail FROM usage_events LIMIT 1")[0]
+        snapshot_at = datetime.now(timezone.utc)
+        reset_at = snapshot_at + timedelta(days=1)
         self.sidecar.repo.insert_subscription_quota_snapshot(
             {
-                "fetched_at": "2026-08-12T00:00:00Z",
+                "fetched_at": snapshot_at,
                 "identity_key": identity["identity_key"],
                 "account_id_hash": identity["account_id_hash"],
                 "account_id_tail": identity["account_id_tail"],
@@ -1629,7 +1631,7 @@ class UsageMeterMVPTest(unittest.TestCase):
                 "used_percent": 100,
                 "remaining_percent": 0,
                 "window_seconds": 604800,
-                "reset_at": "2026-08-19T00:00:00Z",
+                "reset_at": reset_at,
                 "source": "fixture",
             }
         )
@@ -1768,7 +1770,7 @@ class UsageMeterMVPTest(unittest.TestCase):
         )
         self.assertEqual(
             timeline["sources"],
-            ["sidecar", "usage_queue", "cockpit_tools"],
+            ["sidecar", "usage_queue", "cockpit_tools", "sub2api"],
         )
         self.assertEqual(timeline["source"], "api")
         with self.assertRaises(ValueError):

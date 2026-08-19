@@ -81,13 +81,29 @@ DEFAULT_COCKPIT_TOOLS_POLL_SECONDS = 15.0
 MAX_COCKPIT_TOOLS_CACHE_BYTES = 16 * 1024 * 1024
 COCKPIT_TOOLS_REQUEST_SOURCE = "cockpit_tools"
 COCKPIT_TOOLS_QUOTA_SOURCE = "cockpit_tools_quota"
+DEFAULT_SUB2API_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_SUB2API_POLL_SECONDS = 15.0
+DEFAULT_SUB2API_TIMEOUT = 20.0
+DEFAULT_SUB2API_PAGE_SIZE = 1000
+DEFAULT_SUB2API_BACKFILL_DAYS = 30
+MAX_SUB2API_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_SUB2API_PAGES = 10_000
+SUB2API_REQUEST_SOURCE = "sub2api"
+SUB2API_QUOTA_SOURCE = "sub2api_quota"
+SUB2API_ACCOUNT_SOURCE = "sub2api_account"
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 COCKPIT_TOOLS_TERMINAL_ACCOUNT_ERROR_CODES = frozenset(
     {"deactivated_workspace", "token_invalidated"}
 )
 # Sources that represent an actual API request/response.  Local Codex token
 # imports and manual imports have no HTTP response status and intentionally
 # stay out of the response health timeline.
-RESPONSE_TIMELINE_SOURCES = ("sidecar", "usage_queue", COCKPIT_TOOLS_REQUEST_SOURCE)
+RESPONSE_TIMELINE_SOURCES = (
+    "sidecar",
+    "usage_queue",
+    COCKPIT_TOOLS_REQUEST_SOURCE,
+    SUB2API_REQUEST_SOURCE,
+)
 # Version 2 removes pre-account gateway responses from the HTTP health
 # timeline while retaining them in the usage/failure history.
 RESPONSE_OBSERVATION_BACKFILL_VERSION = 2
@@ -761,6 +777,11 @@ class AccountResolver:
         self._cockpit_inventory_keys: set[str] = set()
         self._cockpit_inventory_authoritative = False
         self._cockpit_detected = False
+        # Sub2API account names/emails are supplied by its authenticated
+        # loopback API and remain process-local.  Only the HMAC-backed keys in
+        # these identities are ever written to the meter database.
+        self._sub2api_accounts: dict[str, AccountIdentity] = {}
+        self._sub2api_identity_keys: dict[str, AccountIdentity] = {}
 
     def configure_cockpit_sources(
         self,
@@ -975,7 +996,13 @@ class AccountResolver:
             return AccountIdentity(None, None, None)
         self._refresh_if_needed()
         canonical = self._legacy_identity_keys.get(key, key)
-        return self._identity_keys.get(canonical, AccountIdentity(None, None, None))
+        return self._identity_keys.get(
+            canonical,
+            self._sub2api_identity_keys.get(
+                canonical,
+                AccountIdentity(None, None, None),
+            ),
+        )
 
     def subscription_account_hashes(self) -> set[str]:
         """Return account hashes that have principal-scoped identities."""
@@ -991,7 +1018,115 @@ class AccountResolver:
         """Return current local canonical keys without exposing their inputs."""
 
         self._refresh_if_needed(force=force_refresh)
-        return set(self._active_subscription_keys)
+        return set(self._active_subscription_keys) | set(self._sub2api_identity_keys)
+
+    def register_sub2api_accounts(
+        self,
+        instance_scope: str,
+        records: Sequence[Mapping[str, Any]],
+    ) -> dict[str, AccountIdentity]:
+        """Replace the in-memory Sub2API account inventory.
+
+        A unique email match reuses an existing CLIProxyAPI/Cockpit identity.
+        Otherwise the Sub2API instance and numeric selector receive a stable,
+        domain-separated HMAC identity.  Raw selectors and labels never leave
+        this in-memory mapping.
+        """
+
+        scope = safe_text(instance_scope, 512)
+        if not scope:
+            raise ValueError("invalid Sub2API instance scope")
+        self._refresh_if_needed()
+        with self._lock:
+            email_candidates: dict[str, dict[str, AccountIdentity]] = {}
+            for key, identity in self._identity_keys.items():
+                normalized = normalize_email_identity(identity.account_email)
+                canonical = canonical_subscription_key(key)
+                if normalized and canonical:
+                    email_candidates.setdefault(normalized, {})[canonical] = identity
+
+            accounts: dict[str, AccountIdentity] = {}
+            identity_keys: dict[str, AccountIdentity] = {}
+            for record in records:
+                raw_id = record.get("id")
+                if isinstance(raw_id, bool):
+                    continue
+                try:
+                    account_id = str(int(raw_id))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if int(account_id) <= 0 or account_id in accounts:
+                    continue
+                extra = record.get("extra")
+                extra = extra if isinstance(extra, Mapping) else {}
+                email = safe_email(extra.get("email")) or safe_email(record.get("name"))
+                normalized = normalize_email_identity(email)
+                matches = email_candidates.get(normalized or "", {})
+                identity = next(iter(matches.values())) if len(matches) == 1 else None
+                if identity is None:
+                    subscription_hash = self._private_hash(
+                        "sub2api-account-v1",
+                        scope,
+                        account_id,
+                    )
+                    identity = AccountIdentity(
+                        None,
+                        self._private_hash(
+                            "sub2api-account-reference-v1",
+                            scope,
+                            account_id,
+                        )[:16],
+                        None,
+                        email,
+                        None,
+                        subscription_hash,
+                        None,
+                    )
+                key = resolved_identity_key(identity)
+                if not canonical_subscription_key(key):
+                    continue
+                accounts[account_id] = identity
+                identity_keys[key] = identity
+            self._sub2api_accounts = accounts
+            self._sub2api_identity_keys = identity_keys
+            return dict(accounts)
+
+    def resolve_sub2api_account(self, account_id: Any) -> AccountIdentity:
+        if isinstance(account_id, bool):
+            return AccountIdentity(None, None, None)
+        try:
+            key = str(int(account_id))
+        except (TypeError, ValueError, OverflowError):
+            return AccountIdentity(None, None, None)
+        return self._sub2api_accounts.get(key, AccountIdentity(None, None, None))
+
+    def sub2api_event_import_key(
+        self,
+        instance_scope: str,
+        event_id: Any,
+        request_id: Any,
+        created_at: Any,
+    ) -> str | None:
+        """Return a stable import key without retaining Sub2API request IDs."""
+
+        if isinstance(event_id, bool):
+            return None
+        try:
+            numeric_id = int(event_id)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        scope = safe_text(instance_scope, 512)
+        request = safe_text(request_id, 4096) or ""
+        timestamp = safe_text(created_at, 128) or ""
+        if not scope or numeric_id <= 0:
+            return None
+        return "sub2api:" + self._private_hash(
+            "sub2api-usage-event-v1",
+            scope,
+            str(numeric_id),
+            request,
+            timestamp,
+        )
 
     def resolve_cockpit_account(
         self,
@@ -2539,6 +2674,12 @@ class UsageRepository:
                   updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS remote_import_state (
+                  source TEXT PRIMARY KEY,
+                  last_complete_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS api_response_observations (
                   observation_key TEXT PRIMARY KEY,
                   minute_ts TEXT NOT NULL,
@@ -3871,7 +4012,8 @@ class UsageRepository:
                         SELECT identity_key FROM usage_events
                          WHERE identity_key LIKE 'subscription:%'
                            AND COALESCE(source, 'sidecar') IN (
-                                 'sidecar', 'usage_queue', 'cockpit_tools'
+                                 'sidecar', 'usage_queue', 'cockpit_tools',
+                                 'sub2api'
                                )
                         UNION
                         SELECT identity_key FROM subscription_quota_snapshots
@@ -5004,6 +5146,34 @@ class UsageRepository:
             ).fetchone()
         return dict(row)
 
+    def remote_import_state(self, source: str) -> dict[str, Any] | None:
+        safe_source = safe_alias(source)
+        if not safe_source:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM remote_import_state WHERE source=?",
+                (safe_source,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_remote_import_state(self, source: str, last_complete_at: Any) -> None:
+        safe_source = safe_alias(source)
+        completed = normalize_optional_timestamp(last_complete_at)
+        if not safe_source or not completed:
+            raise ValueError("invalid remote import state")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO remote_import_state (source, last_complete_at, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                  last_complete_at=excluded.last_complete_at,
+                  updated_at=excluded.updated_at
+                """,
+                (safe_source, completed, utc_now()),
+            )
+
     def api_response_backfill_required(
         self,
         source: str,
@@ -5789,7 +5959,7 @@ class UsageRepository:
         return result
 
     def insert_subscription_quota_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
-        allowed_windows = {"five_hour", "weekly", "monthly"}
+        allowed_windows = {"five_hour", "weekly", "monthly", "account_status"}
         window_kind = safe_text(snapshot.get("window_kind"), 32)
         if window_kind not in allowed_windows:
             raise ValueError("invalid subscription quota window")
@@ -7883,6 +8053,655 @@ class CockpitToolsImporter:
         }
 
 
+class Sub2APIHTTPError(RuntimeError):
+    def __init__(self, status: int):
+        super().__init__(f"Sub2API HTTP {status}")
+        self.status = status
+
+
+class Sub2APISchemaError(ValueError):
+    pass
+
+
+class Sub2APIImporter:
+    """Import Sub2API's account inventory and successful usage logs over HTTP.
+
+    The management key is read only when a request is made and is never
+    persisted or logged.  The importer accepts only a loopback origin because
+    a Sub2API admin key is substantially more privileged than a normal gateway
+    key; remote instances should be exposed through a local tunnel.
+    """
+
+    def __init__(
+        self,
+        repo: UsageRepository,
+        resolver: AccountResolver,
+        *,
+        base_url: str = DEFAULT_SUB2API_BASE_URL,
+        key_file: str | Path | None = None,
+        key_env: str = "SUB2API_ADMIN_KEY",
+        poll_seconds: float = DEFAULT_SUB2API_POLL_SECONDS,
+        timeout: float = DEFAULT_SUB2API_TIMEOUT,
+        page_size: int = DEFAULT_SUB2API_PAGE_SIZE,
+        backfill_days: int = DEFAULT_SUB2API_BACKFILL_DAYS,
+    ) -> None:
+        self.repo = repo
+        self.resolver = resolver
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or (parsed.hostname or "").casefold() not in LOOPBACK_HOSTS
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Sub2API base URL must be a loopback HTTP(S) origin")
+        base_path = parsed.path.rstrip("/")
+        if base_path in {"", "/"}:
+            api_root = "/api/v1"
+        elif base_path == "/api/v1":
+            api_root = base_path
+        else:
+            raise ValueError("Sub2API base URL path must be empty or /api/v1")
+        self.origin = parsed
+        self.api_root = api_root
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self.instance_scope = (
+            f"{parsed.scheme}://{(parsed.hostname or '').casefold()}:{port}{api_root}"
+        )
+        self.key_file = Path(key_file).expanduser() if key_file else None
+        self.key_env = safe_text(key_env, 128) if key_env is not None else "SUB2API_ADMIN_KEY"
+        self.poll_seconds = max(1.0, float(poll_seconds))
+        self.timeout = max(1.0, float(timeout))
+        self.page_size = max(1, min(int(page_size), 1000))
+        self.backfill_days = max(1, min(int(backfill_days), 3650))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._warned_no_key = False
+        self._warned_permissions = False
+        self._backoff = self.poll_seconds
+        self._last_status: int | None = None
+        self._last_poll_at: str | None = None
+        self._last_success_at: str | None = None
+        self._last_error_type: str | None = None
+        self._last_imported = 0
+        self._last_scanned = 0
+        self._last_account_count = 0
+        self._last_quota_rows = 0
+        self._api_available = False
+        self._inventory_result: dict[str, Any] = {
+            "authoritative": False,
+            "active": 0,
+            "suspect": 0,
+            "retired": 0,
+        }
+
+    @property
+    def configured(self) -> bool:
+        return bool(
+            self.key_file
+            or (self.key_env and os.environ.get(self.key_env, "").strip())
+        )
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="sub2api-import",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def status(self) -> dict[str, Any]:
+        key_loaded = bool(self._load_key())
+        env_configured = bool(
+            self.key_env and os.environ.get(self.key_env, "").strip()
+        )
+        inventory = {
+            key: value
+            for key, value in self._inventory_result.items()
+            if key != "retired_keys"
+        }
+        return {
+            "enabled": True,
+            "configured": bool(self.key_file or env_configured),
+            "key_source": (
+                "file" if self.key_file else ("env" if env_configured else "none")
+            ),
+            "key_loaded": key_loaded,
+            "api_available": self._api_available,
+            "last_status": self._last_status,
+            "last_poll_at": self._last_poll_at,
+            "last_success_at": self._last_success_at,
+            "last_error_type": self._last_error_type,
+            "last_imported": self._last_imported,
+            "last_scanned": self._last_scanned,
+            "account_count": self._last_account_count,
+            "last_quota_rows": self._last_quota_rows,
+            "poll_seconds": self.poll_seconds,
+            "backfill_days": self.backfill_days,
+            "backoff_seconds": self._backoff,
+            "inventory": inventory,
+            **self.repo.import_status(SUB2API_REQUEST_SOURCE),
+        }
+
+    def _load_key(self) -> str | None:
+        if self.key_file:
+            try:
+                file_stat = self.key_file.stat()
+                if not self.key_file.is_file() or self.key_file.is_symlink():
+                    return None
+                if file_stat.st_mode & 0o077:
+                    if not self._warned_permissions:
+                        LOG.error("Sub2API admin key file must be owner-only (mode 600)")
+                        self._warned_permissions = True
+                    return None
+                if file_stat.st_size > 4096:
+                    return None
+                with self.key_file.open("r", encoding="utf-8") as handle:
+                    value = handle.read(4097).strip()
+            except (OSError, UnicodeError):
+                value = ""
+            if value:
+                return value if len(value) <= 4096 else None
+        value = os.environ.get(self.key_env, "").strip() if self.key_env else ""
+        return value if value and len(value) <= 4096 else None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            key = self._load_key()
+            if not key:
+                if not self._warned_no_key:
+                    LOG.info("Sub2API importer idle: no admin key file/environment configured")
+                    self._warned_no_key = True
+                self._stop.wait(30.0)
+                continue
+            self._warned_no_key = False
+            try:
+                result = self.import_once(key)
+                self._last_poll_at = utc_now()
+                self._last_success_at = self._last_poll_at
+                self._last_error_type = None
+                self._last_imported = result["imported"]
+                self._last_scanned = result["scanned"]
+                self._last_account_count = result["accounts"]
+                self._last_quota_rows = result["quota_rows"]
+                self._api_available = True
+                self._backoff = self.poll_seconds
+            except Sub2APIHTTPError as exc:
+                self._last_poll_at = utc_now()
+                self._last_status = exc.status
+                self._api_available = True
+                self._last_error_type = (
+                    "Sub2APIAuthenticationError"
+                    if exc.status in {401, 403}
+                    else "Sub2APIHTTPError"
+                )
+                if exc.status in {401, 403, 429}:
+                    self._backoff = DEFAULT_MANAGEMENT_BACKOFF_SECONDS
+                else:
+                    self._backoff = min(
+                        max(self._backoff * 2, 5.0),
+                        MAX_MANAGEMENT_BACKOFF_SECONDS,
+                    )
+                LOG.warning("Sub2API import failed: %s", self._last_error_type)
+            except Exception as exc:
+                self._last_poll_at = utc_now()
+                self._last_error_type = type(exc).__name__
+                self._api_available = False
+                self._backoff = min(
+                    max(self._backoff * 2, 5.0),
+                    MAX_MANAGEMENT_BACKOFF_SECONDS,
+                )
+                LOG.warning("Sub2API import failed: %s", type(exc).__name__)
+            self._stop.wait(self._backoff)
+
+    def _connection(self) -> http.client.HTTPConnection:
+        port = self.origin.port or (443 if self.origin.scheme == "https" else 80)
+        if self.origin.scheme == "https":
+            return http.client.HTTPSConnection(
+                self.origin.hostname,
+                port,
+                timeout=self.timeout,
+                context=ssl.create_default_context(),
+            )
+        return http.client.HTTPConnection(
+            self.origin.hostname,
+            port,
+            timeout=self.timeout,
+        )
+
+    def _request_json(
+        self,
+        endpoint: str,
+        key: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        target = f"{self.api_root}{endpoint}"
+        if params:
+            target += "?" + urllib.parse.urlencode(
+                [(name, str(value)) for name, value in params.items() if value is not None]
+            )
+        connection = self._connection()
+        try:
+            connection.request(
+                "GET",
+                target,
+                headers={
+                    "Accept": "application/json",
+                    "Connection": "close",
+                    "X-API-Key": key,
+                    "X-Admin-UI-Request": "1",
+                },
+            )
+            response = connection.getresponse()
+            self._last_status = response.status
+            content_length = as_nonnegative_int(response.getheader("Content-Length"))
+            if content_length is not None and content_length > MAX_SUB2API_RESPONSE_BYTES:
+                raise Sub2APISchemaError("Sub2API response is too large")
+            body = response.read(MAX_SUB2API_RESPONSE_BYTES + 1)
+            if len(body) > MAX_SUB2API_RESPONSE_BYTES:
+                raise Sub2APISchemaError("Sub2API response is too large")
+            if response.status != 200:
+                raise Sub2APIHTTPError(response.status)
+        finally:
+            connection.close()
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise Sub2APISchemaError("Sub2API returned invalid JSON") from exc
+        if not isinstance(payload, Mapping) or payload.get("code") not in {0, None}:
+            raise Sub2APISchemaError("Sub2API returned an invalid envelope")
+        if "data" not in payload:
+            raise Sub2APISchemaError("Sub2API response data is missing")
+        return payload["data"]
+
+    def _paginated(
+        self,
+        endpoint: str,
+        key: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> list[Mapping[str, Any]]:
+        common = dict(params or {})
+        records: list[Mapping[str, Any]] = []
+        seen_ids: set[int] = set()
+        expected_total: int | None = None
+        for page in range(1, MAX_SUB2API_PAGES + 1):
+            data = self._request_json(
+                endpoint,
+                key,
+                {**common, "page": page, "page_size": self.page_size},
+            )
+            if not isinstance(data, Mapping) or not isinstance(data.get("items"), list):
+                raise Sub2APISchemaError("Sub2API pagination data is invalid")
+            items = data["items"]
+            for item in items:
+                if not isinstance(item, Mapping) or isinstance(item.get("id"), bool):
+                    raise Sub2APISchemaError("Sub2API item is invalid")
+                try:
+                    item_id = int(item.get("id"))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise Sub2APISchemaError("Sub2API item ID is invalid") from exc
+                if item_id <= 0 or item_id in seen_ids:
+                    raise Sub2APISchemaError("Sub2API pagination is incomplete")
+                seen_ids.add(item_id)
+                records.append(item)
+            pages = as_nonnegative_int(data.get("pages"))
+            response_page = as_nonnegative_int(data.get("page"))
+            if response_page is not None and response_page != page:
+                raise Sub2APISchemaError("Sub2API pagination page mismatch")
+            response_page_size = as_nonnegative_int(data.get("page_size"))
+            if response_page_size is not None and response_page_size != self.page_size:
+                raise Sub2APISchemaError("Sub2API pagination size mismatch")
+            total = as_nonnegative_int(data.get("total"))
+            if total is not None:
+                if expected_total is None:
+                    expected_total = total
+                elif total != expected_total:
+                    raise Sub2APISchemaError("Sub2API pagination changed during import")
+            if len(items) < self.page_size or (pages is not None and page >= pages):
+                if expected_total is not None and expected_total != len(records):
+                    raise Sub2APISchemaError("Sub2API pagination is incomplete")
+                return records
+        raise Sub2APISchemaError("Sub2API pagination limit exceeded")
+
+    @staticmethod
+    def _safe_cost(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return result if math.isfinite(result) and 0 <= result <= 1_000_000_000 else None
+
+    @staticmethod
+    def _timestamp_plus_seconds(timestamp: Any, seconds: Any) -> str | None:
+        base = normalize_optional_timestamp(timestamp)
+        duration = as_nonnegative_int(seconds)
+        if not base or duration is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(base.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return (parsed + timedelta(seconds=duration)).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+
+    @staticmethod
+    def _account_state(account: Mapping[str, Any], now: str) -> str:
+        status = (safe_text(account.get("status"), 32) or "unknown").casefold()
+        if status in {"inactive", "error"}:
+            return status
+        for field, state in (
+            ("rate_limit_reset_at", "rate_limited"),
+            ("overload_until", "overloaded"),
+            ("temp_unschedulable_until", "temporarily_unschedulable"),
+        ):
+            until = normalize_optional_timestamp(account.get(field))
+            if until and until > now:
+                return state
+        if account.get("schedulable") is not True:
+            return "unschedulable"
+        return "active" if status == "active" else "unknown"
+
+    def _import_account_snapshots(
+        self,
+        accounts: Sequence[Mapping[str, Any]],
+    ) -> int:
+        inserted = 0
+        now = utc_now()
+        previous_statuses = {
+            str(row.get("identity_key")): row
+            for row in self.repo.latest_subscription_quotas()
+            if row.get("window_kind") == "account_status"
+        }
+        for account in accounts:
+            identity = self.resolver.resolve_sub2api_account(account.get("id"))
+            if not identity.subscription_id_hash:
+                continue
+            identity_key_value = f"subscription:{identity.subscription_id_hash}"
+            extra = account.get("extra")
+            extra = extra if isinstance(extra, Mapping) else {}
+            state = self._account_state(account, now)
+            available = (
+                True
+                if state == "active"
+                else (
+                    False
+                    if state
+                    in {
+                        "inactive",
+                        "error",
+                        "rate_limited",
+                        "overloaded",
+                        "temporarily_unschedulable",
+                        "unschedulable",
+                    }
+                    else None
+                )
+            )
+            rate_limited = (
+                True if state == "rate_limited" else (False if state == "active" else None)
+            )
+            plan_type = safe_plan_type(extra.get("plan_type"))
+            active_until = normalize_optional_timestamp(account.get("expires_at"))
+            common = {
+                "identity_key": identity_key_value,
+                "plan_type": plan_type,
+                "subscription_active_until": active_until,
+                "provider_allowed": available,
+                "provider_limit_reached": rate_limited,
+            }
+            status_method = f"sub2api_{state}"
+            previous = previous_statuses.get(identity_key_value)
+            status_changed = previous is None or any(
+                (
+                    previous.get("estimate_method") != status_method,
+                    previous.get("plan_type") != plan_type,
+                    previous.get("subscription_active_until") != active_until,
+                    previous.get("provider_allowed")
+                    != (None if available is None else int(available)),
+                    previous.get("provider_limit_reached")
+                    != (None if rate_limited is None else int(rate_limited)),
+                )
+            )
+            if status_changed:
+                inserted += int(
+                    self.repo.insert_subscription_quota_snapshot(
+                        {
+                            **common,
+                            "fetched_at": now,
+                            "window_kind": "account_status",
+                            "estimate_method": status_method,
+                            "source": SUB2API_ACCOUNT_SOURCE,
+                        }
+                    )
+                )
+
+            usage_fetched_at = normalize_optional_timestamp(
+                extra.get("codex_usage_updated_at")
+            )
+            if not usage_fetched_at:
+                continue
+            for prefix, kind in (("codex_5h", "five_hour"), ("codex_7d", "weekly")):
+                used = _percent_value(extra.get(f"{prefix}_used_percent"))
+                if used is None:
+                    continue
+                minutes = as_nonnegative_int(extra.get(f"{prefix}_window_minutes"))
+                reset_at = normalize_optional_timestamp(extra.get(f"{prefix}_reset_at"))
+                if not reset_at:
+                    reset_at = self._timestamp_plus_seconds(
+                        usage_fetched_at,
+                        extra.get(f"{prefix}_reset_after_seconds"),
+                    )
+                inserted += int(
+                    self.repo.insert_subscription_quota_snapshot(
+                        {
+                            **common,
+                            "fetched_at": usage_fetched_at,
+                            "window_kind": kind,
+                            "used_percent": used,
+                            "remaining_percent": 100.0 - used,
+                            "window_seconds": minutes * 60 if minutes is not None else None,
+                            "reset_at": reset_at,
+                            "source": SUB2API_QUOTA_SOURCE,
+                        }
+                    )
+                )
+        return inserted
+
+    def _event_from_record(
+        self,
+        record: Mapping[str, Any],
+    ) -> tuple[UsageEvent, str] | None:
+        timestamp = normalize_optional_timestamp(record.get("created_at"))
+        import_key = self.resolver.sub2api_event_import_key(
+            self.instance_scope,
+            record.get("id"),
+            record.get("request_id"),
+            timestamp,
+        )
+        if not timestamp or not import_key:
+            return None
+        identity = self.resolver.resolve_sub2api_account(record.get("account_id"))
+        identity_key_value = (
+            f"subscription:{identity.subscription_id_hash}"
+            if identity.subscription_id_hash
+            else "unknown"
+        )
+        non_cached_tokens = as_nonnegative_int(record.get("input_tokens")) or 0
+        cache_write_tokens = as_nonnegative_int(record.get("cache_creation_tokens")) or 0
+        cached_tokens = as_nonnegative_int(record.get("cache_read_tokens")) or 0
+        output_tokens = as_nonnegative_int(record.get("output_tokens")) or 0
+        input_tokens = non_cached_tokens + cache_write_tokens + cached_tokens
+
+        non_cached_cost_parts = (
+            self._safe_cost(record.get("input_cost")),
+            self._safe_cost(record.get("cache_creation_cost")),
+            self._safe_cost(record.get("image_input_cost")),
+        )
+        cached_cost = self._safe_cost(record.get("cache_read_cost"))
+        output_cost_parts = (
+            self._safe_cost(record.get("output_cost")),
+            self._safe_cost(record.get("image_output_cost")),
+        )
+        declared_total = self._safe_cost(record.get("total_cost"))
+        components_valid = (
+            all(value is not None for value in non_cached_cost_parts)
+            and cached_cost is not None
+            and all(value is not None for value in output_cost_parts)
+        )
+        non_cached_cost: float | None = None
+        output_cost: float | None = None
+        estimated_cost = declared_total
+        if components_valid:
+            non_cached_cost = sum(float(value or 0.0) for value in non_cached_cost_parts)
+            output_cost = sum(float(value or 0.0) for value in output_cost_parts)
+            component_total = non_cached_cost + float(cached_cost or 0.0) + output_cost
+            if declared_total is not None and not math.isclose(
+                component_total,
+                declared_total,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            ):
+                non_cached_cost = None
+                cached_cost = None
+                output_cost = None
+            else:
+                # SQLite requires the three frozen components to sum exactly
+                # to the stored total.  Sub2API's declared total can differ by
+                # a final decimal rounding unit, so use the component sum when
+                # the upstream values otherwise agree.
+                estimated_cost = component_total
+
+        stream = bool(record.get("stream")) or safe_text(
+            record.get("request_type"), 32
+        ) in {"stream", "ws_v2", "live"}
+        event = UsageEvent(
+            ts=timestamp,
+            identity_key=identity_key_value,
+            endpoint="local://sub2api",
+            method="LOCAL",
+            model=safe_model_identifier(record.get("model")),
+            status_code=200,
+            ok=1,
+            duration_ms=as_nonnegative_int(record.get("duration_ms")) or 0,
+            stream=int(stream),
+            session_id=None,
+            thread_id=None,
+            turn_id=None,
+            installation_id=None,
+            window_id=None,
+            usage_alias=identity.usage_alias,
+            usage_project=None,
+            auth_fingerprint=None,
+            account_id_hash=identity.account_id_hash,
+            account_id_tail=identity.account_id_tail,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            reasoning_tokens=None,
+            total_tokens=input_tokens + output_tokens,
+            estimated_api_cost_usd=estimated_cost,
+            non_cached_input_cost_usd=non_cached_cost,
+            cached_input_cost_usd=cached_cost,
+            output_cost_usd=output_cost,
+            long_context_pricing_applied=int(
+                bool(record.get("long_context_billing_applied"))
+            ),
+            subscription_amortized_cost_usd=None,
+            api_equivalent_quota_usd=None,
+            usage_missing=0,
+            error_type=None,
+            error_message_redacted=None,
+            request_bytes=0,
+            response_bytes=0,
+            source=SUB2API_REQUEST_SOURCE,
+            request_id=None,
+            account_attempt=int(record.get("account_id") is not None),
+        )
+        return event, import_key
+
+    def _usage_range(self, now: datetime) -> tuple[str, str]:
+        state = self.repo.remote_import_state(SUB2API_REQUEST_SOURCE) or {}
+        last_complete = normalize_optional_timestamp(state.get("last_complete_at"))
+        start = now - timedelta(days=self.backfill_days)
+        if last_complete:
+            try:
+                parsed = datetime.fromisoformat(last_complete.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+            if parsed is not None:
+                start = parsed.astimezone(timezone.utc) - timedelta(days=1)
+        return start.date().isoformat(), now.date().isoformat()
+
+    def import_once(self, key: str | None = None) -> dict[str, Any]:
+        loaded_key = key or self._load_key()
+        if not loaded_key:
+            raise ValueError("Sub2API admin key is not configured")
+        scan_started = datetime.now(timezone.utc)
+        accounts = self._paginated(
+            "/admin/accounts",
+            loaded_key,
+            {"sort_by": "id", "sort_order": "asc"},
+        )
+        self.resolver.register_sub2api_accounts(self.instance_scope, accounts)
+        self._inventory_result = self.repo.reconcile_subscription_inventory(
+            self.resolver.active_subscription_keys(),
+            utc_now(),
+            authoritative=True,
+        )
+        quota_rows = self._import_account_snapshots(accounts)
+
+        start_date, end_date = self._usage_range(scan_started)
+        usage_records = self._paginated(
+            "/admin/usage",
+            loaded_key,
+            {
+                "start_date": start_date,
+                "end_date": end_date,
+                "timezone": "UTC",
+                "sort_by": "id",
+                "sort_order": "asc",
+                "exact_total": "true",
+            },
+        )
+        imported = 0
+        for record in usage_records:
+            converted = self._event_from_record(record)
+            if converted is None:
+                continue
+            event, import_key = converted
+            if self.repo.sync_imported_event(
+                event,
+                import_key,
+                SUB2API_REQUEST_SOURCE,
+            ):
+                imported += 1
+        self.repo.save_remote_import_state(
+            SUB2API_REQUEST_SOURCE,
+            scan_started,
+        )
+        return {
+            "imported": imported,
+            "scanned": len(usage_records),
+            "accounts": len(accounts),
+            "quota_rows": quota_rows,
+        }
+
+
 @dataclass
 class CodexAppFileScan:
     ok: bool
@@ -9161,6 +9980,13 @@ def identity_badge(row: Mapping[str, Any]) -> tuple[str, str]:
 
     if row.get("legacy_ambiguous"):
         return "L", "L = Legacy ambiguous（历史记录无法安全拆分）"
+    windows = row.get("windows")
+    if isinstance(windows, Mapping) and any(
+        isinstance(window, Mapping)
+        and window.get("source") in {SUB2API_ACCOUNT_SOURCE, SUB2API_QUOTA_SOURCE}
+        for window in windows.values()
+    ):
+        return "S", "S = Sub2API account（由本机 Sub2API 只读同步）"
     alias = safe_text(row.get("usage_alias"), 128) or ""
     if re.fullmatch(r"codex-\d+", alias, re.IGNORECASE):
         return "C", "C = Codex alias（已映射本机 CODEX_HOME）"
@@ -9636,7 +10462,7 @@ def response_timeline_chart_html(timeline: Mapping[str, Any]) -> str:
     </div>
   </div>
   <div class="timeline-meta"><div class="timeline-legend"><span><i class="ok"></i>HTTP 200</span><span><i class="bad"></i>非 200 / 无上游响应</span></div><div class="timeline-sync" data-role="timeline-sync">账号选择后 API · 每分钟</div></div>
-  <div class="timeline-footnote">时间轴固定合并 Cockpit Tools、8327 代理与 8317 队列中已进入账号选择阶段的请求；账号选择前的网关拒绝不进入时间轴。分钟观测不含账号信息，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
+  <div class="timeline-footnote">时间轴固定合并 Sub2API、Cockpit Tools、8327 代理与 8317 队列中已进入账号选择阶段的请求；账号选择前的网关拒绝不进入时间轴。分钟观测不含账号信息，因此账号明细退役不会抹掉响应曲线。无上游响应时，8327 会记录为 <b>502</b> 并进入非 200 线；两条线同时为 0 仍只表示该分钟没有采集到已完成请求。JSON：<code>/usage/timeline?minutes=1440</code>。</div>
 </section>
 <script id="response-timeline-data" type="application/json">{payload_json}</script>
 """
@@ -9742,6 +10568,7 @@ def dashboard_html(
     codex_app_status: Mapping[str, Any] | None = None,
     account_resolver: AccountResolver | None = None,
     cockpit_status: Mapping[str, Any] | None = None,
+    sub2api_status: Mapping[str, Any] | None = None,
 ) -> str:
     today = repo.token_breakdown("today")
     week = repo.token_breakdown("7d")
@@ -9766,6 +10593,7 @@ def dashboard_html(
     quota_status = quota_status or {}
     codex_app_status = codex_app_status or {}
     cockpit_status = cockpit_status or {}
+    sub2api_status = sub2api_status or {}
 
     hero_metrics = "".join(
         f'<article class="hero-card {tone}"><span>{html.escape(label)}</span>'
@@ -9841,6 +10669,15 @@ def dashboard_html(
         windows = row.get("windows") or {}
         weekly = windows.get("weekly") or windows.get("monthly")
         five_hour = windows.get("five_hour")
+        account_status = windows.get("account_status")
+        account_status = account_status if isinstance(account_status, Mapping) else {}
+        account_state_method = safe_alias(account_status.get("estimate_method")) or ""
+        sub2api_account_state = (
+            account_state_method.removeprefix("sub2api_")
+            if account_status.get("source") == SUB2API_ACCOUNT_SOURCE
+            and account_state_method.startswith("sub2api_")
+            else ""
+        )
         full_quota = row.get("current_window_full_quota_usd")
         floor = row.get("current_cycle_floor_usd")
         badge, badge_title = identity_badge(row)
@@ -9871,6 +10708,20 @@ def dashboard_html(
         if legacy_ambiguous:
             status_text = "历史归属不确定"
             status_class = "reported"
+        elif sub2api_account_state:
+            status_text, status_class = {
+                "active": ("Sub2API 可调度", "available"),
+                "rate_limited": ("Sub2API 限流中", "confirmed"),
+                "inactive": ("Sub2API 已停用", "confirmed"),
+                "error": ("Sub2API 账号异常", "confirmed"),
+                "overloaded": ("Sub2API 过载中", "reported"),
+                "temporarily_unschedulable": ("Sub2API 暂不可调度", "reported"),
+                "unschedulable": ("Sub2API 不可调度", "reported"),
+                "unknown": ("Sub2API 状态未知", "reported"),
+            }.get(
+                sub2api_account_state,
+                ("Sub2API 状态未知", "reported"),
+            )
         elif execution_availability == "confirmed_exhausted":
             status_text = "已确认耗尽 · 冷却中"
             status_class = "confirmed"
@@ -9950,7 +10801,7 @@ def dashboard_html(
             f'<small>{html.escape(quota_note)}<br>累计消费 {fmt_money(row.get("all_time_cost_usd"))}</small></div></article>'
         )
     subscriptions_html = "".join(subscription_cards) or (
-        '<div class="empty-state">额度快照尚未就绪。collector 会低频、安全地从 8317 获取。</div>'
+        '<div class="empty-state">账号与额度快照尚未就绪，采集器正在等待上游数据。</div>'
     )
 
     model_rows = "".join(
@@ -10009,6 +10860,57 @@ def dashboard_html(
         else ""
     )
 
+    sub2api_enabled = bool(sub2api_status.get("enabled"))
+    sub2api_configured = bool(sub2api_status.get("configured"))
+    sub2api_key_loaded = bool(sub2api_status.get("key_loaded"))
+    sub2api_last_success = sub2api_status.get("last_success_at")
+    sub2api_error_type = sub2api_status.get("last_error_type")
+    sub2api_auth_failed = sub2api_error_type in {
+        "Sub2APIAuthenticationError"
+    }
+    if sub2api_enabled:
+        if not sub2api_configured or not sub2api_key_loaded:
+            sub2api_notice_title = "Sub2API 同步等待密钥"
+            sub2api_notice_class = ""
+            sub2api_notice_body = (
+                "当前未载入可用的 owner-only 管理密钥，Sub2API 调用和新增账号尚未同步。"
+            )
+        elif sub2api_auth_failed:
+            sub2api_notice_title = "Sub2API 管理认证失败"
+            sub2api_notice_class = ""
+            sub2api_notice_body = (
+                "管理 API 返回 401/403；采集器已进入长退避，8327 看板其余来源继续工作。"
+            )
+        elif sub2api_error_type:
+            sub2api_notice_title = "Sub2API 同步异常"
+            sub2api_notice_class = ""
+            sub2api_notice_body = (
+                "最近一次完整同步未完成；采集器会退避重试，详情可在脱敏健康状态中查看。"
+            )
+        elif sub2api_last_success:
+            sub2api_notice_title = "Sub2API 只读同步正常"
+            sub2api_notice_class = " app-import-notice"
+            sub2api_notice_body = (
+                f'已发现 {fmt_int(sub2api_status.get("account_count"))} 个账号，累计导入 '
+                f'{fmt_int(sub2api_status.get("imported_events"))} 条调用；本轮扫描 '
+                f'{fmt_int(sub2api_status.get("last_scanned"))} 条、新增 '
+                f'{fmt_int(sub2api_status.get("last_imported"))} 条，并写入 '
+                f'{fmt_int(sub2api_status.get("last_quota_rows"))} 条账号/额度变化。'
+                "管理员密钥、请求 ID、原始账号 ID 与账号名称不会写入 meter 数据库。"
+            )
+        else:
+            sub2api_notice_title = "Sub2API 同步连接中"
+            sub2api_notice_class = ""
+            sub2api_notice_body = (
+                "管理密钥已载入，正在等待首次完整账号清单和用量分页。"
+            )
+        sub2api_notice = (
+            f'<div class="notice{sub2api_notice_class}"><b>{sub2api_notice_title}</b>'
+            f'<span>{sub2api_notice_body}</span></div>'
+        )
+    else:
+        sub2api_notice = ""
+
     codex_dynamic = codex_app_status.get("account_mode", "dynamic") == "dynamic"
     manual_usage_alias = safe_alias(codex_app_status.get("usage_alias"))
     manual_account_email: str | None = None
@@ -10066,6 +10968,24 @@ def dashboard_html(
         cockpit_status.get("last_success_at") is not None
         or int(cockpit_status.get("imported_events") or 0) > 0
     )
+    sub2api_ok = bool(
+        sub2api_last_success
+        or int(sub2api_status.get("imported_events") or 0) > 0
+    )
+    if not sub2api_enabled:
+        sub2api_strip_text = "关闭"
+    elif not sub2api_configured or not sub2api_key_loaded:
+        sub2api_strip_text = "等待密钥"
+    elif sub2api_auth_failed:
+        sub2api_strip_text = "认证失败"
+    elif sub2api_error_type:
+        sub2api_strip_text = "同步异常"
+    elif sub2api_ok:
+        sub2api_strip_text = (
+            f'同步中 · {fmt_int(sub2api_status.get("account_count"))} 账号'
+        )
+    else:
+        sub2api_strip_text = "连接中"
     guard_status = queue_status.get("quota_routing_guard")
     guard_status = guard_status if isinstance(guard_status, Mapping) else {}
     guard_enabled = bool(guard_status.get("enabled"))
@@ -10094,10 +11014,11 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
 {RESPONSE_TIMELINE_CSS}
 </style></head><body><main>
 <header><div class="brand-lockup"><div class="brand-mark" aria-hidden="true">UM</div><div><div class="eyebrow">Local · Private · Token Safe</div><h1>Usage Observatory</h1><div class="subtitle">跨 Codex 订阅账号的 token、API 等价成本与实时额度；主口径与 Codex /status 对齐。</div></div></div><div class="header-actions"><div class="live">8327 LIVE</div><button class="theme-toggle" type="button" data-role="theme-toggle" aria-label="切换明暗主题" title="切换明暗主题"><svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z"/></svg><svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button></div></header>
-<section class="hero-grid">{hero_metrics}</section>
-{codex_notice}
-{cockpit_notice}
-{manual_import}
+	<section class="hero-grid">{hero_metrics}</section>
+	{codex_notice}
+	{cockpit_notice}
+	{sub2api_notice}
+	{manual_import}
 {session_notice}
 <div class="notice"><b>长上下文计费已启用</b><span>按每次调用完整 input tokens 判断：≤272K 使用短上下文价，&gt;272K 使用长上下文价；cached tokens 是 input 子集，计入阈值且仍按 cached-input 档计费。长上下文请求的输入档（含缓存）与输出档按官方对应费率整次计算。</span></div>
 <div class="section-title"><div><h2>Token 消费总览</h2><p>输入、缓存、输出与推理 token，一眼看清今天、7 天和累计。</p></div></div>
@@ -10111,7 +11032,7 @@ header{{display:flex;min-width:0;align-items:center;justify-content:space-betwee
   <section class="two-col"><article class="panel"><h3>模型消费 · 7 天</h3><div class="table-wrap"><table><thead><tr><th>模型</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>长上下文调用</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{model_rows}</tbody></table></div></article><article class="panel"><h3>最近 50 次账号尝试</h3><p class="table-note">这是历史完成记录（时间精确到秒）；账号进入冷却不会删除冷却前的成功记录，当前状态以账号卡的最新额度信号为准。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>计费档</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{recent_rows}</tbody></table></div></article></section>
 <div class="section-title"><div><h2>账号累计</h2><p>每个订阅自本地 collector 启用以来的 token、请求和 API 等价成本。</p></div></div>
   <section class="panel"><div class="table-wrap"><table><thead><tr><th>账号</th><th>聚合调用</th><th>账号尝试</th><th>非缓存输入</th><th>输出</th><th>缓存</th><th>输入成本</th><th>输出成本</th><th>缓存成本</th><th>总成本</th></tr></thead><tbody>{account_rows}</tbody></table></div></section>
-<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
+	<div class="system-strip"><span>8317 collector <b>{'正常' if collector_ok else '已暂停/等待'}</b></span><span>Cockpit Tools <b>{'只读导入中' if cockpit_ok else ('关闭' if not cockpit_status.get('enabled') else '等待')}</b></span><span>Sub2API <b>{html.escape(sub2api_strip_text)}</b></span><span>ChatGPT App <b>{f'本地监控中 · {codex_matched}/{codex_discovered}' if codex_app_ok else '等待'}</b></span><span>Quota snapshot <b>{'正常' if quota_ok else '等待'}</b></span><span>Quota guard <b>{f'开启 · {guard_locks} 锁' if guard_enabled else '关闭'}</b></span><span>Official prices <b>{'已同步' if price_ok else '待同步'}</b></span><span>账号尝试 <b>{fmt_int(all_time['account_attempts'])}</b></span><span>覆盖 <b>{fmt_local_time(coverage.get('first_event_ts'))} → {fmt_local_time(coverage.get('last_event_ts'))}</b></span></div>
 <footer>自动刷新 30 秒 · 页面生成 {html.escape(generated)} · 实际消耗 = max(输入−缓存, 0)+输出，接近 Codex /status；成本优先沿用采集源冻结的逐请求价格快照，其余事件按 meter 同步的 OpenAI 官方费率逐条计算。长上下文档仅在完整 input tokens &gt; 272K 时启用（272K 本身仍是短档），缓存命中计入这个输入阈值。API 原始处理量 = 输入（含缓存）+输出。reasoning 是输出子集，不重复相加。“API 等价成本/额度”不代表订阅现金余额。</footer>
 </main><script>(()=>{{const b=document.querySelector('[data-role="theme-toggle"]');if(!b)return;b.addEventListener('click',()=>{{const r=document.documentElement;const next=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=next;try{{localStorage.setItem('cliproxy-usage-theme',next)}}catch(e){{}}}})}})()</script><script>{RESPONSE_TIMELINE_SCRIPT}</script></body></html>"""
 
@@ -10149,6 +11070,14 @@ class MeterHTTPServer(ThreadingHTTPServer):
         cockpit_tools_poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
         cockpit_tools_import_enabled: bool = True,
         cockpit_tools_authoritative_accounts: bool = False,
+        sub2api_base_url: str = DEFAULT_SUB2API_BASE_URL,
+        sub2api_admin_key_file: str | Path | None = None,
+        sub2api_admin_key_env: str = "SUB2API_ADMIN_KEY",
+        sub2api_poll_seconds: float = DEFAULT_SUB2API_POLL_SECONDS,
+        sub2api_timeout: float = DEFAULT_SUB2API_TIMEOUT,
+        sub2api_page_size: int = DEFAULT_SUB2API_PAGE_SIZE,
+        sub2api_backfill_days: int = DEFAULT_SUB2API_BACKFILL_DAYS,
+        sub2api_import_enabled: bool = True,
     ):
         super().__init__(address, UsageMeterHandler)
         parsed = urlsplit(upstream)
@@ -10210,6 +11139,18 @@ class MeterHTTPServer(ThreadingHTTPServer):
             poll_seconds=cockpit_tools_poll_seconds,
         )
         self.cockpit_tools_import_enabled = bool(cockpit_tools_import_enabled)
+        self.sub2api_importer = Sub2APIImporter(
+            repo,
+            resolver,
+            base_url=sub2api_base_url,
+            key_file=sub2api_admin_key_file,
+            key_env=sub2api_admin_key_env,
+            poll_seconds=sub2api_poll_seconds,
+            timeout=sub2api_timeout,
+            page_size=sub2api_page_size,
+            backfill_days=sub2api_backfill_days,
+        )
+        self.sub2api_import_enabled = bool(sub2api_import_enabled)
 
     def cockpit_tools_status(self) -> dict[str, Any]:
         if self.cockpit_tools_import_enabled:
@@ -10228,6 +11169,26 @@ class MeterHTTPServer(ThreadingHTTPServer):
             ).get("imported_events", 0),
         }
 
+    def sub2api_status(self) -> dict[str, Any]:
+        if self.sub2api_import_enabled:
+            return self.sub2api_importer.status()
+        return {
+            "enabled": False,
+            "configured": False,
+            "key_source": "none",
+            "key_loaded": False,
+            "api_available": False,
+            "last_status": None,
+            "last_poll_at": None,
+            "last_success_at": None,
+            "last_error_type": None,
+            "last_imported": 0,
+            "last_scanned": 0,
+            "account_count": 0,
+            "last_quota_rows": 0,
+            **self.repo.import_status(SUB2API_REQUEST_SOURCE),
+        }
+
     def start_queue_poller(self) -> None:
         self.queue_poller.start()
         self.quota_poller.start()
@@ -10237,14 +11198,19 @@ class MeterHTTPServer(ThreadingHTTPServer):
             self.codex_app_importer.start()
         if self.cockpit_tools_import_enabled:
             self.cockpit_tools_importer.start()
+        if self.sub2api_import_enabled:
+            self.sub2api_importer.start()
 
     def start_local_importer(self) -> None:
         if self.codex_app_import_enabled:
             self.codex_app_importer.start()
         if self.cockpit_tools_import_enabled:
             self.cockpit_tools_importer.start()
+        if self.sub2api_import_enabled:
+            self.sub2api_importer.start()
 
     def server_close(self) -> None:
+        self.sub2api_importer.stop()
         self.cockpit_tools_importer.stop()
         self.codex_app_importer.stop()
         self.quota_poller.stop()
@@ -10303,6 +11269,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     self.meter_server.codex_app_importer.status(),
                     self.meter_server.resolver,
                     self.meter_server.cockpit_tools_status(),
+                    self.meter_server.sub2api_status(),
                 ).encode("utf-8")
             except Exception as exc:  # dashboard failure must not expose DB internals
                 LOG.error("dashboard rendering failed: %s", type(exc).__name__)
@@ -10340,6 +11307,7 @@ class UsageMeterHandler(BaseHTTPRequestHandler):
                     "quota_routing_guard": self.meter_server.quota_routing_guard.status(),
                     "codex_app_local": self.meter_server.codex_app_importer.status(),
                     "cockpit_tools": self.meter_server.cockpit_tools_status(),
+                    "sub2api": self.meter_server.sub2api_status(),
                 }
             ).encode()
             self._send_bytes(
@@ -10871,6 +11839,14 @@ def create_server(
     cockpit_tools_poll_seconds: float = DEFAULT_COCKPIT_TOOLS_POLL_SECONDS,
     cockpit_tools_import_enabled: bool = True,
     cockpit_tools_authoritative_accounts: bool = False,
+    sub2api_base_url: str = DEFAULT_SUB2API_BASE_URL,
+    sub2api_admin_key_file: str | Path | None = None,
+    sub2api_admin_key_env: str = "SUB2API_ADMIN_KEY",
+    sub2api_poll_seconds: float = DEFAULT_SUB2API_POLL_SECONDS,
+    sub2api_timeout: float = DEFAULT_SUB2API_TIMEOUT,
+    sub2api_page_size: int = DEFAULT_SUB2API_PAGE_SIZE,
+    sub2api_backfill_days: int = DEFAULT_SUB2API_BACKFILL_DAYS,
+    sub2api_import_enabled: bool = True,
 ) -> MeterHTTPServer:
     repo = UsageRepository(db_path)
     resolver = account_resolver or AccountResolver(
@@ -10917,6 +11893,14 @@ def create_server(
         cockpit_tools_poll_seconds=cockpit_tools_poll_seconds,
         cockpit_tools_import_enabled=cockpit_tools_import_enabled,
         cockpit_tools_authoritative_accounts=cockpit_tools_authoritative_accounts,
+        sub2api_base_url=sub2api_base_url,
+        sub2api_admin_key_file=sub2api_admin_key_file,
+        sub2api_admin_key_env=sub2api_admin_key_env,
+        sub2api_poll_seconds=sub2api_poll_seconds,
+        sub2api_timeout=sub2api_timeout,
+        sub2api_page_size=sub2api_page_size,
+        sub2api_backfill_days=sub2api_backfill_days,
+        sub2api_import_enabled=sub2api_import_enabled,
     )
 
 
@@ -11112,6 +12096,54 @@ def build_parser() -> argparse.ArgumentParser:
             "hide CLIProxyAPI-only credentials"
         ),
     )
+    parser.add_argument(
+        "--sub2api-base-url",
+        default=os.environ.get("SUB2API_BASE_URL", DEFAULT_SUB2API_BASE_URL),
+        help="Loopback Sub2API origin (empty path or /api/v1)",
+    )
+    parser.add_argument(
+        "--sub2api-admin-key-file",
+        default=os.environ.get("SUB2API_ADMIN_KEY_FILE", ""),
+        help="Owner-only file containing the Sub2API admin API key",
+    )
+    parser.add_argument(
+        "--sub2api-admin-key-env",
+        default=os.environ.get("SUB2API_ADMIN_KEY_ENV", "SUB2API_ADMIN_KEY"),
+        help="Environment variable name for the Sub2API admin API key",
+    )
+    parser.add_argument(
+        "--sub2api-poll-seconds",
+        type=float,
+        default=float(
+            os.environ.get("SUB2API_POLL_SECONDS", str(DEFAULT_SUB2API_POLL_SECONDS))
+        ),
+        help="Seconds between read-only Sub2API account and usage imports",
+    )
+    parser.add_argument(
+        "--sub2api-timeout",
+        type=float,
+        default=float(os.environ.get("SUB2API_TIMEOUT", str(DEFAULT_SUB2API_TIMEOUT))),
+    )
+    parser.add_argument(
+        "--sub2api-page-size",
+        type=int,
+        default=int(os.environ.get("SUB2API_PAGE_SIZE", str(DEFAULT_SUB2API_PAGE_SIZE))),
+    )
+    parser.add_argument(
+        "--sub2api-backfill-days",
+        type=int,
+        default=int(
+            os.environ.get("SUB2API_BACKFILL_DAYS", str(DEFAULT_SUB2API_BACKFILL_DAYS))
+        ),
+        help="Initial Sub2API usage history window in days",
+    )
+    parser.add_argument(
+        "--no-sub2api-import",
+        action="store_true",
+        default=os.environ.get("SUB2API_IMPORT_ENABLED", "1").lower()
+        in {"0", "false", "no", "off"},
+        help="Disable read-only Sub2API account and usage import",
+    )
     parser.add_argument("--no-usage-queue", action="store_true", help="Disable direct 8317 usage-queue polling")
     parser.add_argument("--cached-input-price", type=float, help="Cached input USD/M; defaults to input price")
     parser.add_argument("--price-source-note", help="Human-readable provenance for a manually supplied price")
@@ -11208,6 +12240,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             cockpit_tools_authoritative_accounts=(
                 args.cockpit_tools_authoritative_accounts
             ),
+            sub2api_base_url=args.sub2api_base_url,
+            sub2api_admin_key_file=(args.sub2api_admin_key_file or None),
+            sub2api_admin_key_env=args.sub2api_admin_key_env,
+            sub2api_poll_seconds=args.sub2api_poll_seconds,
+            sub2api_timeout=args.sub2api_timeout,
+            sub2api_page_size=args.sub2api_page_size,
+            sub2api_backfill_days=args.sub2api_backfill_days,
+            sub2api_import_enabled=not args.no_sub2api_import,
         )
         LOG.info(
             "usage meter listening on http://%s:%d; upstream=%s; db=%s",

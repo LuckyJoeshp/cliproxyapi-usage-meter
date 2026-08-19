@@ -14,6 +14,8 @@ client -> http://127.0.0.1:8327/v1/... -> meter -> http://127.0.0.1:8317/v1/...
 除了显式经过 8327 的请求，sidecar 还可以只读消费 CLIProxyAPI v7.2.125
 提供的 `GET /v0/management/usage-queue`。这条路径能统计仍然直连 8317
 的客户端；队列中的 `api_key` 字段会被完全丢弃，只保存 token hash/脱敏账号信息。
+对于直接访问本机 Sub2API 的 `codex-s2a`，sidecar 还会通过 Sub2API 管理 API
+只读同步账号清单、逐请求用量与 Codex 额度快照。
 
 ## 启动
 
@@ -56,6 +58,56 @@ CLIPROXY_MANAGEMENT_KEY_FILE="$HOME/.config/cliproxyapi-management.key" \
 不会连续重试触发 CLIProxyAPI 封禁。可用参数为 `--usage-queue-count`、
 `--usage-queue-poll-seconds`、`--usage-queue-timeout`，必要时用
 `--no-usage-queue` 明确关闭。
+
+### Sub2API / `codex-s2a` 只读导入（默认开启、无 key 时 idle）
+
+`codex-s2a` 若直接请求 `http://127.0.0.1:8080`，流量不会经过 8327、8317 usage queue
+或 Cockpit 日志，因此原有采集路径无法看到这些调用。Sub2API importer 使用：
+
+```text
+codex-s2a -> Sub2API:8080
+Sub2API /api/v1/admin/accounts + /api/v1/admin/usage --read-only--> meter -> 8327/usage
+```
+
+先在 Sub2API 中启用 `admin_api_key`，再把同一个明文 key 放在仓库外 owner-only 文件中。
+它不是 Sub2API 给普通 `/v1` 客户端使用的 API key：
+
+```bash
+chmod 600 /path/to/sub2api-admin.key
+SUB2API_BASE_URL=http://127.0.0.1:8080 \
+SUB2API_ADMIN_KEY_FILE=/path/to/sub2api-admin.key \
+  PORT=8327 UPSTREAM=http://127.0.0.1:8317 \
+  scripts/start_cliproxy_usage_meter.sh
+```
+
+也可通过 `SUB2API_ADMIN_KEY` 环境变量提供，但外部 `0600` 文件更容易控制暴露范围。
+Sub2API admin key 权限很高，因此 importer 只接受 loopback HTTP(S) origin，路径只能为空或
+`/api/v1`；远端部署应先建立本地 tunnel，不能把 key 直接发送到任意 URL。
+
+首次完整导入默认回填最近 30 天；后续按上次完整扫描时间重叠回扫一天，并用 keyed import key
+幂等更新，所以不会因轮询重复计数，也能吸收延迟写入。账号与用量都逐页读取并核对总数；分页
+中途变化、响应过大或 schema 不兼容时整轮失败，不会用局部账号清单推进账号退役。调节项为：
+
+- `SUB2API_POLL_SECONDS` / `--sub2api-poll-seconds`；
+- `SUB2API_TIMEOUT` / `--sub2api-timeout`；
+- `SUB2API_PAGE_SIZE` / `--sub2api-page-size`；
+- `SUB2API_BACKFILL_DAYS` / `--sub2api-backfill-days`；
+- `--no-sub2api-import`（或 `SUB2API_IMPORT_ENABLED=0`）完全关闭。
+
+Sub2API 的 `usage_logs.input_tokens` 是非缓存输入；meter 会重建为
+`input_tokens + cache_creation_tokens + cache_read_tokens`，并把 cache read/write 分别保留。
+逐请求的 input/cache/output 成本快照与 `total_cost` 一并导入，不跟随 meter 之后的价格表变化。
+完整账号清单会为每个账号写入状态变化，因此新增账号即使尚无调用，也会在 `/usage` 出现；
+`extra.codex_5h_*`、`extra.codex_7d_*` 可用时同步为 5 小时/周额度。
+
+邮箱只在运行内存中用于页面显示与跨来源唯一匹配。SQLite 只保存域隔离 HMAC 身份，不保存
+Sub2API admin key、原始账号 ID、账号名称、邮箱、request ID、用户信息或响应原文。
+`/healthz` 只返回脱敏的 configured/key-loaded、HTTP 状态、账号/调用数量、最后成功时间和
+错误类型。401/403/429 会进入长退避，不会形成认证重试风暴。
+
+不要让同一批请求既经过 8327 再进入 Sub2API，又同时开启 Sub2API importer；透明代理事件和
+Sub2API usage row 会分别被视为一次调用。`codex-s2a` 直连 Sub2API、meter 仅做管理 API
+只读导入时不会发生这类双计数。
 
 ### Cockpit Tools `request_logs` 只读导入（默认开启）
 
@@ -432,8 +484,8 @@ http://127.0.0.1:8327/usage
 看板展示今日/近 7 日/SQLite 全量累计、成功/失败/streaming、各 token 与估算成本、全量按日历史、
 alias/account 与模型排行、quota 周期统计以及最近 50 次账号尝试。页面顶部明确标出 SQLite 第一条和最后一条
 记录时间，并显示 direct-8317 collector 是 active、backoff 还是因缺少 key 而 idle；
-Cockpit importer 的脱敏状态也由 `/healthz` 提供。页面只读取 meter SQLite，不直接接入
-cliproxyapi 或 Cockpit 本体。`/usage` 与
+Cockpit 与 Sub2API importer 的脱敏状态也由 `/healthz` 提供。页面只读取 meter SQLite
+和各 importer 的内存健康状态，不直接把管理凭据交给浏览器。`/usage` 与
 `/healthz` 都是动态本机状态，响应带 `Cache-Control: no-store`，避免浏览器复用旧额度或身份映射。
 额度卡通过运行时 resolver 补回邮箱/alias；SQLite 中的额度快照本身不含这些可读身份信息。
 其中“最近 50 次账号尝试”只取已到达账号选择阶段的调用；账号选择前的网关 401 不占用列表名额，
@@ -444,9 +496,9 @@ cliproxyapi 或 Cockpit 本体。`/usage` 与
 
 - 累计、今日、近 7 日的实际消耗（非缓存输入 + 输出）、缓存输入、API 原始处理量、
   输出、推理 token、缓存命中率与 API 等价成本。
-- 近 1/6/24 小时的每分钟 HTTP 200 与非 200 双折线时间轴，固定合并 Cockpit Tools、
-  8327 sidecar 与 8317 usage queue 中已进入账号选择阶段的 API 请求；账号选择前的网关
-  拒绝排除在外，无上游响应时 sidecar 写入的 502 归入非 200 线。
+- 近 1/6/24 小时的每分钟 HTTP 200 与非 200 双折线时间轴，固定合并 Sub2API、
+  Cockpit Tools、8327 sidecar 与 8317 usage queue 中已进入账号选择阶段的 API 请求；
+  账号选择前的网关拒绝排除在外，无上游响应时 sidecar 写入的 502 归入非 200 线。
 - 近 7 天 token/cost 柱状趋势。
 - 每个 Codex 订阅按实际窗口时长归类的 5 小时、周或月剩余百分比、重置时间与 provider gate 状态。
 - 每账号当前周期已观测美元下限，以及基于 provider 周/月窗口的 API 等价满额度估值。
